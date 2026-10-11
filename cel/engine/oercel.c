@@ -607,11 +607,13 @@ static void build_slot(Sys *s) {
     for (int d = 0; d < s->N; d++) s->slot[s->gid[d]] = d;
 }
 
-/* counter-based uniform deviate for parallel, order-independent decisions */
-static inline double hash_u01(uint64_t seed, int64_t step, uint32_t g, uint64_t salt) {
-    uint64_t h = mix13(seed ^ mix13((uint64_t)step * 0x9e3779b97f4a7c15ULL + salt));
-    h = mix13(h ^ ((uint64_t)g * 0xd1b54a32d192ed03ULL));
-    return (double)(h >> 11) * 0x1.0p-53;
+/* counter-based uniform deviate for parallel, order-independent decisions:
+ * u = hash_u01(hash_key(seed, step, salt), gid) */
+static inline uint64_t hash_key(uint64_t seed, int64_t step, uint64_t salt) {
+    return mix13(seed ^ mix13((uint64_t)step * 0x9e3779b97f4a7c15ULL + salt));
+}
+static inline double hash_u01(uint64_t key, uint32_t g) {
+    return (double)(mix13(key ^ ((uint64_t)g * 0xd1b54a32d192ed03ULL)) >> 11) * 0x1.0p-53;
 }
 
 /* Stable parallel counting sort of all slot arrays by cell index (column-major).
@@ -996,20 +998,35 @@ static void bonded_forces(Sys *s, const Params *P) {
 /* ------------------------------------------------------------------ chemistry */
 
 typedef struct { int slot; double d2; } nbr_t;
+#define CHEM_MARGIN 0.5 /* max displacement since the last cell sort that chemistry tolerates */
 
-/* all N beads within r of slot ks, sorted by distance (needs fresh cell sort) */
+/* all beads of the given type within rcut of slot ks, sorted by distance (ties
+ * by gid).  Uses the cell index of the last sort: the sub-cells of a column are
+ * contiguous in slot order, so each column contributes one or two slot ranges. */
 static int find_type_near(Sys *s, int ks, double rcut, int type, nbr_t *out, int maxout) {
     const double xk = s->x[ks], yk = s->y[ks], L = s->L, r2c = rcut * rcut;
+    const int ncx = s->ncx, ncy = s->ncy;
     const int c = cell_of_pos(s, xk, yk);
-    const int cx = c / s->ncy, cy = c % s->ncy;
-    const int rx = (int)ceil(rcut * s->icsx), ry = (int)ceil(rcut * s->icsy);
+    const int cx = c / ncy, cy = c % ncy;
+    const int rx = (int)ceil((rcut + CHEM_MARGIN) * s->icsx), ry = (int)ceil((rcut + CHEM_MARGIN) * s->icsy);
     int n = 0;
     for (int ox = -rx; ox <= rx; ox++) {
-        const int cxx = ((cx + ox) % s->ncx + s->ncx) % s->ncx;
-        for (int oy = -ry; oy <= ry; oy++) {
-            const int cyy = ((cy + oy) % s->ncy + s->ncy) % s->ncy;
-            const int cc = cxx * s->ncy + cyy;
-            for (int j = s->cstart[cc]; j < s->cstart[cc + 1]; j++) {
+        int cxx = cx + ox;
+        cxx += cxx < 0 ? ncx : 0;
+        cxx -= cxx >= ncx ? ncx : 0;
+        const int base = cxx * ncy;
+        int r0[2], r1[2], nr = 0;
+        const int lo = cy - ry, hi = cy + ry; /* inclusive sub-cell window */
+        if (lo >= 0 && hi < ncy) { r0[nr] = s->cstart[base + lo]; r1[nr] = s->cstart[base + hi + 1]; nr++; }
+        else if (lo < 0) {
+            r0[nr] = s->cstart[base + lo + ncy]; r1[nr] = s->cstart[base + ncy]; nr++;
+            r0[nr] = s->cstart[base]; r1[nr] = s->cstart[base + hi + 1]; nr++;
+        } else {
+            r0[nr] = s->cstart[base + lo]; r1[nr] = s->cstart[base + ncy]; nr++;
+            r0[nr] = s->cstart[base]; r1[nr] = s->cstart[base + hi - ncy + 1]; nr++;
+        }
+        for (int q = 0; q < nr; q++)
+            for (int j = r0[q]; j < r1[q]; j++) {
                 if (s->type[j] != type || j == ks) continue;
                 const double dx = minimg(s->x[j] - xk, L), dy = minimg(s->y[j] - yk, L);
                 const double d2 = dx * dx + dy * dy;
@@ -1019,7 +1036,6 @@ static int find_type_near(Sys *s, int ks, double rcut, int type, nbr_t *out, int
                     n++;
                 }
             }
-        }
     }
     /* insertion sort by distance, ties by gid for determinism */
     for (int a = 1; a < n; a++) {
@@ -1034,8 +1050,8 @@ static int find_type_near(Sys *s, int ks, double rcut, int type, nbr_t *out, int
     return n;
 }
 
-/* Parallel scan: slots for which pred(d) holds go to s->glist in increasing
- * slot order (independent of the thread count).  Returns the count. */
+/* Parallel scan: slots d for which COND holds go to s->glist in increasing
+ * slot order (independent of the thread count); the count goes to nout. */
 #define COLLECT_SLOTS(s, COND, nout)                                                    \
     do {                                                                                \
         int nth_ = omp_get_max_threads();                                               \
@@ -1058,12 +1074,14 @@ static int find_type_near(Sys *s, int ks, double rcut, int type, nbr_t *out, int
     } while (0)
 
 static int feed_outside(Sys *s, const Params *P, int64_t step);
+static double g_t_react = 0, g_t_decay = 0, g_t_feed = 0;
 
 /* lipid synthesis / catalyst replication / decay; returns 1 if beads moved */
 static int chemistry(Sys *s, const Params *P, int64_t step, int do_react, int do_feed) {
     int moved = 0;
     const int ml = s->mlen;
     const double L = s->L;
+    double tc0 = wtime();
     if (do_react) {
         /* catalysts, in slot order, then shuffled with the serial RNG */
         int nk;
@@ -1131,18 +1149,21 @@ static int chemistry(Sys *s, const Params *P, int64_t step, int do_react, int do
             }
         }
         free(ks);
+        g_t_react += wtime() - tc0;
+        tc0 = wtime();
         /* decay: independent per-bead decisions from a counter-based hash of
          * (seed, step, gid), so the scan is parallel and order independent */
         if (P->p_ld > 0 || P->p_kd > 0 || P->p_nd > 0) {
             const int8_t *mp = s->mpos;
             const uint32_t *gd = s->gid;
-            const uint64_t sd = s->seed;
+            const uint64_t kl = hash_key(s->seed, step, 11), kk = hash_key(s->seed, step, 12),
+                           kn = hash_key(s->seed, step, 13);
             const double pld = P->p_ld, pkd = P->p_kd, pnd = P->p_nd;
             int nd;
             COLLECT_SLOTS(s,
-                          ((mp[d] == 0 && pld > 0 && hash_u01(sd, step, gd[d], 11) < pld) ||
-                           ((ty[d] == TKA || ty[d] == TKB) && pkd > 0 && hash_u01(sd, step, gd[d], 12) < pkd) ||
-                           (ty[d] == TN && pnd > 0 && hash_u01(sd, step, gd[d], 13) < pnd)),
+                          ((mp[d] == 0 && pld > 0 && hash_u01(kl, gd[d]) < pld) ||
+                           ((ty[d] == TKA || ty[d] == TKB) && pkd > 0 && hash_u01(kk, gd[d]) < pkd) ||
+                           (ty[d] == TN && pnd > 0 && hash_u01(kn, gd[d]) < pnd)),
                           nd);
             for (int q = 0; q < nd; q++) {
                 const int d = s->glist[q];
@@ -1170,7 +1191,10 @@ static int chemistry(Sys *s, const Params *P, int64_t step, int do_react, int do
             }
         }
     }
+    if (do_react) g_t_decay += wtime() - tc0;
+    tc0 = wtime();
     if (do_feed) feed_outside(s, P, step);
+    g_t_feed += wtime() - tc0;
     return moved;
 }
 
@@ -1570,6 +1594,23 @@ static double kinetic_T(const Sys *s, double dt, double *px, double *py) {
     return k2 / (2.0 * s->N - 2.0);
 }
 
+/* compare two params files ignoring comment lines and the restart key */
+static int same_params_file(const char *a, const char *b) {
+    FILE *fa = fopen(a, "r"), *fb = fopen(b, "r");
+    int same = fa && fb;
+    char la[2048], lb[2048];
+    while (same) {
+        char *ra, *rb;
+        do { ra = fgets(la, sizeof la, fa); } while (ra && (la[0] == '#' || !strncmp(la, "restart ", 8)));
+        do { rb = fgets(lb, sizeof lb, fb); } while (rb && (lb[0] == '#' || !strncmp(lb, "restart ", 8)));
+        if (!ra || !rb) { same = !ra && !rb; break; }
+        if (strcmp(la, lb)) same = 0;
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return same;
+}
+
 static void ensure_dir(const char *d) {
     if (mkdir(d, 0755) != 0 && errno != EEXIST) die("cannot create directory %s: %s", d, strerror(errno));
 }
@@ -1653,18 +1694,27 @@ int main(int argc, char **argv) {
         }
     }
     {
-        const int rx = (int)ceil(P.r_cat * s->icsx), ry = (int)ceil(P.r_cat * s->icsy);
+        const int rx = (int)ceil((P.r_cat + CHEM_MARGIN) * s->icsx), ry = (int)ceil((P.r_cat + CHEM_MARGIN) * s->icsy);
         if (s->ncx < 2 * rx + 1 || s->ncy < 2 * ry + 1) die("box too small for r_cat");
     }
+    if (restarting) sort_cells(s); /* identity permutation; builds the cell index for chemistry */
 
     /* parameters used */
     snprintf(path, sizeof path, "%s/params.ini", outdir);
-    if (restarting && file_exists(path)) {
-        char old[2100];
-        snprintf(old, sizeof old, "%s/params_before_%010lld.ini", outdir, (long long)s->step);
-        if (rename(path, old) != 0) logmsg("warning: could not keep old params.ini\n");
+    {
+        /* keep the previous params.ini (as params_before_<step>.ini) only if the
+         * parameters actually changed at this restart */
+        char newp[2100];
+        snprintf(newp, sizeof newp, "%s.new", path);
+        write_params(&P, newp, argc - 3, argv + 3);
+        if (restarting && file_exists(path) && !same_params_file(path, newp)) {
+            char old[2100];
+            snprintf(old, sizeof old, "%s/params_before_%010lld.ini", outdir, (long long)s->step);
+            if (rename(path, old) != 0) logmsg("warning: could not keep old params.ini\n");
+            else logmsg("parameters changed at restart; previous ones kept in %s\n", old);
+        }
+        if (rename(newp, path) != 0) die("cannot write %s", path);
     }
-    write_params(&P, path, argc - 3, argv + 3);
 
     /* stats / events files */
     char spath[2048], epath[2048];
@@ -1707,9 +1757,11 @@ int main(int argc, char **argv) {
         s->maxbond = 0;
         if (P.snap_every > 0) write_snapshot(s, outdir);
     } else {
+        /* a restart into a fresh directory gets the starting snapshot, but only
+         * on the regular snapshot cadence (never an off-cadence file) */
         char sp[2100];
         snprintf(sp, sizeof sp, "%s/snap_%010lld.bin", outdir, (long long)s->step);
-        if (P.snap_every > 0 && !file_exists(sp)) write_snapshot(s, outdir);
+        if (P.snap_every > 0 && s->step % P.snap_every == 0 && !file_exists(sp)) write_snapshot(s, outdir);
     }
 
     const double dt = P.dt, dt2 = dt * dt, cvt = (0.5 + P.lambda) * dt, L = s->L;
@@ -1729,14 +1781,18 @@ int main(int argc, char **argv) {
          *    vh' = v + dt/2 f      = vh + dt f
          *  after the new forces f' the full velocity is v' = vh' + dt/2 f'. */
         const int N = s->N;
+        double dmax = 0.0;
         {
             double *restrict x = s->x, *restrict y = s->y, *restrict vx = s->vx, *restrict vy = s->vy;
             const double *restrict fx = s->fx, *restrict fy = s->fy;
             double *restrict vtx = s->vtx, *restrict vty = s->vty;
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) reduction(max : dmax)
             for (int i = 0; i < N; i++) {
-                double xi = x[i] + dt * vx[i] + dt2 * fx[i];
-                double yi = y[i] + dt * vy[i] + dt2 * fy[i];
+                const double ddx = dt * vx[i] + dt2 * fx[i], ddy = dt * vy[i] + dt2 * fy[i];
+                const double dd = fmax(fabs(ddx), fabs(ddy));
+                dmax = dd > dmax ? dd : dmax;
+                double xi = x[i] + ddx;
+                double yi = y[i] + ddy;
                 if (xi < 0.0) { xi += L; if (xi >= L) xi -= L; }
                 else if (xi >= L) xi -= L;
                 if (yi < 0.0) { yi += L; if (yi >= L) yi -= L; }
@@ -1751,19 +1807,25 @@ int main(int argc, char **argv) {
         }
         double t1 = wtime();
         tm.integ += t1 - t0;
-        sort_cells(s);
-        double t2 = wtime();
-        tm.sort += t2 - t1;
-        /* 2. chemistry on the new configuration */
+        /* 2. chemistry on the new configuration, using the cell index of the
+         *    previous sort (valid: every bead moved less than CHEM_MARGIN) */
         if (P.chem) {
             const int do_react = (ns % P.n_chem) == 0;
             const int do_feed = P.feed && (ns % P.feed_every) == 0;
             if (do_react || do_feed) {
-                if (chemistry(s, &P, ns, do_react, do_feed)) sort_cells(s);
+                if (dmax >= CHEM_MARGIN) {
+                    logmsg("warning: step %lld max displacement %.3f >= %.2f, extra cell sort\n", (long long)ns, dmax,
+                           CHEM_MARGIN);
+                    sort_cells(s);
+                }
+                chemistry(s, &P, ns, do_react, do_feed);
             }
         }
+        double t2 = wtime();
+        tm.chem += t2 - t1;
+        sort_cells(s);
         double t3 = wtime();
-        tm.chem += t3 - t2;
+        tm.sort += t3 - t2;
         /* 3. forces */
         pair_forces(s, &P, ns);
         double t4 = wtime();
@@ -1819,6 +1881,8 @@ int main(int argc, char **argv) {
         logmsg("timing: %lld steps, %.4f ms/step (integrate %.4f, sort %.4f, pair %.4f, bonded %.4f, chem %.4f, io %.4f)\n",
                (long long)nst, 1e3 * tot / nst, 1e3 * tm.integ / nst, 1e3 * tm.sort / nst, 1e3 * tm.pair / nst,
                1e3 * tm.bond / nst, 1e3 * tm.chem / nst, 1e3 * tm.io / nst);
+        logmsg("chemistry per step: reactions %.4f, decay %.4f, feed %.4f ms\n", 1e3 * g_t_react / nst,
+               1e3 * g_t_decay / nst, 1e3 * g_t_feed / nst);
     }
     logmsg("done at step %lld%s\n", (long long)s->step, stopped_early ? " (stopped early; restart to continue)" : "");
     if (g_log) fclose(g_log);
