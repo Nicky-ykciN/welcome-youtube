@@ -126,8 +126,9 @@ class Tracker:
         return R
 
     def _valid_children(self, k, children):
+        """children are cell ids in frame k + 1."""
         m = self.cfg["confirm_frames"]
-        reach = {c: self._reach((k, c), m) for c in children}
+        reach = {c: self._reach((k + 1, c), m) for c in children}
         valid, censored = [], False
         for c in children:
             R = reach[c]

@@ -140,8 +140,8 @@ def _holes_torus(gpix, ng, r_pix):
 
 def detect(snap, cfg=None):
     """Detect cells in a Snapshot. Returns dict with 'cells' (list of dict), 'label' (ng x ng
-    int16 global lumen label grid, -1 = none), 'bead_cell' (int16 per bead: lumen cell for
-    solvent beads, membrane cell for assigned lipid beads, -1 otherwise), 'h', 'ng',
+    int16 global lumen label grid, -1 = none), 'bead_cell' (int32 per bead: c >= 0 solvent bead
+    in the lumen of cell c; -c-2 lipid bead in the membrane of cell c; -1 otherwise), 'h', 'ng',
     'aggregates' (summary)."""
     c = dict(DEFAULTS)
     if cfg:
@@ -260,7 +260,9 @@ def detect(snap, cfg=None):
     ncell = len(lumens)
 
     # ---- assign lipids of each aggregate to nearest lumen of that aggregate
-    bead_cell = np.full(nb, -1, np.int16 if ncell < 32000 else np.int32)
+    # bead_cell: cell id of the lumen for solvent beads inside a lumen; for lipid beads that are
+    # part of a cell wall: -(cell id) - 2  (so -1 = none, <= -2 = membrane of cell -v-2)
+    bead_cell = np.full(nb, -1, np.int32)
     sm = solvent & (bead_lab >= 0)
     bead_cell[sm] = bead_lab[sm]
     n_lip = np.zeros(ncell, np.int64)
@@ -302,7 +304,7 @@ def detect(snap, cfg=None):
             for b, cc in zip(missing, bl[nn2].tolist()):
                 mol_cell.setdefault(int(mol[b]), cc)
         cell_of_bead = np.array([mol_cell[m] for m in mols_here.tolist()])
-        bead_cell[beads] = cell_of_bead
+        bead_cell[beads] = -cell_of_bead - 2
         for mm, cc in mol_cell.items():
             n_lip[cc] += 1
         np.add.at(inner, hl[dist <= c["leaflet_in"]], 1)

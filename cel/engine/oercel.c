@@ -89,6 +89,17 @@ static void *xcalloc(size_t n) {
     return p;
 }
 
+/* Per-bead arrays are allocated with staggered base addresses: identical
+ * sizes from an aligned allocator put every array at the same address modulo
+ * 4 KiB, so the ~16 streams of the sort/force loops collide in the same L1
+ * sets (4K aliasing).  These arrays live for the whole run and are never freed. */
+static void *xmalloc_stagger(size_t n) {
+    static unsigned k = 0;
+    const size_t off = (size_t)((k++ * 7u) % 61u) * 64u + 64u * 3u;
+    char *p = xmalloc(n + off + 64);
+    return p + off;
+}
+
 static double wtime(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -468,15 +479,18 @@ static void sys_alloc(Sys *s, int N, double L, int mlen, int nH, int nthreads) {
     s->mlen = mlen;
     s->nH = nH;
     size_t dn = (size_t)N * sizeof(double);
-    s->x = xmalloc(dn); s->y = xmalloc(dn); s->vx = xmalloc(dn); s->vy = xmalloc(dn);
-    s->fx = xcalloc(dn); s->fy = xcalloc(dn); s->vtx = xmalloc(dn); s->vty = xmalloc(dn);
-    s->x2 = xmalloc(dn); s->y2 = xmalloc(dn); s->vx2 = xmalloc(dn); s->vy2 = xmalloc(dn);
-    s->vtx2 = xmalloc(dn); s->vty2 = xmalloc(dn);
-    s->type = xmalloc(N); s->type2 = xmalloc(N);
-    s->gid = xmalloc(N * sizeof(uint32_t)); s->gid2 = xmalloc(N * sizeof(uint32_t));
-    s->cellof = xmalloc(N * sizeof(int));
-    s->slot = xmalloc(N * sizeof(int));
-    s->mol_of = xmalloc(N * sizeof(int32_t));
+#define SA(n) xmalloc_stagger(n)
+    s->x = SA(dn); s->y = SA(dn); s->vx = SA(dn); s->vy = SA(dn);
+    s->fx = SA(dn); s->fy = SA(dn); s->vtx = SA(dn); s->vty = SA(dn);
+    memset(s->fx, 0, dn); memset(s->fy, 0, dn);
+    s->x2 = SA(dn); s->y2 = SA(dn); s->vx2 = SA(dn); s->vy2 = SA(dn);
+    s->vtx2 = SA(dn); s->vty2 = SA(dn);
+    s->type = SA(N); s->type2 = SA(N);
+    s->gid = SA(N * sizeof(uint32_t)); s->gid2 = SA(N * sizeof(uint32_t));
+    s->cellof = SA(N * sizeof(int));
+    s->slot = SA(N * sizeof(int));
+    s->mol_of = SA(N * sizeof(int32_t));
+#undef SA
     for (int i = 0; i < N; i++) s->mol_of[i] = -1;
     s->ncx = (int)floor(L);
     s->ncy = (int)floor(L);
