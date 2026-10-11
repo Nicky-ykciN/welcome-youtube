@@ -1,3 +1,5 @@
 runs/
 *.o
 __pycache__/
+engine/oercel
+engine/tests/forcetest
