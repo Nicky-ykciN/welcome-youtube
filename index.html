@@ -105,7 +105,7 @@ button.primary { background: var(--accent); color: #1a0a16; border-color: var(--
       <section>
         <h2>Spelregels</h2>
         <ul class="how">
-          <li><b>Energie</b> stroomt binnen bij drijvende bronnen (paars), diffundeert, en elke cel eet wat onder haar ligt.</li>
+          <li><b>Petrischaal</b>: alles leeft in één ronde schaal met een wand. Energie stroomt binnen bij drijvende bronnen (paars), verspreidt zich, en elke cel eet wat onder haar ligt.</li>
           <li><b>Brein</b>: 14 zintuigen → 10 neuronen → 9 acties: bewegen, plakken, delen, signaal uitzenden, aanvallen, delen in tweeën, plus 2 geheugenwaarden.</li>
           <li><b>Kosten</b>: leven, bewegen en bindingen kosten energie, die als warmte verdwijnt. Wie op is, sterft en geeft zijn lichaam terug aan het veld.</li>
           <li><b>Erfelijkheid</b>: een kind krijgt het netwerk van de ouder met kleine mutaties. Wil de ouder plakken, dan blijft het kind vastzitten: zo ontstaan klonale klompen.</li>
@@ -120,8 +120,9 @@ button.primary { background: var(--accent); color: #1a0a16; border-color: var(--
 (() => {
 "use strict";
 // ---------- wereld ----------
-const W = 192, G = 96, CS = W / G;         // wereldmaat, veldgrid, celmaat
-const MAXN = 7000;
+const W = 256, G = 128, CS = W / G;        // wereldmaat, veldgrid, celmaat
+const MAXN = 12000;
+const DC = W / 2, DR = W / 2 - 6;          // petrischaal: middelpunt en straal
 const NI = 14, NH = 10, NO = 9;
 const W1 = NI * NH, W2 = (NH + 1) * NO, GL = W1 + W2 + 3;
 const BIN = 4, NBIN = W / BIN;
@@ -130,7 +131,7 @@ const FMAX = 6, EAT = 0.25, BASE = 0.015, MOVE_F = 0.22, MOVE_C = 0.006;
 const REPRO_E = 5, BODY_E = 1, MAXAGE = 2500;
 const REST = 1.9, BOND_MAX = 5, BOND_K = 0.12, BOND_C = 0.0015, SHARE = 0.12;
 const DAMP = 0.78, DF = 0.06, DS = 0.2, SDECAY = 0.93;
-const INFLOW_TOTAL = 85, MIN_POP = 150, NVENT = 7;
+const INFLOW_TOTAL = 105, MIN_POP = 150, NVENT = 7;
 
 const px = new Float32Array(MAXN), py = new Float32Array(MAXN), vx = new Float32Array(MAXN), vy = new Float32Array(MAXN);
 const en = new Float32Array(MAXN), mem0 = new Float32Array(MAXN), mem1 = new Float32Array(MAXN);
@@ -211,6 +212,7 @@ function buildRate() {
   const sig2 = 2 * 11 * 11;
   for (let y = 0; y < G; y++) for (let x = 0; x < G; x++) {
     let r = 0.25;
+    if (!dish[y * G + x]) { rate[y * G + x] = 0; continue; }
     for (const v of vents) {
       let dx = x - v.x, dy = y - v.y;
       if (dx > G / 2) dx -= G; else if (dx < -G / 2) dx += G;
@@ -223,21 +225,30 @@ function buildRate() {
   for (let c = 0; c < G * G; c++) rate[c] *= k;
 }
 function moveVents() {
+  const c = G / 2, lim = DR / CS - 14;
   for (const v of vents) {
     v.d += gauss() * 0.3;
-    v.x = (v.x + Math.cos(v.d) * 0.4 + G) % G;
-    v.y = (v.y + Math.sin(v.d) * 0.4 + G) % G;
+    if (Math.hypot(v.x - c, v.y - c) > lim) v.d = Math.atan2(c - v.y, c - v.x);   // bronnen blijven in de schaal
+    v.x += Math.cos(v.d) * 0.4; v.y += Math.sin(v.d) * 0.4;
   }
+}
+// masker: welke veldcellen liggen in de schaal
+const dish = new Uint8Array(G * G);
+for (let y = 0; y < G; y++) for (let x = 0; x < G; x++) dish[y * G + x] = Math.hypot((x + 0.5) * CS - DC, (y + 0.5) * CS - DC) < DR ? 1 : 0;
+function randomInDish() {
+  const a = Math.random() * 6.2832, r = DR * 0.97 * Math.sqrt(Math.random());
+  return [DC + Math.cos(a) * r, DC + Math.sin(a) * r];
 }
 
 function reset() {
   alive.fill(0); count = 0; nFree = 0; t = 0;
   for (let i = MAXN - 1; i >= 0; i--) freeList[nFree++] = i;
   vents.length = 0;
-  for (let k = 0; k < NVENT; k++) vents.push({ x: Math.random() * G, y: Math.random() * G, d: Math.random() * 6.28, a: 0.6 + Math.random() * 1.4 });
+  for (let k = 0; k < NVENT; k++) vents.push({ x: G / 2 + (Math.random() - 0.5) * G * 0.6, y: G / 2 + (Math.random() - 0.5) * G * 0.6, d: Math.random() * 6.28, a: 0.6 + Math.random() * 1.4 });
   buildRate();
-  for (let c = 0; c < G * G; c++) { F[c] = Math.min(FMAX, 1 + rate[c] * 120); S[c] = 0; }
-  for (let k = 0; k < 900; k++) spawnRandom(Math.random() * W, Math.random() * W);
+  for (let c = 0; c < G * G; c++) { F[c] = dish[c] ? Math.min(FMAX, 1 + rate[c] * 120) : 0; S[c] = 0; }
+  for (let k = 0; k < 1200; k++) spawnRandom(...randomInDish());
+  dirty = true;
   hist.length = 0;
   computeStats();
 }
@@ -369,7 +380,14 @@ function step() {
     if (!alive[i]) continue;
     const v2 = vx[i] * vx[i] + vy[i] * vy[i];
     if (v2 > 2.25) { const k = 1.5 / Math.sqrt(v2); vx[i] *= k; vy[i] *= k; }
-    px[i] = wrap(px[i] + vx[i]); py[i] = wrap(py[i] + vy[i]);
+    px[i] += vx[i]; py[i] += vy[i];
+    // wand van de petrischaal
+    const ex = px[i] - DC, ey = py[i] - DC, er = Math.sqrt(ex * ex + ey * ey);
+    if (er > DR) {
+      const k = DR / er; px[i] = DC + ex * k; py[i] = DC + ey * k;
+      const vn = (vx[i] * ex + vy[i] * ey) / er;
+      if (vn > 0) { vx[i] -= vn * ex / er; vy[i] -= vn * ey / er; }
+    }
     if (px[i] >= W) px[i] = 0; if (py[i] >= W) py[i] = 0;
     if (en[i] <= 0 || age[i] > MAXAGE) kill(i);
   }
@@ -400,14 +418,14 @@ function step() {
     for (let x = 0; x < G; x++) {
       const c = r0 + x, l = r0 + ((x + G - 1) % G), r = r0 + ((x + 1) % G);
       let f = F[c] + DF * (F[l] + F[r] + F[ru + x] + F[rd + x] - 4 * F[c]) + rate[c] * k;
-      F2[c] = f > FMAX ? FMAX : f;
-      S2[c] = (S[c] + DS * (S[l] + S[r] + S[ru + x] + S[rd + x] - 4 * S[c])) * SDECAY;
+      F2[c] = dish[c] ? (f > FMAX ? FMAX : f) : 0;
+      S2[c] = dish[c] * (S[c] + DS * (S[l] + S[r] + S[ru + x] + S[rd + x] - 4 * S[c])) * SDECAY;
     }
   }
   let tmp = F; F = F2; F2 = tmp; tmp = S; S = S2; S2 = tmp;
 
   // spontane abiogenese als het leven bijna uitsterft
-  if (count < MIN_POP) for (let n = 0; n < 4; n++) spawnRandom(Math.random() * W, Math.random() * W);
+  if (count < MIN_POP) for (let n = 0; n < 4; n++) spawnRandom(...randomInDish());
 
   t++;
   if (t % 30 === 0) computeStats();
@@ -514,6 +532,13 @@ function render() {
     }
   }
   ctx.putImageData(img, 0, 0);
+  // alles buiten de schaal donker, plus een glazen rand
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, RS, RS); ctx.moveTo((DC + DR + 1.5) * SC, DC * SC); ctx.arc(DC * SC, DC * SC, (DR + 1.5) * SC, 0, 6.2832, true);
+  ctx.fillStyle = "#07060c"; ctx.fill();
+  ctx.beginPath(); ctx.arc(DC * SC, DC * SC, (DR + 1.5) * SC, 0, 6.2832);
+  ctx.strokeStyle = "rgba(220,210,255,0.22)"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.restore();
 }
 
 const chart = document.getElementById("chart"), cctx = chart.getContext("2d");
@@ -537,11 +562,11 @@ function drawChart() {
 const $ = (id) => document.getElementById(id);
 const fmt = (n) => Math.round(n).toLocaleString("nl-NL");
 let running = !matchMedia("(prefers-reduced-motion: reduce)").matches;
-let speed = 4, stepsDone = 0, lastT = performance.now(), sps = 0;
+let dirty = true, speed = 4, stepsDone = 0, lastT = performance.now(), sps = 0;
 $("play").textContent = running ? "Pauze" : "Start";
 $("play").onclick = () => { running = !running; $("play").textContent = running ? "Pauze" : "Start"; };
 $("reset").onclick = () => reset();
-$("mode").onchange = (e) => { mode = +e.target.value; computeStats(); };
+$("mode").onchange = (e) => { mode = +e.target.value; computeStats(); dirty = true; };
 function bindRange(id, outId, f) { const el = $(id); const upd = () => { $(outId).textContent = f(+el.value); }; el.oninput = upd; upd(); }
 bindRange("speed", "oSpeed", (v) => (speed = v, v));
 bindRange("inflow", "oInflow", (v) => (params.inflow = v, v.toFixed(2) + "×"));
@@ -553,14 +578,15 @@ view.addEventListener("pointerdown", (e) => {
   for (let y = -8; y <= 8; y++) for (let x = -8; x <= 8; x++) {
     if (x * x + y * y > 64) continue;
     const c = (((gy + y) | 0) + G) % G * G + ((((gx + x) | 0) + G) % G);
-    F[c] = FMAX;
+    if (dish[c]) F[c] = FMAX;
+    dirty = true;
   }
 });
 
 function frame(now) {
   if (running) { for (let s = 0; s < speed; s++) step(); stepsDone += speed; }
   if (now - lastT > 500) { sps = stepsDone * 1000 / (now - lastT); stepsDone = 0; lastT = now; }
-  render();
+  if (running || dirty) { render(); dirty = false; }   // niet tekenen als er niets verandert
   $("hud").textContent = `t=${t}  ·  pop=${count}  ·  ${Math.round(sps)} stappen/s`;
   $("sPop").textContent = fmt(count); $("sOrg").textContent = fmt(stats.org); $("sBig").textContent = fmt(stats.big);
   $("sGen").textContent = fmt(stats.gen); $("sEc").textContent = fmt(stats.ec); $("sEf").textContent = fmt(stats.ef);
@@ -568,9 +594,49 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 reset();
+// ---------- opslaan / laden van een hele wereld ----------
+function toB64(arr) {
+  const u = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength); let s = "";
+  for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function fromB64(str, T) {
+  const s = atob(str), u = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
+  return new T(u.buffer);
+}
+function exportState() {
+  const ids = []; for (let i = 0; i < MAXN; i++) if (alive[i]) ids.push(i);
+  const map = new Int32Array(MAXN).fill(-1); ids.forEach((i, n) => (map[i] = n));
+  const n = ids.length, f = new Float32Array(n * 5), gq = new Int16Array(n * GL), b = new Int32Array(n * 4);
+  ids.forEach((i, k) => {
+    f.set([px[i], py[i], en[i], gen[i], age[i]], k * 5);
+    for (let q = 0; q < GL; q++) gq[k * GL + q] = Math.max(-32767, Math.min(32767, Math.round(genome[i * GL + q] * 1000)));
+    for (let s = 0; s < 4; s++) { const j = bonds[i * 4 + s]; b[k * 4 + s] = j >= 0 ? map[j] : -1; }
+  });
+  return { v: 1, t, n, vents: vents.map((v) => ({ ...v })), cells: toB64(f), genome: toB64(gq), bonds: toB64(b), food: toB64(F.slice()) };
+}
+function importState(st) {
+  alive.fill(0); count = 0; nFree = 0;
+  for (let i = MAXN - 1; i >= 0; i--) freeList[nFree++] = i;
+  const f = fromB64(st.cells, Float32Array), gq = fromB64(st.genome, Int16Array), b = fromB64(st.bonds, Int32Array);
+  const ids = [];
+  for (let k = 0; k < st.n; k++) {
+    const i = alloc(); ids.push(i);
+    px[i] = f[k * 5]; py[i] = f[k * 5 + 1]; en[i] = f[k * 5 + 2]; gen[i] = f[k * 5 + 3]; age[i] = f[k * 5 + 4];
+    for (let q = 0; q < GL; q++) genome[i * GL + q] = gq[k * GL + q] / 1000;
+    lineageColor(i);
+  }
+  for (let k = 0; k < st.n; k++) for (let s = 0; s < 4; s++) { const j = b[k * 4 + s]; if (j > k) addBond(ids[k], ids[j]); }
+  F.set(fromB64(st.food, Float32Array)); S.fill(0);
+  vents.length = 0; for (const v of st.vents) vents.push({ ...v });
+  buildRate(); t = st.t; hist.length = 0; computeStats(); dirty = true;
+}
+
 window.__sim = {
   step, stats: () => ({ t, count, ...stats }), setRunning: (v) => (running = v),
   peek: () => ({ px, py, bonds, alive, nbond, col, en, gen, MAXN, W, t }),
+  exportState, importState,
 };
 requestAnimationFrame(frame);
 })();
