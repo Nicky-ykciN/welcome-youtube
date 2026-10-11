@@ -5,13 +5,17 @@
  * Units: rc = 1, kT = 1 (configurable), bead mass = 1.  Periodic square box.
  *
  * Data layout: all per-bead state lives in "slot" order and is re-sorted by
- * cell (counting sort, column-major cell index) every step, so that the cell
- * list is just cstart[c]..cstart[c+1] and all hot loops stream contiguous
- * memory.  Every bead also has a permanent global id (gid, 0..N-1) used for
- * bonds, the pair-noise hash, snapshots and the event log; slot[gid] maps back.
+ * cell (stable counting sort; cells are 1 wide in x and split into nsub
+ * sub-cells in y, column-major) every step, so the cell list is just
+ * cstart[c]..cstart[c+1] and all hot loops stream contiguous memory.  Every
+ * bead has a permanent id (gid, 0..N-1) used for the pair-noise hash,
+ * snapshots and the event log.  Lipid chains are stored per slot (nxt = slot of
+ * the next bead, mpos = position in the chain) and remapped by the sort;
+ * slot[gid] is only rebuilt for output.
  *
- * Parallel pair forces: half-shell stencil (self, up, and the three cells in
- * the next column).  Columns are grouped into an even number of strips; even
+ * Parallel pair forces: half shell per bead i = its own column upward
+ * (y_i .. y_i+1) plus the next column (y_i-1 .. y_i+1), two contiguous slot
+ * ranges selected through the sub-cell index.  Columns are grouped into an even number of strips; even
  * strips run concurrently, then odd strips.  A strip only writes to its own
  * columns plus the first column of the next strip, so this is race free with no
  * per-thread buffers, and the summation order per bead does not depend on the
@@ -487,6 +491,8 @@ typedef struct {
     /* time */
     int64_t step;
     double time;
+    double t_anchor, dt_anchor; /* time = t_anchor + (step - step_anchor) * dt */
+    int64_t step_anchor;
     uint64_t seed;
     rng_t rng;
     double maxbond;  /* running max since last stats row */
@@ -1610,6 +1616,9 @@ static void write_ckpt(Sys *s, const char *dir, int keep) {
     fwrite(s->rng.s, 8, 4, f);
     fwrite(&s->maxbond, 8, 1, f);
     fwrite(&g_warm_end, 8, 1, f);
+    fwrite(&s->t_anchor, 8, 1, f);
+    fwrite(&s->step_anchor, 8, 1, f);
+    fwrite(&s->dt_anchor, 8, 1, f);
     fwrite(s->gid, 4, N, f);
     fwrite(s->type, 1, N, f);
     fwrite(s->mpos, 1, N, f);
@@ -1659,6 +1668,11 @@ static void read_ckpt(Sys *s, const Params *P, const char *path) {
     double maxbond;
     freadx(&maxbond, 8, 1, f, "maxbond");
     freadx(&g_warm_end, 8, 1, f, "warm_end");
+    double ta, da;
+    int64_t sa;
+    freadx(&ta, 8, 1, f, "t_anchor");
+    freadx(&sa, 8, 1, f, "step_anchor");
+    freadx(&da, 8, 1, f, "dt_anchor");
     if (ml != P->lip_nH + P->lip_nT || nH != P->lip_nH) die("checkpoint lipid architecture differs from parameters");
     if (fabs(L - P->L) > 1e-12) die("checkpoint L=%g differs from parameter L=%g", L, P->L);
     sys_alloc(s, N, L, ml, nH, P->threads, P->feed_grid, P->nsub);
@@ -1667,6 +1681,8 @@ static void read_ckpt(Sys *s, const Params *P, const char *path) {
     s->seed = seed;
     memcpy(s->rng.s, rs, sizeof rs);
     s->maxbond = maxbond;
+    if (da == P->dt) { s->t_anchor = ta; s->step_anchor = sa; s->dt_anchor = da; }
+    else { s->t_anchor = time; s->step_anchor = step; s->dt_anchor = P->dt; } /* dt changed: new anchor */
     freadx(s->gid, 4, N, f, "gid");
     freadx(s->type, 1, N, f, "type");
     freadx(s->mpos, 1, N, f, "mpos");
@@ -1874,6 +1890,9 @@ int main(int argc, char **argv) {
         for (int i = 0; i < N; i++) { s->vtx[i] = s->vx[i]; s->vty[i] = s->vy[i]; }
         s->step = 0;
         s->time = 0.0;
+        s->t_anchor = 0.0;
+        s->step_anchor = 0;
+        s->dt_anchor = P.dt;
         sort_cells(s);
         pair_forces(s, &P, 0);
         bonded_forces(s, &P);
@@ -1979,14 +1998,16 @@ int main(int argc, char **argv) {
 #pragma omp parallel for schedule(static) reduction(max : dmax)
             for (int i = 0; i < N; i++) {
                 const double ddx = dt * vx[i] + dt2 * fx[i], ddy = dt * vy[i] + dt2 * fy[i];
-                const double dd = fmax(fabs(ddx), fabs(ddy));
+                const double adx = ddx < 0.0 ? -ddx : ddx, ady = ddy < 0.0 ? -ddy : ddy;
+                const double dd = adx > ady ? adx : ady;
                 dmax = dd > dmax ? dd : dmax;
-                double xi = x[i] + ddx;
-                double yi = y[i] + ddy;
-                if (xi < 0.0) { xi += L; if (xi >= L) xi -= L; }
-                else if (xi >= L) xi -= L;
-                if (yi < 0.0) { yi += L; if (yi >= L) yi -= L; }
-                else if (yi >= L) yi -= L;
+                /* periodic wrap into [0, L), branch free (vectorisable); the
+                 * second select catches x = -tiny -> x + L == L */
+                double xi = x[i] + ddx, yi = y[i] + ddy;
+                xi = xi < 0.0 ? xi + L : xi;
+                yi = yi < 0.0 ? yi + L : yi;
+                xi = xi >= L ? xi - L : xi;
+                yi = yi >= L ? yi - L : yi;
                 x[i] = xi;
                 y[i] = yi;
                 vtx[i] = vx[i] + cvt * fx[i];
@@ -2025,7 +2046,7 @@ int main(int argc, char **argv) {
         tm.bond += t5 - t4;
         double t6 = t5;
         s->step = ns;
-        s->time += dt;
+        s->time = s->t_anchor + (double)(ns - s->step_anchor) * dt;
         /* 5. output */
         if (P.stats_every > 0 && ns % P.stats_every == 0) {
             double px, py;

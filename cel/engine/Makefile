@@ -8,7 +8,7 @@ oercel: oercel.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
 clean:
-	rm -f oercel
+	rm -f oercel tests/forcetest
 
 .PHONY: clean
 
