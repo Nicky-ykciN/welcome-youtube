@@ -239,7 +239,7 @@ static const pdef_t PDEFS[] = {
     {"threads", PT_INT, OFF(threads), "2", "OpenMP threads"},
     {"nsub", PT_INT, OFF(nsub), "4", "performance only: y sub-cells per unit cell (1..8); same physics, different round-off order"},
     {"seed", PT_U64, OFF(seed), "1", "random seed"},
-    {"init", PT_STR, OFF(init), "soup", "soup | seeded | restart"},
+    {"init", PT_STR, OFF(init), "soup", "soup, seeded or restart"},
     {"restart", PT_STR, OFF(restart), "", "checkpoint file; if non-empty the run restarts from it"},
     {"restart_reseed", PT_INT, OFF(restart_reseed), "0", "1 = on restart use this ini's seed (branch) instead of the checkpoint's"},
     {"walltime", PT_DBL, OFF(walltime), "0", "stop cleanly (with checkpoint) after this many seconds (0 = off)"},
@@ -251,11 +251,11 @@ static const pdef_t PDEFS[] = {
     {"p_syn_a", PT_DBL, OFF(p_syn_a), "0.02", "lipid synthesis probability per check, Ka"},
     {"p_syn_b", PT_DBL, OFF(p_syn_b), "0.06", "lipid synthesis probability per check, Kb"},
     {"p_rep_a", PT_DBL, OFF(p_rep_a), "0.001", "catalyst replication probability per check, Ka"},
-    {"p_rep_b", PT_DBL, OFF(p_rep_b), "0.003", "catalyst replication probability per check, Kb"},
+    {"p_rep_b", PT_DBL, OFF(p_rep_b), "0.001", "catalyst replication probability per check, Kb"},
     {"mu", PT_DBL, OFF(mu), "0.02", "mutation probability per replication (a<->b)"},
-    {"p_ld", PT_DBL, OFF(p_ld), "1e-6", "lipid decay probability per molecule per check"},
-    {"p_kd", PT_DBL, OFF(p_kd), "1e-5", "catalyst decay probability per check"},
-    {"p_nd", PT_DBL, OFF(p_nd), "1e-5", "nutrient decay probability per check"},
+    {"p_ld", PT_DBL, OFF(p_ld), "2e-4", "lipid decay probability per molecule per check"},
+    {"p_kd", PT_DBL, OFF(p_kd), "5e-4", "catalyst decay probability per check"},
+    {"p_nd", PT_DBL, OFF(p_nd), "1e-4", "nutrient decay probability per check"},
     {"feed", PT_INT, OFF(feed), "1", "1 = food supply in the outside medium"},
     {"feed_every", PT_LONG, OFF(feed_every), "0", "food supply interval in steps (0 = n_chem)"},
     {"c_N", PT_DBL, OFF(c_N), "0.12", "target nutrient fraction in the outside medium"},
@@ -1781,9 +1781,31 @@ static void ensure_dir(const char *d) {
     if (mkdir(d, 0755) != 0 && errno != EEXIST) die("cannot create directory %s: %s", d, strerror(errno));
 }
 
+static void print_param_table(void) {
+    Params P;
+    memset(&P, 0, sizeof P);
+    printf("| key | default | meaning |\n|---|---|---|\n");
+    for (int k = 0; k < NPDEFS; k++) printf("| `%s` | %s | %s |\n", PDEFS[k].key, PDEFS[k].def[0] ? PDEFS[k].def : "(empty)", PDEFS[k].help);
+    default_amatrix(&P);
+    printf("\nDefault repulsion matrix a_ij (key `a_X_Y`, symmetric; `a_K_X` sets Ka and Kb at once):\n\n|    |");
+    for (int j = 0; j < NTYPES; j++) printf(" %s |", TNAME[j]);
+    printf("\n|---|");
+    for (int j = 0; j < NTYPES; j++) printf("---|");
+    printf("\n");
+    for (int i = 0; i < NTYPES; i++) {
+        printf("| **%s** |", TNAME[i]);
+        for (int j = 0; j < NTYPES; j++) printf(" %g |", P.a[i][j]);
+        printf("\n");
+    }
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--params")) {
+        print_param_table();
+        return 0;
+    }
     if (argc < 3) {
-        fprintf(stderr, "usage: %s params.ini outdir [key=value ...]\n", argv[0]);
+        fprintf(stderr, "usage: %s params.ini outdir [key=value ...]\n       %s --params   (print all parameters)\n", argv[0], argv[0]);
         return 2;
     }
     {
