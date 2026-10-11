@@ -14,9 +14,22 @@ A "living cell" in this project must satisfy all of these, each demonstrated by 
 | 5 | Heredity + selection | Catalyst variants are passed to daughters; the faster variant's share rises over time |
 | 6 | Death | Cells that lose their catalysts stop growing and decay |
 
-Nothing about cells is hard-coded. Membranes, compartments, growth and division must emerge
-from bead physics + local chemistry rules. If a fallback mechanism is needed (see §6) it must
-itself be local and documented honestly.
+## 0. The emergence rule (non-negotiable, set by the user)
+
+The user wants **emergent properties only — nothing placed, nothing engineered.**
+
+- Allowed: the *laws of nature* of this world — pair forces between bead types, bonds inside
+  molecules, local stochastic reactions between molecules that touch, global environmental
+  physics that treats every bead the same (temperature, a uniform energy/nutrient influx,
+  uniform gentle stirring, slow global cycles such as day/night or wet/dry).
+- Forbidden:
+  - placing any structure: no pre-built vesicles, membranes, cells or arranged molecules.
+    The only start state is a random, well-mixed soup. (`init=seeded` is removed.)
+  - any rule that knows about cells, membranes, compartments, inside/outside, cell size, or
+    that is triggered by a structure-level measurement (no flood fill of "outside", no
+    "divide when big", no division machinery such as the former FtsZ fallback).
+  - analysis results feeding back into the simulation. Analysis only observes.
+- If growth or division does not emerge, report that honestly. Never fake it.
 
 Machine: 4 cores (Xeon 2.1 GHz), 15 GB RAM, gcc 13 + OpenMP, Python 3 with numpy, scipy,
 matplotlib, PIL; ffmpeg. No GPU.
@@ -79,11 +92,13 @@ All reactions conserve bead count (types change, bonds are created/removed).
    becomes K of the same variant (with probability μ the other variant), a second N becomes W.
 3. **Decay (death / turnover)** — per check: each lipid molecule with p_ld becomes 4 × W (bonds
    removed); each K with p_kd becomes W; each N with p_nd becomes W.
-4. **Food supply (open system)** — maintain the nutrient fraction c_N among beads in the
-   *outside medium only*: on a coarse grid (cell ≈ 1.5–2), mark cells containing T beads as
-   membrane, flood-fill the non-membrane cells connected to the largest connected region =
-   outside; convert random W there into N until the outside N fraction reaches c_N. Nutrients may
-   enter cells only by permeating the membrane.
+4. **Food supply (open system)** — must be a *local, structure-blind* rule (§0). Choose and
+   document one of:
+   - a uniform influx: every W bead anywhere turns into N with a small probability per check
+     (like light or geochemistry producing nutrients everywhere);
+   - a fixed source region of the box (a "vent" strip/disk at fixed coordinates) where W turns
+     into N, so nutrients diffuse outward and form a gradient.
+   The old flood fill of "outside medium" is forbidden: it knew where membranes were.
 
 Each reaction is appended to the event log with step, kind, bead id(s), x, y, variant.
 
@@ -91,8 +106,9 @@ Each reaction is appended to the event log with step, kind, bead id(s), x, y, va
 
 - `init=soup`: random positions; lipid beads ≈ 8–15 % of all beads as whole randomly-oriented
   molecules, catalysts Ka ≈ 0.3–1 %, N at c_N, the rest W. Kb starts at 0 (arises by mutation).
-- `init=seeded` (for testing growth/division only, never for the final claims): one pre-built
-  vesicle with a few Ka inside, in a nutrient bath.
+- `init=seeded` is **removed** (§0). Remove the code path and its parameters.
+- Starting a tuning experiment from a checkpoint of an earlier *soup* run is fine (that state
+  emerged); editing a checkpoint by hand is not.
 - `restart=<checkpoint>`: continue a run exactly (positions, velocities, bonds, types, RNG, step).
 
 ## 5. File formats (both engine and tools must follow exactly)
@@ -125,14 +141,15 @@ Engine CLI: `engine/oercel params.ini outdir` with every option in the ini file 
 
 ## 6. Division
 
-Preferred: **emergent fission** — when lipid synthesis outpaces lumen growth the membrane gets
-excess area, the cell elongates and opposite sides of the bilayer touch and fuse into two closed
-vesicles. Tune synthesis/replication/permeability ratios to make this happen.
-
-Fallback (only after a genuine attempt at the preferred route, and stated honestly in every
-report): a minimal FtsZ-like contractile machinery — catalysts produce Z beads from N, Z is
-attracted to lipid heads, Z–Z bonds form on contact and their rest length shrinks over time,
-constricting the cell until the membrane pinches. Still local rules, no cell-level logic.
+Division must be **emergent fission** only. Known physical routes in real protocell research
+that the laws of this world may make possible:
+- membrane growth outpacing lumen growth → excess area → elongation/budding → opposite bilayer
+  sides touch and fuse → two closed vesicles;
+- osmotic imbalance (impermeable catalysts vs. permeable nutrients/water) changing shape;
+- environmental physics treating all beads equally, e.g. gentle uniform stirring/shear
+  (Szostak-lab vesicles divide under mild shear) or slow temperature cycles.
+Tune only laws and environment (§0). There is **no fallback**: the FtsZ-like machinery is
+forbidden. Type id 6 (Z) stays unused.
 
 ## 7. Analysis (tools/)
 

@@ -80,8 +80,11 @@ def track_cell(cells_json, track, step=None):
 
 
 def default_out(rundir, kind, suffix):
-    os.makedirs(BEELDEN, exist_ok=True)
-    return os.path.join(BEELDEN, f"{os.path.basename(os.path.abspath(rundir))}_{kind}_{suffix}.png")
+    """cel/beelden/ for real runs; synthetic test data never goes there (-> RUNDIR/beelden_test/)."""
+    synth = bool(ocio.read_params(rundir).get("synthetic", 0))
+    d = os.path.join(rundir, "beelden_test") if synth else BEELDEN
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"{os.path.basename(os.path.abspath(rundir))}_{kind}_{suffix}.png")
 
 
 def best_division(lin, cells_json):

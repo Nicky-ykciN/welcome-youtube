@@ -55,6 +55,33 @@ def pick_frames(parent, kids, n_panels=5):
     return panels[:6]
 
 
+def _arrowheads(img, p, info, L):
+    """Small white arrowheads pointing at the tracked cell(s), like in microscopy figures."""
+    from PIL import ImageFilter
+    x0, y0, w, h = info["view"]
+    ppu = info["ppu"]
+    W, H = img.size
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    da = ImageDraw.Draw(layer); ds = ImageDraw.Draw(shadow)
+    for c in p.get("cells", []):
+        dx = (c["x"] - x0) % L; dy = (c["y"] - y0) % L
+        px, py = dx * ppu, (h - dy) * ppu
+        rr = (0.5 * c["extent"] * 0.75 + 5.2) * ppu
+        u = np.array([0.62, -0.78])                     # from upper right
+        tip = np.array([px, py]) + u * rr
+        back = tip + u * 0.075 * W
+        nrm = np.array([-u[1], u[0]])
+        tri = [tuple(tip), tuple(back + nrm * 0.026 * W), tuple(back - nrm * 0.026 * W)]
+        if not (0 <= tip[0] < W and 0 <= tip[1] < H):
+            continue
+        ds.polygon([(a + 2, b + 3) for a, b in tri], fill=(0, 0, 0, 150))
+        da.polygon(tri, fill=(255, 255, 255, 235))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(3))
+    base = img.convert("RGBA"); base.alpha_composite(shadow); base.alpha_composite(layer)
+    img.paste(base.convert("RGB"))
+
+
 def _cell_at(frames_by_step, step, track):
     f = frames_by_step.get(step)
     if f is None:
@@ -75,11 +102,12 @@ def render(rundir, cells_json, lineage, event, panel_px=720, gap=16, n_panels=5,
     for p in panels:
         if p["phase"] == "ouder":
             c = _cell_at(fbs, p["step"], parent["id"])
-            p["center"] = (c["x"], c["y"]); p["ext"] = c["extent"] + 2 * c["r_eq"] * 0
+            p["center"] = (c["x"], c["y"]); p["cells"] = [c]
             p["need"] = c["extent"] + 10
         else:
             cs = [_cell_at(fbs, p["step"], k["id"]) for k in kids]
             cs = [c for c in cs if c is not None]
+            p["cells"] = cs
             if len(cs) == 2:
                 mid = periodic_mid((cs[0]["x"], cs[0]["y"]), (cs[1]["x"], cs[1]["y"]), L)
                 d = np.array([cs[1]["x"] - cs[0]["x"], cs[1]["y"] - cs[0]["y"]]); d -= L * np.round(d / L)
@@ -106,7 +134,7 @@ def render(rundir, cells_json, lineage, event, panel_px=720, gap=16, n_panels=5,
     n = len(panels)
     margin = int(0.05 * panel_px)
     head = int(0.205 * panel_px)
-    foot = int(0.16 * panel_px)
+    foot = int(0.19 * panel_px)
     Wt = n * panel_px + (n - 1) * gap + 2 * margin
     Ht = head + panel_px + foot
     bg = (12, 12, 14)
@@ -125,17 +153,22 @@ def render(rundir, cells_json, lineage, event, panel_px=720, gap=16, n_panels=5,
         x = margin + j * (panel_px + gap)
         if j == 0:
             style.scale_bar(img, info["ppu"], corner="br", frac=0.25, font_scale=1.6)
+        _arrowheads(img, p, info, L)
         tag = "t = 0 τ" if j == 0 else f"+{ocio.fmt_int_nl(round(p['dt']))} τ"
         style.text_with_shadow(img, (int(0.05 * panel_px), int(0.05 * panel_px)), tag,
                                style.font("Medium", int(0.040 * panel_px)), anchor="lt")
         out.paste(img, (x, head))
         cx = x + panel_px / 2
-        ly = head + panel_px + int(0.055 * panel_px)
+        ly = head + panel_px + int(0.085 * panel_px)
         d.text((cx, ly), p["label"], font=f_lab, fill=(236, 236, 238), anchor="mm")
-        d.text((cx, ly + int(0.055 * panel_px)), f"stap {ocio.fmt_int_nl(p['step'])}", font=f_t,
+        d.text((cx, ly + int(0.052 * panel_px)), f"stap {ocio.fmt_int_nl(p['step'])}", font=f_t,
                fill=(140, 140, 148), anchor="mm")
-        # thin connector arrows between panels
-        if j < n - 1:
-            ax = x + panel_px + gap / 2
-            d.text((ax, ly), "›", font=f_lab, fill=(110, 110, 118), anchor="mm")
+    # time axis: thin line with a marker under every panel
+    ty = head + panel_px + int(0.030 * panel_px)
+    xs = [margin + j * (panel_px + gap) + panel_px / 2 for j in range(n)]
+    d.line([(xs[0], ty), (xs[-1], ty)], fill=(80, 80, 88), width=max(2, panel_px // 300))
+    r = max(4, panel_px // 110)
+    for j, xx in enumerate(xs):
+        col = (236, 236, 238) if panels[j]["label"] == "deling" else (150, 150, 158)
+        d.ellipse([xx - r, ty - r, xx + r, ty + r], fill=col)
     return out, panels

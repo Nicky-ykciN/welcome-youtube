@@ -177,6 +177,7 @@ typedef struct {
     long steps, snap_every, stats_every, ckpt_every, log_every;
     int ckpt_keep;
     int threads;
+    int nsub;
     uint64_t seed;
     char init[64];
     char restart[1024];
@@ -231,6 +232,7 @@ static const pdef_t PDEFS[] = {
     {"ckpt_keep", PT_INT, OFF(ckpt_keep), "0", "1 = also keep ckpt_<step>.bin copies"},
     {"log_every", PT_LONG, OFF(log_every), "1000", "log line interval"},
     {"threads", PT_INT, OFF(threads), "2", "OpenMP threads"},
+    {"nsub", PT_INT, OFF(nsub), "4", "performance only: y sub-cells per unit cell (1..8); results identical up to round-off order"},
     {"seed", PT_U64, OFF(seed), "1", "random seed"},
     {"init", PT_STR, OFF(init), "soup", "soup | seeded | restart"},
     {"restart", PT_STR, OFF(restart), "", "checkpoint file; if non-empty the run restarts from it"},
@@ -399,6 +401,7 @@ static void finalize_params(Params *P) {
     if (P->L < 8) die("L must be >= 8");
     if (P->dt <= 0) die("dt must be > 0");
     if (P->threads < 1) P->threads = 1;
+    if (P->nsub < 1 || P->nsub > 8) die("nsub must be 1..8");
     if (P->n_chem < 1) P->n_chem = 1;
     if (strcmp(P->init, "soup") && strcmp(P->init, "seeded") && strcmp(P->init, "restart"))
         die("init must be soup, seeded or restart");
@@ -491,7 +494,7 @@ typedef struct {
     int fng;
 } Sys;
 
-static void sys_alloc(Sys *s, int N, double L, int mlen, int nH, int nthreads, double feed_grid) {
+static void sys_alloc(Sys *s, int N, double L, int mlen, int nH, int nthreads, double feed_grid, int nsub) {
     memset(s, 0, sizeof *s);
     s->N = N;
     s->L = L;
@@ -518,7 +521,7 @@ static void sys_alloc(Sys *s, int N, double L, int mlen, int nH, int nthreads, d
 #undef SA
     for (int i = 0; i < N; i++) { s->nxt[i] = -1; s->mpos[i] = -1; }
     s->ncx = (int)floor(L);
-    s->ncy = (int)floor(L);
+    s->ncy = (int)floor(L) * nsub; /* fine y sub-cells, see pair_column() */
     s->ncell = s->ncx * s->ncy;
     s->csx = L / s->ncx;
     s->csy = L / s->ncy;
@@ -837,9 +840,15 @@ pair_seg_v(const int j0, const int j1, ivec_t *iv, const double shx, const doubl
 }
 #endif
 
+/* Pair forces of all beads i in column cx.  Columns are 1 cell wide in x and
+ * sorted by fine y sub-cells (height csy = 1/nsub), so the candidates of bead i
+ * are two contiguous slot ranges selected by its own y window:
+ *   own column:  j > i with sub-cell <= floor((y_i + 1)/csy)   (upward only)
+ *   next column: sub-cells floor((y_i - 1)/csy) .. floor((y_i + 1)/csy)
+ * (plus periodic wrap pieces).  Every pair with r < 1 is visited exactly once. */
 static void pair_column(Sys *s, const pairpar_t *pp, const int cx) {
     const int ncx = s->ncx, ncy = s->ncy;
-    const double L = s->L;
+    const double L = s->L, icsy = s->icsy;
     const int *restrict cs = s->cstart;
     const double *restrict x = s->x, *restrict y = s->y, *restrict vx = s->vtx, *restrict vy = s->vty;
     const uint8_t *restrict ty = s->type;
@@ -851,57 +860,50 @@ static void pair_column(Sys *s, const pairpar_t *pp, const int cx) {
     double shx = 0.0;
     if (cxn == ncx) { cxn = 0; shx = L; }
     const int base = cx * ncy, nb = cxn * ncy;
-    for (int cy = 0; cy < ncy; cy++) {
-        const int c = base + cy;
-        const int i0 = cs[c], i1 = cs[c + 1];
-        if (i0 == i1) continue;
-        int sj0[3], sj1[3], nseg = 0;
-        double ssx[3], ssy[3];
-        int selfend;
-        if (cy + 1 < ncy) selfend = cs[c + 2];
-        else {
-            selfend = i1;
-            sj0[nseg] = cs[base]; sj1[nseg] = cs[base + 1]; ssx[nseg] = 0.0; ssy[nseg] = L; nseg++;
-        }
-        if (cy >= 1 && cy + 1 < ncy) {
-            sj0[nseg] = cs[nb + cy - 1]; sj1[nseg] = cs[nb + cy + 2]; ssx[nseg] = shx; ssy[nseg] = 0.0; nseg++;
-        } else if (cy == 0) {
-            sj0[nseg] = cs[nb]; sj1[nseg] = cs[nb + 2]; ssx[nseg] = shx; ssy[nseg] = 0.0; nseg++;
-            sj0[nseg] = cs[nb + ncy - 1]; sj1[nseg] = cs[nb + ncy]; ssx[nseg] = shx; ssy[nseg] = -L; nseg++;
+    const int i0 = cs[base], i1 = cs[base + ncy];
+    for (int i = i0; i < i1; i++) {
+        const double yi = y[i];
+        const int khi = (int)((yi + 1.0) * icsy);              /* yi + 1 > 0: truncation = floor */
+        const int klo = (int)((yi - 1.0) * icsy + ncy) - ncy;  /* floor, may be negative */
+        int sj0[4], sj1[4], nseg = 0;
+        double ssx[4], ssy[4];
+        /* own column, upward */
+        sj0[nseg] = i + 1; sj1[nseg] = cs[base + (khi < ncy ? khi + 1 : ncy)]; ssx[nseg] = 0.0; ssy[nseg] = 0.0; nseg++;
+        if (khi >= ncy) { sj0[nseg] = cs[base]; sj1[nseg] = cs[base + khi - ncy + 1]; ssx[nseg] = 0.0; ssy[nseg] = L; nseg++; }
+        /* next column, full window */
+        if (klo >= 0 && khi < ncy) {
+            sj0[nseg] = cs[nb + klo]; sj1[nseg] = cs[nb + khi + 1]; ssx[nseg] = shx; ssy[nseg] = 0.0; nseg++;
+        } else if (klo < 0) {
+            sj0[nseg] = cs[nb + klo + ncy]; sj1[nseg] = cs[nb + ncy]; ssx[nseg] = shx; ssy[nseg] = -L; nseg++;
+            sj0[nseg] = cs[nb]; sj1[nseg] = cs[nb + khi + 1]; ssx[nseg] = shx; ssy[nseg] = 0.0; nseg++;
         } else {
-            sj0[nseg] = cs[nb + ncy - 2]; sj1[nseg] = cs[nb + ncy]; ssx[nseg] = shx; ssy[nseg] = 0.0; nseg++;
-            sj0[nseg] = cs[nb]; sj1[nseg] = cs[nb + 1]; ssx[nseg] = shx; ssy[nseg] = L; nseg++;
+            sj0[nseg] = cs[nb + klo]; sj1[nseg] = cs[nb + ncy]; ssx[nseg] = shx; ssy[nseg] = 0.0; nseg++;
+            sj0[nseg] = cs[nb]; sj1[nseg] = cs[nb + khi - ncy + 1]; ssx[nseg] = shx; ssy[nseg] = L; nseg++;
         }
 #ifdef OERCEL_AVX512
-        for (int i = i0; i < i1; i++) {
-            ivec_t iv;
-            iv.xi = _mm512_set1_pd(x[i]);
-            iv.yi = _mm512_set1_pd(y[i]);
-            iv.vxi = _mm512_set1_pd(vx[i]);
-            iv.vyi = _mm512_set1_pd(vy[i]);
-            iv.arow = _mm512_loadu_pd(pp->a + 8 * ty[i]);
-            iv.gi = _mm256_set1_epi32((int)gid[i]);
-            iv.ax = _mm512_setzero_pd();
-            iv.ay = _mm512_setzero_pd();
-            pair_seg_v(i + 1, selfend, &iv, 0.0, 0.0, gam, sdt, sseed, x, y, vx, vy, ty, gid, fx, fy);
-            for (int k = 0; k < nseg; k++)
-                pair_seg_v(sj0[k], sj1[k], &iv, ssx[k], ssy[k], gam, sdt, sseed, x, y, vx, vy, ty, gid, fx, fy);
-            fx[i] += _mm512_reduce_add_pd(iv.ax);
-            fy[i] += _mm512_reduce_add_pd(iv.ay);
-        }
+        ivec_t iv;
+        iv.xi = _mm512_set1_pd(x[i]);
+        iv.yi = _mm512_set1_pd(yi);
+        iv.vxi = _mm512_set1_pd(vx[i]);
+        iv.vyi = _mm512_set1_pd(vy[i]);
+        iv.arow = _mm512_loadu_pd(pp->a + 8 * ty[i]);
+        iv.gi = _mm256_set1_epi32((int)gid[i]);
+        iv.ax = _mm512_setzero_pd();
+        iv.ay = _mm512_setzero_pd();
+        for (int k = 0; k < nseg; k++)
+            pair_seg_v(sj0[k], sj1[k], &iv, ssx[k], ssy[k], gam, sdt, sseed, x, y, vx, vy, ty, gid, fx, fy);
+        fx[i] += _mm512_reduce_add_pd(iv.ax);
+        fy[i] += _mm512_reduce_add_pd(iv.ay);
 #else
-        for (int i = i0; i < i1; i++) {
-            const double xi = x[i], yi = y[i], vxi = vx[i], vyi = vy[i];
-            const uint32_t gi = gid[i];
-            const double *arow = pp->a + 8 * ty[i];
-            double fxi = 0.0, fyi = 0.0;
-            pair_seg(i + 1, selfend, xi, yi, vxi, vyi, gi, arow, gam, sdt, sseed, x, y, vx, vy, ty, gid, fx, fy, &fxi, &fyi);
-            for (int k = 0; k < nseg; k++)
-                pair_seg(sj0[k], sj1[k], xi - ssx[k], yi - ssy[k], vxi, vyi, gi, arow, gam, sdt, sseed, x, y, vx, vy, ty,
-                         gid, fx, fy, &fxi, &fyi);
-            fx[i] += fxi;
-            fy[i] += fyi;
-        }
+        const double xi = x[i], vxi = vx[i], vyi = vy[i];
+        const uint32_t gi = gid[i];
+        const double *arow = pp->a + 8 * ty[i];
+        double fxi = 0.0, fyi = 0.0;
+        for (int k = 0; k < nseg; k++)
+            pair_seg(sj0[k], sj1[k], xi - ssx[k], yi - ssy[k], vxi, vyi, gi, arow, gam, sdt, sseed, x, y, vx, vy, ty, gid,
+                     fx, fy, &fxi, &fyi);
+        fx[i] += fxi;
+        fy[i] += fyi;
 #endif
     }
 }
@@ -1282,7 +1284,7 @@ static void init_soup(Sys *s, const Params *P) {
     for (long m = 0; m < nlip; m++) {
         const double hx = L * rng_unif(&s->rng), hy = L * rng_unif(&s->rng);
         const double phi = 2.0 * M_PI * rng_unif(&s->rng);
-        int32_t g[MAXMLEN];
+        int sl[MAXMLEN];
         for (int b = 0; b < ml; b++) {
             s->x[gi] = hx + b * P->r0 * cos(phi);
             s->y[gi] = hy + b * P->r0 * sin(phi);
@@ -1290,10 +1292,10 @@ static void init_soup(Sys *s, const Params *P) {
             wrap1(&s->y[gi], L);
             s->type[gi] = b < s->nH ? TH : TT;
             s->gid[gi] = gi;
-            g[b] = gi;
+            sl[b] = gi;
             gi++;
         }
-        add_molecule(s, g);
+        link_lipid(s, sl);
     }
     long cnt = 0;
     for (; gi < N; gi++, cnt++) {
@@ -1321,7 +1323,7 @@ static void init_seeded(Sys *s, const Params *P) {
         const int n = leaf == 0 ? nout : nin;
         for (int k = 0; k < n; k++) {
             const double phi = 2.0 * M_PI * (k + 0.5 * leaf) / n;
-            int32_t g[MAXMLEN];
+            int sl[MAXMLEN];
             for (int b = 0; b < ml; b++) {
                 const double depth = 0.25 + (ml - 1 - b) * P->r0;
                 const double rad = leaf == 0 ? R + depth : R - depth;
@@ -1329,10 +1331,10 @@ static void init_seeded(Sys *s, const Params *P) {
                 s->y[gi] = c0 + rad * sin(phi);
                 s->type[gi] = b < s->nH ? TH : TT;
                 s->gid[gi] = gi;
-                g[b] = gi;
+                sl[b] = gi;
                 gi++;
             }
-            add_molecule(s, g);
+            link_lipid(s, sl);
         }
     }
     int nKa = 0;
@@ -1374,8 +1376,10 @@ static void write_snapshot(Sys *s, const char *dir) {
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "wb");
     if (!f) die("cannot write %s", tmp);
-    const int N = s->N, ml = s->mlen;
-    const int32_t nb = s->nmol * (ml - 1);
+    const int N = s->N;
+    build_slot(s);
+    int32_t nb = 0;
+    for (int d = 0; d < N; d++) nb += s->nxt[d] >= 0;
     const int32_t ver = 1, n32 = N;
     const int64_t st = s->step;
     fwrite("OCEL", 1, 4, f);
@@ -1394,16 +1398,16 @@ static void write_snapshot(Sys *s, const char *dir) {
     for (int g = 0; g < N; g++) tb[g] = s->type[s->slot[g]];
     fwrite(tb, 1, N, f);
     free(buf);
+    /* bonds in order of the first bead's id */
     int32_t *bb = xmalloc((size_t)(nb + 1) * 2 * sizeof(int32_t));
     int k = 0;
-    for (int m = 0; m < s->nmol; m++) {
-        const int32_t *g = s->mol + (size_t)m * ml;
-        for (int b = 0; b < ml - 1; b++) {
-            int32_t i = g[b], j = g[b + 1];
-            bb[2 * k] = i < j ? i : j;
-            bb[2 * k + 1] = i < j ? j : i;
-            k++;
-        }
+    for (int g = 0; g < N; g++) {
+        const int d = s->slot[g];
+        if (s->nxt[d] < 0) continue;
+        const int32_t i = (int32_t)g, j = (int32_t)s->gid[s->nxt[d]];
+        bb[2 * k] = i < j ? i : j;
+        bb[2 * k + 1] = i < j ? j : i;
+        k++;
     }
     fwrite(bb, 4, 2 * (size_t)nb, f);
     free(bb);
@@ -1418,13 +1422,12 @@ static void write_ckpt(Sys *s, const char *dir, int keep) {
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "wb");
     if (!f) die("cannot write %s", tmp);
-    const int32_t ver = CKPT_VERSION, N = s->N, ml = s->mlen, nH = s->nH, nmol = s->nmol;
+    const int32_t ver = CKPT_VERSION, N = s->N, ml = s->mlen, nH = s->nH;
     fwrite("OCKP", 1, 4, f);
     fwrite(&ver, 4, 1, f);
     fwrite(&N, 4, 1, f);
     fwrite(&ml, 4, 1, f);
     fwrite(&nH, 4, 1, f);
-    fwrite(&nmol, 4, 1, f);
     fwrite(&s->step, 8, 1, f);
     fwrite(&s->time, 8, 1, f);
     fwrite(&s->L, 8, 1, f);
@@ -1432,13 +1435,14 @@ static void write_ckpt(Sys *s, const char *dir, int keep) {
     fwrite(s->rng.s, 8, 4, f);
     fwrite(s->gid, 4, N, f);
     fwrite(s->type, 1, N, f);
+    fwrite(s->mpos, 1, N, f);
+    fwrite(s->nxt, 4, N, f);
     fwrite(s->x, 8, N, f);
     fwrite(s->y, 8, N, f);
     fwrite(s->vx, 8, N, f);
     fwrite(s->vy, 8, N, f);
     fwrite(s->fx, 8, N, f);
     fwrite(s->fy, 8, N, f);
-    fwrite(s->mol, 4, (size_t)nmol * ml, f);
     fwrite("END!", 1, 4, f);
     fflush(f);
     fsync(fileno(f));
@@ -1459,7 +1463,7 @@ static void read_ckpt(Sys *s, const Params *P, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) die("cannot open checkpoint %s: %s", path, strerror(errno));
     char mg[4];
-    int32_t ver, N, ml, nH, nmol;
+    int32_t ver, N, ml, nH;
     int64_t step;
     double time, L;
     uint64_t seed, rs[4];
@@ -1470,7 +1474,6 @@ static void read_ckpt(Sys *s, const Params *P, const char *path) {
     freadx(&N, 4, 1, f, "N");
     freadx(&ml, 4, 1, f, "mlen");
     freadx(&nH, 4, 1, f, "nH");
-    freadx(&nmol, 4, 1, f, "nmol");
     freadx(&step, 8, 1, f, "step");
     freadx(&time, 8, 1, f, "time");
     freadx(&L, 8, 1, f, "L");
@@ -1478,28 +1481,32 @@ static void read_ckpt(Sys *s, const Params *P, const char *path) {
     freadx(rs, 8, 4, f, "rng");
     if (ml != P->lip_nH + P->lip_nT || nH != P->lip_nH) die("checkpoint lipid architecture differs from parameters");
     if (fabs(L - P->L) > 1e-12) die("checkpoint L=%g differs from parameter L=%g", L, P->L);
-    sys_alloc(s, N, L, ml, nH, P->threads);
+    sys_alloc(s, N, L, ml, nH, P->threads, P->feed_grid, P->nsub);
     s->step = step;
     s->time = time;
     s->seed = seed;
     memcpy(s->rng.s, rs, sizeof rs);
     freadx(s->gid, 4, N, f, "gid");
     freadx(s->type, 1, N, f, "type");
+    freadx(s->mpos, 1, N, f, "mpos");
+    freadx(s->nxt, 4, N, f, "nxt");
     freadx(s->x, 8, N, f, "x");
     freadx(s->y, 8, N, f, "y");
     freadx(s->vx, 8, N, f, "vx");
     freadx(s->vy, 8, N, f, "vy");
     freadx(s->fx, 8, N, f, "fx");
     freadx(s->fy, 8, N, f, "fy");
-    int32_t *mol = xmalloc(((size_t)nmol * ml + 1) * sizeof(int32_t));
-    freadx(mol, 4, (size_t)nmol * ml, f, "molecules");
     char end[4];
     freadx(end, 1, 4, f, "end marker");
     if (memcmp(end, "END!", 4)) die("checkpoint end marker missing");
     fclose(f);
-    for (int i = 0; i < N; i++) s->slot[s->gid[i]] = i;
-    for (int m = 0; m < nmol; m++) add_molecule(s, mol + (size_t)m * ml);
-    free(mol);
+    /* consistency checks */
+    build_slot(s);
+    for (int d = 0; d < N; d++) {
+        if (s->gid[d] >= (uint32_t)N || s->slot[s->gid[d]] != d) die("checkpoint: gid table is not a permutation");
+        if (s->nxt[d] >= N || (s->mpos[d] < 0) != (s->type[d] != TH && s->type[d] != TT))
+            die("checkpoint: inconsistent lipid links at slot %d", d);
+    }
 }
 
 /* truncate a csv (header + rows whose first field is the step) after step */
@@ -1548,12 +1555,15 @@ static void count_types(const Sys *s, long *cnt) {
     for (int i = 0; i < s->N; i++) cnt[s->type[i]]++;
 }
 
-static double kinetic_T(const Sys *s, double *px, double *py) {
+/* kinetic temperature from the full velocity v = vh + dt/2 f (2D, 2N-2 dof) */
+static double kinetic_T(const Sys *s, double dt, double *px, double *py) {
     double k2 = 0, sx = 0, sy = 0;
+    const double h = 0.5 * dt;
     for (int i = 0; i < s->N; i++) {
-        k2 += s->vx[i] * s->vx[i] + s->vy[i] * s->vy[i];
-        sx += s->vx[i];
-        sy += s->vy[i];
+        const double vx = s->vx[i] + h * s->fx[i], vy = s->vy[i] + h * s->fy[i];
+        k2 += vx * vx + vy * vy;
+        sx += vx;
+        sy += vy;
     }
     if (px) *px = sx;
     if (py) *py = sy;
@@ -1621,15 +1631,14 @@ int main(int argc, char **argv) {
                    (unsigned long long)s->seed, (unsigned long long)P.seed);
         }
         logmsg("restart from %s at step %lld (t=%.4f), N=%d, lipids=%d\n", P.restart, (long long)s->step, s->time, s->N,
-               s->nmol);
+               count_lipids(s));
     } else {
         const int N = (int)lround(P.rho * P.L * P.L);
-        sys_alloc(s, N, P.L, mlen, P.lip_nH, P.threads);
+        sys_alloc(s, N, P.L, mlen, P.lip_nH, P.threads, P.feed_grid, P.nsub);
         s->seed = P.seed;
         rng_seed(&s->rng, P.seed);
         if (!strcmp(P.init, "soup")) init_soup(s, &P);
         else init_seeded(s, &P);
-        for (int i = 0; i < N; i++) s->slot[s->gid[i]] = i;
         set_velocities(s, &P);
         for (int i = 0; i < N; i++) { s->vtx[i] = s->vx[i]; s->vty[i] = s->vy[i]; }
         s->step = 0;
@@ -1637,6 +1646,11 @@ int main(int argc, char **argv) {
         sort_cells(s);
         pair_forces(s, &P, 0);
         bonded_forces(s, &P);
+        /* stored velocity is the half-step one: vh = v - dt/2 f */
+        for (int i = 0; i < N; i++) {
+            s->vx[i] -= 0.5 * P.dt * s->fx[i];
+            s->vy[i] -= 0.5 * P.dt * s->fy[i];
+        }
     }
     {
         const int rx = (int)ceil(P.r_cat * s->icsx), ry = (int)ceil(P.r_cat * s->icsy);
@@ -1685,11 +1699,11 @@ int main(int argc, char **argv) {
     long cnt[NTYPES];
     if (!restarting) {
         double px, py;
-        double T = kinetic_T(s, &px, &py);
+        double T = kinetic_T(s, P.dt, &px, &py);
         count_types(s, cnt);
         if (P.stats_every > 0)
             fprintf(sf, "0,0,%.6f,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%.6f\n", T, cnt[TW], cnt[TH], cnt[TT], cnt[TN], cnt[TKA],
-                    cnt[TKB], cnt[TZ], s->nmol, s->maxbond);
+                    cnt[TKB], cnt[TZ], count_lipids(s), s->maxbond);
         s->maxbond = 0;
         if (P.snap_every > 0) write_snapshot(s, outdir);
     } else {
@@ -1698,7 +1712,7 @@ int main(int argc, char **argv) {
         if (P.snap_every > 0 && !file_exists(sp)) write_snapshot(s, outdir);
     }
 
-    const double dt = P.dt, hdt = 0.5 * dt, hdt2 = 0.5 * dt * dt, ldt = P.lambda * dt, L = s->L;
+    const double dt = P.dt, dt2 = dt * dt, cvt = (0.5 + P.lambda) * dt, L = s->L;
     timers_t tm = {0, 0, 0, 0, 0, 0};
     const int64_t step0 = s->step;
     double t_loop0 = wtime(), t_lastlog = t_loop0;
@@ -1709,24 +1723,31 @@ int main(int argc, char **argv) {
     while (s->step < P.steps) {
         const int64_t ns = s->step + 1;
         double t0 = wtime();
-        /* 1. positions, half-kick, velocity prediction */
+        /* 1. Groot-Warren step with stored half-step velocity vh = v - dt/2 f:
+         *    x += dt v + dt^2/2 f = dt vh + dt^2 f
+         *    vt = v + lambda dt f = vh + (1/2 + lambda) dt f    (force input)
+         *    vh' = v + dt/2 f      = vh + dt f
+         *  after the new forces f' the full velocity is v' = vh' + dt/2 f'. */
         const int N = s->N;
-        double *restrict x = s->x, *restrict y = s->y, *restrict vx = s->vx, *restrict vy = s->vy;
-        double *restrict fx = s->fx, *restrict fy = s->fy, *restrict vtx = s->vtx, *restrict vty = s->vty;
+        {
+            double *restrict x = s->x, *restrict y = s->y, *restrict vx = s->vx, *restrict vy = s->vy;
+            const double *restrict fx = s->fx, *restrict fy = s->fy;
+            double *restrict vtx = s->vtx, *restrict vty = s->vty;
 #pragma omp parallel for schedule(static)
-        for (int i = 0; i < N; i++) {
-            double xi = x[i] + dt * vx[i] + hdt2 * fx[i];
-            double yi = y[i] + dt * vy[i] + hdt2 * fy[i];
-            if (xi < 0.0) { xi += L; if (xi >= L) xi -= L; }
-            else if (xi >= L) xi -= L;
-            if (yi < 0.0) { yi += L; if (yi >= L) yi -= L; }
-            else if (yi >= L) yi -= L;
-            x[i] = xi;
-            y[i] = yi;
-            vtx[i] = vx[i] + ldt * fx[i];
-            vty[i] = vy[i] + ldt * fy[i];
-            vx[i] += hdt * fx[i];
-            vy[i] += hdt * fy[i];
+            for (int i = 0; i < N; i++) {
+                double xi = x[i] + dt * vx[i] + dt2 * fx[i];
+                double yi = y[i] + dt * vy[i] + dt2 * fy[i];
+                if (xi < 0.0) { xi += L; if (xi >= L) xi -= L; }
+                else if (xi >= L) xi -= L;
+                if (yi < 0.0) { yi += L; if (yi >= L) yi -= L; }
+                else if (yi >= L) yi -= L;
+                x[i] = xi;
+                y[i] = yi;
+                vtx[i] = vx[i] + cvt * fx[i];
+                vty[i] = vy[i] + cvt * fy[i];
+                vx[i] += dt * fx[i];
+                vy[i] += dt * fy[i];
+            }
         }
         double t1 = wtime();
         tm.integ += t1 - t0;
@@ -1750,27 +1771,16 @@ int main(int argc, char **argv) {
         bonded_forces(s, &P);
         double t5 = wtime();
         tm.bond += t5 - t4;
-        /* 4. second half-kick */
-        {
-            double *restrict vx2 = s->vx, *restrict vy2 = s->vy;
-            const double *restrict fx2 = s->fx, *restrict fy2 = s->fy;
-#pragma omp parallel for schedule(static)
-            for (int i = 0; i < N; i++) {
-                vx2[i] += hdt * fx2[i];
-                vy2[i] += hdt * fy2[i];
-            }
-        }
+        double t6 = t5;
         s->step = ns;
         s->time += dt;
-        double t6 = wtime();
-        tm.integ += t6 - t5;
         /* 5. output */
         if (P.stats_every > 0 && ns % P.stats_every == 0) {
             double px, py;
-            double T = kinetic_T(s, &px, &py);
+            double T = kinetic_T(s, dt, &px, &py);
             count_types(s, cnt);
             fprintf(sf, "%lld,%.6f,%.6f,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%d,%.6f\n", (long long)ns, s->time, T, cnt[TW], cnt[TH],
-                    cnt[TT], cnt[TN], cnt[TKA], cnt[TKB], cnt[TZ], s->nmol, s->maxbond);
+                    cnt[TT], cnt[TN], cnt[TKA], cnt[TKB], cnt[TZ], count_lipids(s), s->maxbond);
             s->maxbond = 0;
             if (!isfinite(T)) die("non-finite temperature at step %lld", (long long)ns);
         }
@@ -1785,10 +1795,10 @@ int main(int argc, char **argv) {
         }
         if (P.log_every > 0 && ns % P.log_every == 0) {
             double px, py;
-            double T = kinetic_T(s, &px, &py);
+            double T = kinetic_T(s, dt, &px, &py);
             count_types(s, cnt);
             logmsg("step %lld t=%.2f T=%.4f p=(%.2e,%.2e) lip=%d Ka=%ld Kb=%ld N=%ld  %.3f ms/step\n", (long long)ns,
-                   s->time, T, px, py, s->nmol, cnt[TKA], cnt[TKB], cnt[TN],
+                   s->time, T, px, py, count_lipids(s), cnt[TKA], cnt[TKB], cnt[TN],
                    1e3 * (now - t_lastlog) / (double)(ns - lastlog_step));
             t_lastlog = now;
             lastlog_step = ns;

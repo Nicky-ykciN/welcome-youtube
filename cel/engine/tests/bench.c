@@ -16,10 +16,9 @@ int main(int argc, char **argv) {
     omp_set_num_threads(th);
     Sys S, *s = &S;
     int N = (int)lround(P.rho * P.L * P.L);
-    sys_alloc(s, N, P.L, P.lip_nH + P.lip_nT, P.lip_nH, th);
+    sys_alloc(s, N, P.L, P.lip_nH + P.lip_nT, P.lip_nH, th, P.feed_grid, P.nsub);
     s->seed = 1; rng_seed(&s->rng, 1);
     init_soup(s, &P);
-    for (int i = 0; i < N; i++) s->slot[s->gid[i]] = i;
     set_velocities(s, &P);
     for (int i = 0; i < N; i++) { s->vtx[i] = s->vx[i]; s->vty[i] = s->vy[i]; }
     sort_cells(s);

@@ -34,6 +34,10 @@ DEFAULTS = dict(
     pad=2.5,                  # padding around an aggregate's bounding box (units)
     leaflet_in=1.5,           # head within this distance of the lumen = inner leaflet
     leaflet_max=6.0,          # heads further than this are not counted as wall heads
+    min_exposure=0.5,         # fraction of the lumen boundary that must lie within one membrane
+                              # thickness of the bulk outside medium (rejects water pockets
+                              # buried in a lipid matrix / inverted phases)
+    wall_extra=4.0,           # wall_max = 2 * lipid length * r0 + wall_extra (units)
 )
 
 _S4 = ndimage.generate_binary_structure(2, 1)
@@ -87,6 +91,40 @@ def _unwrap_tree(pos, n, edges, L):
     dm = minimg(pos[edges[:, 1]] - pos[edges[:, 0]], L)
     wraps = bool(np.any(np.abs(du - dm) > 0.5 * L))
     return U, wraps
+
+
+def _pedt(target, pad):
+    """Periodic Euclidean distance (pixels) from every pixel to the nearest True pixel of target."""
+    big = np.pad(target, pad, mode="wrap")
+    d = ndimage.distance_transform_edt(~big)
+    return d[pad:-pad, pad:-pad]
+
+
+def _bulk_outside(memb):
+    """Bulk solvent on the periodic grid: largest periodic solvent component (+ any >= 25 %)."""
+    sol = ~memb
+    lab, nl = ndimage.label(sol, structure=_S4)
+    if nl == 0:
+        return np.zeros_like(sol)
+    par = np.arange(nl + 1)
+
+    def find(x):
+        while par[x] != x:
+            par[x] = par[par[x]]
+            x = par[x]
+        return x
+    for a_, b_ in ((lab[:, 0], lab[:, -1]), (lab[0, :], lab[-1, :])):
+        m = (a_ > 0) & (b_ > 0)
+        for u, v in zip(a_[m].tolist(), b_[m].tolist()):
+            ru, rv = find(u), find(v)
+            if ru != rv:
+                par[ru] = rv
+    roots = np.array([find(x) for x in range(nl + 1)])
+    area = np.bincount(roots[lab.ravel()], minlength=nl + 1)
+    area[0] = 0
+    tot = area.sum()
+    big = np.nonzero((area == area.max()) | (area >= 0.25 * tot))[0]
+    return np.isin(roots[lab], big) & sol
 
 
 def _stamp_mask(pix, shape, r_pix):
@@ -240,13 +278,37 @@ def detect(snap, cfg=None):
         np.add.at(counts, (bead_lab[m], types[m].astype(np.int64)), 1)
     area_px = np.bincount(label[label >= 0].ravel(), minlength=nl) if nl else np.zeros(0)
 
-    # aqueous test
+    # bulk outside medium and distance (through membrane) from each lumen boundary to it
+    mlen = (int(np.sum(lipmask)) / nmol) if nmol else 4.0
+    wall_max = 2.0 * mlen * 0.5 + c["wall_extra"]
+    if nl:
+        gl = np.floor(pos[lipmask] / h).astype(np.int64) % ng
+        pts = np.zeros((ng, ng), bool)
+        pts[gl[:, 0], gl[:, 1]] = True
+        rp = int(np.ceil(r_pix)) + 2
+        memb_all = _pedt(pts, rp) <= r_pix
+        outside = _bulk_outside(memb_all)
+        dpad = int(np.ceil(wall_max / h)) + 2
+        dist_out = _pedt(outside, dpad) * h if outside.any() else np.full((ng, ng), np.inf)
+    # aqueous + exposure tests
     keep = []
     for k, lu in enumerate(lumens):
         area = area_px[k] * h * h
         hyd = counts[k, W] + counts[k, N] + counts[k, KA] + counts[k, KB]
         lu["area"] = area
-        lu["ok"] = (area >= c["min_lumen_area"]) and (hyd >= c["min_aqueous_frac"] * c["rho"] * area)
+        g = lu["gpix"] % ng
+        isb = np.zeros(len(g), bool)
+        for d_ in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nbx = (g + d_) % ng
+            isb |= label[nbx[:, 0], nbx[:, 1]] != k
+        gb = g[isb] if isb.any() else g
+        dob = dist_out[gb[:, 0], gb[:, 1]]
+        # a lumen that is itself (part of) the bulk medium is not a compartment
+        lu["is_bulk"] = bool(np.mean(outside[g[:, 0], g[:, 1]]) > 0.2) if nl else False
+        lu["exposure"] = 0.0 if lu["is_bulk"] else float(np.mean(dob <= wall_max))
+        lu["wall"] = float(np.median(dob)) if np.isfinite(dob).any() else float("inf")
+        lu["ok"] = ((area >= c["min_lumen_area"]) and (hyd >= c["min_aqueous_frac"] * c["rho"] * area)
+                    and lu["exposure"] >= c["min_exposure"])
         if lu["ok"]:
             keep.append(k)
     # relabel to kept lumens only
@@ -290,23 +352,26 @@ def detect(snap, cfg=None):
         b0, b1 = np.searchsorted(sb, a), np.searchsorted(sb, a, "right")
         beads = order_b[b0:b1]
         mols_here = mol[beads]
-        # one representative per molecule: its head bead (or first bead)
-        heads = beads[types[beads] == H]
-        dist, nn = tree.query(pos[heads])
+        # a molecule belongs to the wall of the nearest lumen of its aggregate if its closest
+        # bead lies within one membrane thickness (wall_max) of that lumen
+        dist_b, nn_b = tree.query(pos[beads])
+        mm_b = mols_here
+        order_m = np.lexsort((dist_b, mm_b))           # per molecule, closest bead first
+        first = np.ones(len(order_m), bool)
+        first[1:] = mm_b[order_m][1:] != mm_b[order_m][:-1]
+        sel_b = order_m[first]
+        mol_ids = mm_b[sel_b]
+        mol_d = dist_b[sel_b]
+        mol_c = bl[nn_b[sel_b]]
+        ok = mol_d <= wall_max
+        mol_cell = dict(zip(mol_ids[ok].tolist(), mol_c[ok].tolist()))
+        cob = np.array([mol_cell.get(m, -1) for m in mols_here.tolist()])
+        inw = cob >= 0
+        bead_cell[beads[inw]] = -cob[inw] - 2
+        np.add.at(n_lip, mol_c[ok], 1)
+        heads = beads[(types[beads] == H) & inw]
+        dist, nn = tree.query(pos[heads]) if len(heads) else (np.zeros(0), np.zeros(0, int))
         hl = bl[nn]
-        # molecule -> cell via its head; molecules without head use their first bead
-        mol_cell = {}
-        for mm, cc in zip(mol[heads].tolist(), hl.tolist()):
-            mol_cell[mm] = cc
-        missing = [b for b in beads.tolist() if mol[b] not in mol_cell]
-        if missing:
-            d2, nn2 = tree.query(pos[missing])
-            for b, cc in zip(missing, bl[nn2].tolist()):
-                mol_cell.setdefault(int(mol[b]), cc)
-        cell_of_bead = np.array([mol_cell[m] for m in mols_here.tolist()])
-        bead_cell[beads] = -cell_of_bead - 2
-        for mm, cc in mol_cell.items():
-            n_lip[cc] += 1
         np.add.at(inner, hl[dist <= c["leaflet_in"]], 1)
         np.add.at(outer, hl[(dist > c["leaflet_in"]) & (dist <= c["leaflet_max"])], 1)
 
@@ -329,17 +394,18 @@ def detect(snap, cfg=None):
             x=float(cen[0] % L), y=float(cen[1] % L),
             area=round(area, 3),
             r_eq=round(float(np.sqrt(area / np.pi)), 3),
-            n_lipids=int(n_lip[j]),
+            n_lipids=int(n_lip[j]),                  # wall lipids: within wall_max of this lumen
             n_Ka=int(counts[j, KA]), n_Kb=int(counts[j, KB]),
             n_N=int(counts[j, N]), n_W=int(counts[j, W]), n_Z=int(counts[j, Z]),
             agg=int(lu["agg"]),
             agg_lumens=len(by_agg[lu["agg"]]),
-            agg_lipids=int(agg_size[lu["agg"]]),
+            agg_lipids=int(agg_size[lu["agg"]]),     # whole membrane aggregate (may be a network)
             inner_heads=int(inner[j]), outer_heads=int(outer[j]),
             inner_frac=round(float(inner[j] / max(inner[j] + outer[j], 1)), 3),
             aspect=round(aspect, 3), solidity=round(min(solidity, 1.0), 3),
             extent=round(float(np.sqrt(ev[1]) * 4), 2),
             wraps_membrane=bool(lu["wraps_agg"]),
+            exposure=round(lu["exposure"], 3), wall=round(lu["wall"], 2) if np.isfinite(lu["wall"]) else None,
         ))
     n_free = int(np.sum(agg_size[agg_of_mol] < c["min_membrane_lipids"])) if nmol else 0
     summary = dict(n_molecules=int(nmol), n_aggregates=int(nagg),

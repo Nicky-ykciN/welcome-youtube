@@ -5,19 +5,20 @@
 #undef main
 
 static double bonded_energy(Sys *s, const Params *P) {
-    const int ml = s->mlen;
     double U = 0;
-    for (int m = 0; m < s->nmol; m++) {
-        const int32_t *g = s->mol + (size_t)m * ml;
+    for (int h = 0; h < s->N; h++) {
+        if (s->mpos[h] != 0) continue;
+        int sl[MAXMLEN], n = 0;
+        for (int d = h; d >= 0 && n < s->mlen; d = s->nxt[d]) sl[n++] = d;
         double bx[MAXMLEN], by[MAXMLEN], bl[MAXMLEN];
-        for (int b = 0; b < ml - 1; b++) {
-            int i = s->slot[g[b]], j = s->slot[g[b + 1]];
+        for (int b = 0; b < n - 1; b++) {
+            int i = sl[b], j = sl[b + 1];
             bx[b] = minimg(s->x[j] - s->x[i], s->L);
             by[b] = minimg(s->y[j] - s->y[i], s->L);
             bl[b] = hypot(bx[b], by[b]);
             U += 0.5 * P->k_bond * (bl[b] - P->r0) * (bl[b] - P->r0);
         }
-        for (int b = 0; b < ml - 2; b++)
+        for (int b = 0; b < n - 2; b++)
             U += P->k_angle * (1.0 - (bx[b] * bx[b + 1] + by[b] * by[b + 1]) / (bl[b] * bl[b + 1]));
     }
     return U;
@@ -31,19 +32,39 @@ int main(int argc, char **argv) {
     P.L = argc > 1 ? atof(argv[1]) : 12.5; /* non-integer L: cell side != 1 */
     P.f_lip = 0.15; P.f_Ka = 0.02; P.f_Kb = 0.02; P.c_N = 0.1;
     P.threads = 4;
+    if (argc > 2) P.nsub = atoi(argv[2]);
     finalize_params(&P);
     omp_set_num_threads(P.threads);
     Sys S, *s = &S;
     int N = (int)lround(P.rho * P.L * P.L);
-    sys_alloc(s, N, P.L, P.lip_nH + P.lip_nT, P.lip_nH, P.threads);
+    sys_alloc(s, N, P.L, P.lip_nH + P.lip_nT, P.lip_nH, P.threads, P.feed_grid, P.nsub);
     s->seed = 99; rng_seed(&s->rng, 99);
     init_soup(s, &P);
-    for (int i = 0; i < N; i++) s->slot[s->gid[i]] = i;
     set_velocities(s, &P);
     for (int i = 0; i < N; i++) { s->vtx[i] = s->vx[i] + 0.3 * rng_normal(&s->rng); s->vty[i] = s->vy[i]; }
     /* put some beads exactly on cell boundaries / box edge to stress wrapping */
     s->x[0] = 0.0; s->y[1] = P.L - 1e-13; s->x[2] = s->csx * 3; s->y[2] = s->csy * 2;
     sort_cells(s);
+    /* chain integrity after several sorts with moved beads */
+    for (int rep = 0; rep < 5; rep++) {
+        for (int d = 0; d < N; d++) { s->x[d] += 0.3 * rng_normal(&s->rng); wrap1(&s->x[d], P.L); }
+        sort_cells(s);
+    }
+    {
+        int bad = 0, heads = 0;
+        for (int d = 0; d < N; d++) {
+            if (s->mpos[d] < 0) { bad += s->nxt[d] != -1 || s->type[d] == TH || s->type[d] == TT; continue; }
+            if (s->mpos[d] == 0) heads++;
+            const int nx = s->nxt[d];
+            if (s->mpos[d] < s->mlen - 1) bad += nx < 0 || s->gid[nx] != s->gid[d] + 1 || s->mpos[nx] != s->mpos[d] + 1;
+            else bad += nx != -1;
+        }
+        /* cells: every bead inside its cell */
+        for (int c = 0; c < s->ncell; c++)
+            for (int d = s->cstart[c]; d < s->cstart[c + 1]; d++) bad += cell_of_pos(s, s->x[d], s->y[d]) != c;
+        printf("chain/cell integrity after sorts: heads=%d errors=%d\n", heads, bad);
+        if (bad) { printf("FORCETEST FAIL\n"); return 1; }
+    }
     pair_forces(s, &P, 12345);
     /* brute force */
     double *bfx = calloc(N, sizeof(double)), *bfy = calloc(N, sizeof(double));
@@ -94,30 +115,32 @@ int main(int argc, char **argv) {
     /* bonded forces vs finite differences */
     for (int i = 0; i < N; i++) { s->fx[i] = s->fy[i] = 0; }
     /* distort molecules a bit */
-    for (int m = 0; m < s->nmol; m++)
-        for (int b = 0; b < s->mlen; b++) {
-            int sl = s->slot[s->mol[m * s->mlen + b]];
-            s->x[sl] += 0.15 * rng_normal(&s->rng); s->y[sl] += 0.15 * rng_normal(&s->rng);
-            wrap1(&s->x[sl], P.L); wrap1(&s->y[sl], P.L);
+    for (int d = 0; d < N; d++)
+        if (s->mpos[d] >= 0) {
+            s->x[d] += 0.15 * rng_normal(&s->rng); s->y[d] += 0.15 * rng_normal(&s->rng);
+            wrap1(&s->x[d], P.L); wrap1(&s->y[d], P.L);
         }
+    int nlip = count_lipids(s);
     bonded_forces(s, &P);
     double maxe = 0, maxbf = 0;
     const double h = 1e-6;
-    for (int m = 0; m < 20 && m < s->nmol; m++)
-        for (int b = 0; b < s->mlen; b++) {
-            int sl = s->slot[s->mol[m * s->mlen + b]];
-            for (int c = 0; c < 2; c++) {
-                double *q = c ? &s->y[sl] : &s->x[sl];
-                double q0 = *q;
-                *q = q0 + h; double Up = bonded_energy(s, &P);
-                *q = q0 - h; double Um = bonded_energy(s, &P);
-                *q = q0;
-                double fnum = -(Up - Um) / (2 * h);
-                double fan = c ? s->fy[sl] : s->fx[sl];
-                maxe = fmax(maxe, fabs(fnum - fan));
-                maxbf = fmax(maxbf, fabs(fan));
-            }
+    int checked = 0;
+    for (int sl = 0; sl < N && checked < 80; sl++) {
+        if (s->mpos[sl] < 0) continue;
+        checked++;
+        for (int c = 0; c < 2; c++) {
+            double *q = c ? &s->y[sl] : &s->x[sl];
+            double q0 = *q;
+            *q = q0 + h; double Up = bonded_energy(s, &P);
+            *q = q0 - h; double Um = bonded_energy(s, &P);
+            *q = q0;
+            double fnum = -(Up - Um) / (2 * h);
+            double fan = c ? s->fy[sl] : s->fx[sl];
+            maxe = fmax(maxe, fabs(fnum - fan));
+            maxbf = fmax(maxbf, fabs(fan));
         }
+    }
+    printf("lipids=%d, checked %d lipid beads\n", nlip, checked);
     printf("bonded forces: max|F_analytic - F_numeric|=%.3e (max|F|=%.2f)\n", maxe, maxbf);
     ok &= maxe < 1e-5 * fmax(1, maxbf);
     printf("%s\n", ok ? "FORCETEST PASS" : "FORCETEST FAIL");
