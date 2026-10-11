@@ -1,0 +1,574 @@
+<title>Oersoep</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Atkinson+Hyperlegible:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: microscoopbeeld links als held, smal labjournaal rechts; stapelt op telefoon. Bewust één donkere look. */
+:root {
+  --bg: #0b0a12;
+  --panel: #13111c;
+  --line: #2a2638;
+  --fg: #e7e3f1;
+  --muted: #9b95ae;
+  --accent: #e27ac4;   /* voedsel / zonlicht */
+  --cyan: #7fd3d6;     /* organismen */
+  --display: "Bricolage Grotesque", "Avenir Next", system-ui, sans-serif;
+  --body: "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 15px; line-height: 1.5; }
+.wrap { max-width: 1240px; margin: 0 auto; padding-inline: 16px; padding-block: 20px 40px; display: flex; flex-direction: column; gap: 18px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; }
+h1 { font-family: var(--display); font-weight: 700; font-size: clamp(30px, 5vw, 46px); letter-spacing: -0.02em; margin: 0; line-height: 1; }
+header p { margin: 0; color: var(--muted); max-width: 62ch; text-wrap: pretty; }
+.main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 20px; align-items: start; }
+@media (max-width: 880px) { .main { grid-template-columns: minmax(0, 1fr); } }
+.scope { position: relative; width: 100%; max-width: min(100%, 82vh); aspect-ratio: 1; border-radius: 6px; overflow: hidden; background: #000; border: 1px solid var(--line); justify-self: center; }
+.scope canvas { width: 100%; height: 100%; display: block; cursor: crosshair; image-rendering: auto; }
+.hud { position: absolute; left: 0; top: 0; right: 0; padding: 6px 10px; font-family: var(--mono); font-size: 11px; color: #d8d4e6; background: linear-gradient(#000a, #0000); pointer-events: none; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hint { position: absolute; left: 10px; bottom: 8px; font-family: var(--mono); font-size: 11px; color: #ffffff88; pointer-events: none; }
+aside { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+section h2 { font-family: var(--mono); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); margin: 0 0 8px; }
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.stat { background: var(--panel); padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.stat span { font-size: 12px; color: var(--muted); }
+.stat b { font-family: var(--mono); font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat b.pk { color: var(--accent); }
+.stat b.cy { color: var(--cyan); }
+#chart { width: 100%; height: 110px; display: block; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 6px; }
+.legend i { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 5px; }
+.btns { display: flex; gap: 8px; flex-wrap: wrap; }
+button, select { font: inherit; font-size: 14px; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 6px 12px; cursor: pointer; }
+button:hover, select:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); color: #1a0a16; border-color: var(--accent); font-weight: 700; }
+:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+.ctl { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; align-items: center; margin-top: 10px; }
+.ctl label { font-size: 13px; }
+.ctl output { font-family: var(--mono); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.ctl input[type=range] { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); }
+.how { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13.5px; display: flex; flex-direction: column; gap: 6px; }
+.how b { color: var(--fg); font-weight: 700; }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Oersoep</h1>
+    <p>Deeltjes met een willekeurig klein neuraal netwerk als DNA, in een wereld waar energie binnenstroomt en als warmte weglekt. Niemand programmeert samenwerking; natuurlijke selectie moet het zelf vinden.</p>
+  </header>
+
+  <div class="main">
+    <div class="scope">
+      <canvas id="view" width="512" height="512" aria-label="Simulatie van evoluerende cellen"></canvas>
+      <div class="hud" id="hud">t=0</div>
+      <div class="hint">klik = voedselpuls</div>
+    </div>
+
+    <aside>
+      <section>
+        <h2>Nu</h2>
+        <div class="stats">
+          <div class="stat"><span>Cellen</span><b id="sPop">0</b></div>
+          <div class="stat"><span>Organismen (≥3 cellen)</span><b class="cy" id="sOrg">0</b></div>
+          <div class="stat"><span>Grootste organisme</span><b class="cy" id="sBig">0</b></div>
+          <div class="stat"><span>Hoogste generatie</span><b id="sGen">0</b></div>
+          <div class="stat"><span>Energie in cellen</span><b class="pk" id="sEc">0</b></div>
+          <div class="stat"><span>Energie in het veld</span><b class="pk" id="sEf">0</b></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Verloop</h2>
+        <canvas id="chart" width="640" height="220" aria-label="Grafiek van cellen en grootste organisme"></canvas>
+        <div class="legend"><span><i style="background:var(--accent)"></i>cellen</span><span><i style="background:var(--cyan)"></i>grootste organisme</span></div>
+      </section>
+
+      <section>
+        <h2>Bediening</h2>
+        <div class="btns">
+          <button id="play" class="primary">Pauze</button>
+          <button id="reset">Nieuwe oersoep</button>
+          <select id="mode" aria-label="Kleuring">
+            <option value="0">Kleur: afstamming</option>
+            <option value="1">Kleur: organisme</option>
+            <option value="2">Kleur: energie</option>
+          </select>
+        </div>
+        <div class="ctl"><label for="speed">Stappen per beeld</label><output id="oSpeed">4</output><input id="speed" type="range" min="1" max="16" step="1" value="4"></div>
+        <div class="ctl"><label for="inflow">Zonlicht (energie-instroom)</label><output id="oInflow">1.00×</output><input id="inflow" type="range" min="0.2" max="2.5" step="0.05" value="1"></div>
+        <div class="ctl"><label for="mut">Mutatiesnelheid</label><output id="oMut">1.00×</output><input id="mut" type="range" min="0" max="4" step="0.05" value="1"></div>
+        <div class="ctl"><label for="temp">Temperatuur (Brownse ruis)</label><output id="oTemp">1.00</output><input id="temp" type="range" min="0" max="3" step="0.05" value="1"></div>
+      </section>
+
+      <section>
+        <h2>Spelregels</h2>
+        <ul class="how">
+          <li><b>Energie</b> stroomt binnen bij drijvende bronnen (paars), diffundeert, en elke cel eet wat onder haar ligt.</li>
+          <li><b>Brein</b>: 14 zintuigen → 10 neuronen → 9 acties: bewegen, plakken, delen, signaal uitzenden, aanvallen, delen in tweeën, plus 2 geheugenwaarden.</li>
+          <li><b>Kosten</b>: leven, bewegen en bindingen kosten energie, die als warmte verdwijnt. Wie op is, sterft en geeft zijn lichaam terug aan het veld.</li>
+          <li><b>Erfelijkheid</b>: een kind krijgt het netwerk van de ouder met kleine mutaties. Wil de ouder plakken, dan blijft het kind vastzitten: zo ontstaan klonale klompen.</li>
+          <li><b>Strijd</b>: aanvallen steelt energie; cellen met meer bindingen zijn sterker. Samen ben je minder makkelijk prooi.</li>
+        </ul>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<script>
+(() => {
+"use strict";
+// ---------- wereld ----------
+const W = 192, G = 96, CS = W / G;         // wereldmaat, veldgrid, celmaat
+const MAXN = 7000;
+const NI = 14, NH = 10, NO = 9;
+const W1 = NI * NH, W2 = (NH + 1) * NO, GL = W1 + W2 + 3;
+const BIN = 4, NBIN = W / BIN;
+const R2 = 16;                              // waarnemingsstraal²
+const FMAX = 6, EAT = 0.25, BASE = 0.015, MOVE_F = 0.22, MOVE_C = 0.006;
+const REPRO_E = 5, BODY_E = 1, MAXAGE = 2500;
+const REST = 1.9, BOND_MAX = 5, BOND_K = 0.12, BOND_C = 0.0015, SHARE = 0.12;
+const DAMP = 0.78, DF = 0.06, DS = 0.2, SDECAY = 0.93;
+const INFLOW_TOTAL = 85, MIN_POP = 150, NVENT = 7;
+
+const px = new Float32Array(MAXN), py = new Float32Array(MAXN), vx = new Float32Array(MAXN), vy = new Float32Array(MAXN);
+const en = new Float32Array(MAXN), mem0 = new Float32Array(MAXN), mem1 = new Float32Array(MAXN);
+const out = new Float32Array(MAXN * NO), col = new Float32Array(MAXN * 3);
+const age = new Int32Array(MAXN), gen = new Int32Array(MAXN), root = new Int32Array(MAXN), csize = new Int32Array(MAXN);
+const alive = new Uint8Array(MAXN), nbond = new Uint8Array(MAXN);
+const bonds = new Int32Array(MAXN * 4);
+const genome = new Float32Array(MAXN * GL);
+const freeList = new Int32Array(MAXN);
+let nFree = 0, count = 0;
+const binCount = new Int32Array(NBIN * NBIN), binStart = new Int32Array(NBIN * NBIN + 1), binItems = new Int32Array(MAXN), pbin = new Int32Array(MAXN);
+let F = new Float32Array(G * G), F2 = new Float32Array(G * G), S = new Float32Array(G * G), S2 = new Float32Array(G * G);
+const rate = new Float32Array(G * G);
+const vents = [];
+const inp = new Float32Array(NI), hid = new Float32Array(NH + 1);
+const births = [];
+let t = 0;
+const params = { inflow: 1, mut: 1, temp: 1 };
+
+let spare = null;
+function gauss() {
+  if (spare !== null) { const s = spare; spare = null; return s; }
+  let u, v, s;
+  do { u = Math.random() * 2 - 1; v = Math.random() * 2 - 1; s = u * u + v * v; } while (s >= 1 || s === 0);
+  const m = Math.sqrt(-2 * Math.log(s) / s);
+  spare = v * m; return u * m;
+}
+const wrap = (a) => (a < 0 ? a + W : a >= W ? a - W : a);
+const wd = (d) => (d > W / 2 ? d - W : d < -W / 2 ? d + W : d);
+
+function hsl(h, s, l, o, k) {
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) => { const q = (n + h * 12) % 12; return l - a * Math.max(-1, Math.min(q - 3, 9 - q, 1)); };
+  o[k] = f(0); o[k + 1] = f(8); o[k + 2] = f(4);
+}
+function lineageColor(i) {
+  const g = i * GL + W1 + W2;
+  const h = (Math.atan2(genome[g + 1], genome[g]) / (2 * Math.PI) + 1) % 1;
+  hsl(h, 0.55 + 0.4 * Math.abs(genome[g + 2]), 0.58, col, i * 3);
+}
+
+function alloc() {
+  if (nFree === 0) return -1;
+  const i = freeList[--nFree];
+  alive[i] = 1; count++;
+  vx[i] = vy[i] = 0; mem0[i] = mem1[i] = 0; age[i] = 0; gen[i] = 0; nbond[i] = 0;
+  bonds[i * 4] = bonds[i * 4 + 1] = bonds[i * 4 + 2] = bonds[i * 4 + 3] = -1;
+  for (let o = 0; o < NO; o++) out[i * NO + o] = 0;
+  return i;
+}
+function bonded(i, j) { const b = i * 4; return bonds[b] === j || bonds[b + 1] === j || bonds[b + 2] === j || bonds[b + 3] === j; }
+function addBond(i, j) {
+  if (nbond[i] >= 4 || nbond[j] >= 4 || bonded(i, j)) return;
+  for (let s = 0; s < 4; s++) if (bonds[i * 4 + s] < 0) { bonds[i * 4 + s] = j; break; }
+  for (let s = 0; s < 4; s++) if (bonds[j * 4 + s] < 0) { bonds[j * 4 + s] = i; break; }
+  nbond[i]++; nbond[j]++;
+}
+function unlink(i, j) { for (let s = 0; s < 4; s++) if (bonds[i * 4 + s] === j) { bonds[i * 4 + s] = -1; nbond[i]--; return; } }
+function removeBond(i, j) { unlink(i, j); unlink(j, i); }
+function cellOf(i) { return ((py[i] / CS) | 0) * G + ((px[i] / CS) | 0); }
+function kill(i) {
+  F[cellOf(i)] += Math.max(en[i], 0) + BODY_E;   // lichaam en restenergie terug naar het veld
+  for (let s = 0; s < 4; s++) { const j = bonds[i * 4 + s]; if (j >= 0) unlink(j, i); bonds[i * 4 + s] = -1; }
+  nbond[i] = 0; alive[i] = 0; freeList[nFree++] = i; count--;
+}
+function spawnRandom(x, y) {
+  const i = alloc(); if (i < 0) return;
+  px[i] = x; py[i] = y; en[i] = 3;
+  const g = i * GL;
+  for (let k = 0; k < W1 + W2; k++) genome[g + k] = gauss() * 0.7;
+  for (let k = 0; k < 3; k++) genome[g + W1 + W2 + k] = Math.random() * 2 - 1;
+  lineageColor(i);
+}
+
+// ---------- energiebronnen ----------
+function buildRate() {
+  let sum = 0;
+  const sig2 = 2 * 11 * 11;
+  for (let y = 0; y < G; y++) for (let x = 0; x < G; x++) {
+    let r = 0.25;
+    for (const v of vents) {
+      let dx = x - v.x, dy = y - v.y;
+      if (dx > G / 2) dx -= G; else if (dx < -G / 2) dx += G;
+      if (dy > G / 2) dy -= G; else if (dy < -G / 2) dy += G;
+      r += v.a * Math.exp(-(dx * dx + dy * dy) / sig2);
+    }
+    rate[y * G + x] = r; sum += r;
+  }
+  const k = INFLOW_TOTAL / sum;
+  for (let c = 0; c < G * G; c++) rate[c] *= k;
+}
+function moveVents() {
+  for (const v of vents) {
+    v.d += gauss() * 0.3;
+    v.x = (v.x + Math.cos(v.d) * 0.4 + G) % G;
+    v.y = (v.y + Math.sin(v.d) * 0.4 + G) % G;
+  }
+}
+
+function reset() {
+  alive.fill(0); count = 0; nFree = 0; t = 0;
+  for (let i = MAXN - 1; i >= 0; i--) freeList[nFree++] = i;
+  vents.length = 0;
+  for (let k = 0; k < NVENT; k++) vents.push({ x: Math.random() * G, y: Math.random() * G, d: Math.random() * 6.28, a: 0.6 + Math.random() * 1.4 });
+  buildRate();
+  for (let c = 0; c < G * G; c++) { F[c] = Math.min(FMAX, 1 + rate[c] * 120); S[c] = 0; }
+  for (let k = 0; k < 900; k++) spawnRandom(Math.random() * W, Math.random() * W);
+  hist.length = 0;
+  computeStats();
+}
+
+// ---------- één tijdstap ----------
+function step() {
+  // ruimtelijke hash
+  binCount.fill(0);
+  for (let i = 0; i < MAXN; i++) if (alive[i]) {
+    const b = ((py[i] / BIN) | 0) * NBIN + ((px[i] / BIN) | 0);
+    pbin[i] = b; binCount[b]++;
+  }
+  binStart[0] = 0;
+  for (let b = 0; b < NBIN * NBIN; b++) binStart[b + 1] = binStart[b] + binCount[b];
+  for (let b = 0; b < NBIN * NBIN; b++) binCount[b] = binStart[b];
+  for (let i = 0; i < MAXN; i++) if (alive[i]) binItems[binCount[pbin[i]]++] = i;
+
+  births.length = 0;
+  const noise = 0.08 * params.temp;
+
+  for (let i = 0; i < MAXN; i++) {
+    if (!alive[i]) continue;
+    const x = px[i], y = py[i];
+    const cx = (x / CS) | 0, cy = (y / CS) | 0, c = cy * G + cx;
+    const xl = cy * G + ((cx + G - 1) % G), xr = cy * G + ((cx + 1) % G);
+    const yu = ((cy + G - 1) % G) * G + cx, yd = ((cy + 1) % G) * G + cx;
+    const gi = i * GL, tg = gi + W1 + W2;
+    const t0 = genome[tg], t1 = genome[tg + 1], t2 = genome[tg + 2];
+
+    let cnt = 0, kin = 0, fx = 0, fy = 0;
+    let atk = -1, atkSim = 9, cand = -1, candD = 9;
+    const bx = (x / BIN) | 0, by = (y / BIN) | 0;
+    for (let oy = -1; oy <= 1; oy++) {
+      const yy = ((by + oy + NBIN) % NBIN) * NBIN;
+      for (let ox = -1; ox <= 1; ox++) {
+        const b = yy + ((bx + ox + NBIN) % NBIN);
+        for (let k = binStart[b], e = binStart[b + 1]; k < e; k++) {
+          const j = binItems[k];
+          if (j === i || !alive[j]) continue;
+          const dx = wd(px[j] - x), dy = wd(py[j] - y);
+          const d2 = dx * dx + dy * dy;
+          if (d2 > R2) continue;
+          cnt++;
+          const tj = j * GL + W1 + W2;
+          const e0 = genome[tj] - t0, e1 = genome[tj + 1] - t1, e2 = genome[tj + 2] - t2;
+          const sim = 1 - (e0 * e0 + e1 * e1 + e2 * e2) / 6;
+          kin += sim;
+          const d = Math.sqrt(d2) + 1e-6;
+          if (d < 1.6) { const f = (1.6 - d) / d * 0.5; fx -= dx * f; fy -= dy * f; }
+          if (d < 3 && !bonded(i, j)) {
+            if (sim < atkSim) { atkSim = sim; atk = j; }
+            if (d < candD) { candD = d; cand = j; }
+          }
+        }
+      }
+    }
+
+    // zintuigen
+    inp[0] = 1;
+    inp[1] = F[c] / FMAX * 2 - 1;
+    inp[2] = (F[xr] - F[xl]) * 0.5;
+    inp[3] = (F[yd] - F[yu]) * 0.5;
+    inp[4] = en[i] / REPRO_E * 2 - 1;
+    inp[5] = Math.tanh(S[c]);
+    inp[6] = Math.tanh((S[xr] - S[xl]) * 2);
+    inp[7] = Math.tanh((S[yd] - S[yu]) * 2);
+    inp[8] = cnt / 6;
+    inp[9] = nbond[i] / 4;
+    inp[10] = cnt ? kin / cnt : 0;
+    inp[11] = mem0[i];
+    inp[12] = mem1[i];
+    inp[13] = Math.sin(age[i] * 0.05);
+
+    // brein
+    for (let h = 0; h < NH; h++) {
+      let s = 0; const b = gi + h * NI;
+      for (let k = 0; k < NI; k++) s += genome[b + k] * inp[k];
+      hid[h] = Math.tanh(s);
+    }
+    hid[NH] = 1;
+    const o = i * NO;
+    for (let q = 0; q < NO; q++) {
+      let s = 0; const b = gi + W1 + q * (NH + 1);
+      for (let h = 0; h <= NH; h++) s += genome[b + h] * hid[h];
+      out[o + q] = Math.tanh(s);
+    }
+
+    // acties
+    const mx = out[o], my = out[o + 1];
+    fx += mx * MOVE_F; fy += my * MOVE_F;
+    let cost = BASE * (1 - 0.06 * nbond[i]) + MOVE_C * (mx * mx + my * my);
+    const eat = Math.min(F[c], EAT); F[c] -= eat; en[i] += eat;
+    const emit = out[o + 4];
+    if (emit > 0) { S[c] += emit * 0.6; cost += emit * 0.003; }
+    const a = out[o + 6];
+    if (a > 0.3 && atk >= 0) {
+      let pow = (1 + nbond[i]) / (1 + nbond[atk]); pow = pow < 0.2 ? 0.2 : pow > 3 ? 3 : pow;
+      const amt = Math.min(Math.max(en[atk], 0), 0.22 * a * pow);
+      en[atk] -= amt; en[i] += amt * 0.7;   // 30% gaat verloren als warmte
+      cost += 0.01;
+    }
+    if (cand >= 0 && out[o + 2] > 0.2 && out[cand * NO + 2] > 0.2) addBond(i, cand);
+    if (out[o + 3] > 0 && en[i] > REPRO_E) births.push(i);
+    mem0[i] = out[o + 7]; mem1[i] = out[o + 8];
+    en[i] -= cost; age[i]++;
+    vx[i] = vx[i] * DAMP + fx + gauss() * noise;
+    vy[i] = vy[i] * DAMP + fy + gauss() * noise;
+  }
+
+  // bindingen: veren, energie delen, breken
+  for (let i = 0; i < MAXN; i++) {
+    if (!alive[i] || !nbond[i]) continue;
+    for (let s = 0; s < 4; s++) {
+      const j = bonds[i * 4 + s];
+      if (j <= i) continue;
+      const dx = wd(px[j] - px[i]), dy = wd(py[j] - py[i]);
+      const d = Math.sqrt(dx * dx + dy * dy) + 1e-6;
+      if (d > BOND_MAX || out[i * NO + 2] < -0.4 || out[j * NO + 2] < -0.4) { removeBond(i, j); continue; }
+      const f = BOND_K * (d - REST) / d;
+      vx[i] += dx * f; vy[i] += dy * f; vx[j] -= dx * f; vy[j] -= dy * f;
+      let sh = (out[i * NO + 5] + out[j * NO + 5]) * 0.5; sh = sh < 0 ? 0 : sh;
+      const flow = (en[i] - en[j]) * sh * SHARE;
+      en[i] -= flow + BOND_C; en[j] += flow - BOND_C;
+    }
+  }
+
+  // bewegen en sterven
+  for (let i = 0; i < MAXN; i++) {
+    if (!alive[i]) continue;
+    const v2 = vx[i] * vx[i] + vy[i] * vy[i];
+    if (v2 > 2.25) { const k = 1.5 / Math.sqrt(v2); vx[i] *= k; vy[i] *= k; }
+    px[i] = wrap(px[i] + vx[i]); py[i] = wrap(py[i] + vy[i]);
+    if (px[i] >= W) px[i] = 0; if (py[i] >= W) py[i] = 0;
+    if (en[i] <= 0 || age[i] > MAXAGE) kill(i);
+  }
+
+  // geboorten
+  const pm = 0.05 * params.mut;
+  for (const p of births) {
+    if (!alive[p] || en[p] < REPRO_E) continue;
+    const c = alloc(); if (c < 0) break;
+    const gp = p * GL, gc = c * GL;
+    for (let k = 0; k < W1 + W2; k++) genome[gc + k] = genome[gp + k] + (Math.random() < pm ? gauss() * 0.35 : 0);
+    for (let k = W1 + W2; k < GL; k++) { let v = genome[gp + k] + gauss() * 0.04 * params.mut; genome[gc + k] = v < -1 ? -1 : v > 1 ? 1 : v; }
+    lineageColor(c);
+    const half = (en[p] - BODY_E) / 2;
+    en[p] = half; en[c] = half;
+    const ang = Math.random() * 6.283;
+    px[c] = wrap(px[p] + Math.cos(ang) * 1.5); py[c] = wrap(py[p] + Math.sin(ang) * 1.5);
+    if (px[c] >= W) px[c] = 0; if (py[c] >= W) py[c] = 0;
+    gen[c] = gen[p] + 1;
+    if (out[p * NO + 2] > 0) addBond(p, c);   // klonale groei: kind blijft vastzitten
+  }
+
+  // velden: instroom, diffusie, verval
+  if (t % 20 === 0) { moveVents(); buildRate(); }
+  const k = params.inflow;
+  for (let y = 0; y < G; y++) {
+    const r0 = y * G, ru = ((y + G - 1) % G) * G, rd = ((y + 1) % G) * G;
+    for (let x = 0; x < G; x++) {
+      const c = r0 + x, l = r0 + ((x + G - 1) % G), r = r0 + ((x + 1) % G);
+      let f = F[c] + DF * (F[l] + F[r] + F[ru + x] + F[rd + x] - 4 * F[c]) + rate[c] * k;
+      F2[c] = f > FMAX ? FMAX : f;
+      S2[c] = (S[c] + DS * (S[l] + S[r] + S[ru + x] + S[rd + x] - 4 * S[c])) * SDECAY;
+    }
+  }
+  let tmp = F; F = F2; F2 = tmp; tmp = S; S = S2; S2 = tmp;
+
+  // spontane abiogenese als het leven bijna uitsterft
+  if (count < MIN_POP) for (let n = 0; n < 4; n++) spawnRandom(Math.random() * W, Math.random() * W);
+
+  t++;
+  if (t % 30 === 0) computeStats();
+}
+
+// ---------- statistiek ----------
+const stats = { org: 0, big: 0, gen: 0, ec: 0, ef: 0 };
+const hist = [];
+function find(i) { while (root[i] !== i) { root[i] = root[root[i]]; i = root[i]; } return i; }
+function computeStats() {
+  let mg = 0, ec = 0, ef = 0;
+  for (let i = 0; i < MAXN; i++) { root[i] = i; csize[i] = 0; }
+  for (let i = 0; i < MAXN; i++) if (alive[i]) {
+    ec += en[i]; if (gen[i] > mg) mg = gen[i];
+    for (let s = 0; s < 4; s++) { const j = bonds[i * 4 + s]; if (j > i) { const a = find(i), b = find(j); if (a !== b) root[a] = b; } }
+  }
+  let org = 0, big = 0;
+  for (let i = 0; i < MAXN; i++) if (alive[i]) csize[find(i)]++;
+  for (let i = 0; i < MAXN; i++) if (alive[i] && root[i] === i) { if (csize[i] >= 3) org++; if (csize[i] > big) big = csize[i]; }
+  for (let c = 0; c < G * G; c++) ef += F[c];
+  Object.assign(stats, { org, big, gen: mg, ec, ef });
+  hist.push([count, big]); if (hist.length > 320) hist.shift();
+}
+
+// ---------- tekenen ----------
+const view = document.getElementById("view"), ctx = view.getContext("2d");
+const RS = 512, SC = RS / W;
+const img = ctx.createImageData(RS, RS);
+const acc = new Float32Array(RS * RS * 3), tmpB = new Float32Array(RS * RS * 3), blr = new Float32Array(RS * RS * 3), blr2 = new Float32Array(RS * RS * 3);
+const cmap = new Int32Array(RS);
+for (let x = 0; x < RS; x++) cmap[x] = (x * G / RS) | 0;
+const bg = new Float32Array(G * G * 3);
+let mode = 0;
+const ecol = new Float32Array(3);
+
+function splat(X, Y, r, g, b) {
+  X = (X + RS) % RS; Y = (Y + RS) % RS;
+  const k = (Y * RS + X) * 3; acc[k] += r; acc[k + 1] += g; acc[k + 2] += b;
+}
+function boxBlur(src, dst, rad) {
+  const n = 2 * rad + 1;
+  for (let y = 0; y < RS; y++) for (let ch = 0; ch < 3; ch++) {
+    let s = 0; const row = y * RS;
+    for (let x = -rad; x <= rad; x++) s += src[(row + ((x + RS) % RS)) * 3 + ch];
+    for (let x = 0; x < RS; x++) {
+      tmpB[(row + x) * 3 + ch] = s / n;
+      s += src[(row + ((x + rad + 1) % RS)) * 3 + ch] - src[(row + ((x - rad + RS) % RS)) * 3 + ch];
+    }
+  }
+  for (let x = 0; x < RS; x++) for (let ch = 0; ch < 3; ch++) {
+    let s = 0;
+    for (let y = -rad; y <= rad; y++) s += tmpB[(((y + RS) % RS) * RS + x) * 3 + ch];
+    for (let y = 0; y < RS; y++) {
+      dst[(y * RS + x) * 3 + ch] = s / n;
+      s += tmpB[(((y + rad + 1) % RS) * RS + x) * 3 + ch] - tmpB[(((y - rad + RS) % RS) * RS + x) * 3 + ch];
+    }
+  }
+}
+function colorOf(i, o) {
+  if (mode === 0) { o[0] = col[i * 3]; o[1] = col[i * 3 + 1]; o[2] = col[i * 3 + 2]; }
+  else if (mode === 1) {
+    const r = find(i);
+    if (csize[r] < 3) { o[0] = o[1] = o[2] = 0.28; }
+    else hsl((r * 0.6180339) % 1, 0.75, 0.6, o, 0);
+  } else {
+    const e = Math.min(1, Math.max(0, en[i] / REPRO_E));
+    o[0] = 0.2 + 0.8 * e; o[1] = 0.25 + 0.65 * e * e; o[2] = 0.9 - 0.7 * e;
+  }
+}
+function render() {
+  acc.fill(0);
+  for (let i = 0; i < MAXN; i++) {
+    if (!alive[i]) continue;
+    colorOf(i, ecol);
+    const br = 0.55 + 0.45 * Math.min(1, en[i] / REPRO_E);
+    const r = ecol[0] * br, g = ecol[1] * br, b = ecol[2] * br;
+    const X = (px[i] * SC) | 0, Y = (py[i] * SC) | 0;
+    splat(X, Y, r, g, b); splat(X + 1, Y, r, g, b); splat(X, Y + 1, r, g, b); splat(X + 1, Y + 1, r, g, b);
+    for (let s = 0; s < 4; s++) {
+      const j = bonds[i * 4 + s];
+      if (j <= i) continue;
+      const dx = wd(px[j] - px[i]) * SC, dy = wd(py[j] - py[i]) * SC;
+      const n = Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)));
+      for (let q = 1; q < n; q++) splat((X + dx * q / n) | 0, (Y + dy * q / n) | 0, r * 0.45, g * 0.45, b * 0.45);
+    }
+  }
+  boxBlur(acc, blr, 3); boxBlur(blr, blr2, 3);
+  for (let c = 0; c < G * G; c++) {
+    const f = Math.sqrt(F[c] / FMAX), s = Math.min(1, S[c] * 0.5);
+    bg[c * 3] = 0.035 + 0.26 * f;
+    bg[c * 3 + 1] = 0.025 + 0.03 * f + 0.07 * s;
+    bg[c * 3 + 2] = 0.06 + 0.3 * f + 0.08 * s;
+  }
+  const d = img.data;
+  for (let y = 0; y < RS; y++) {
+    const brow = cmap[y] * G;
+    for (let x = 0; x < RS; x++) {
+      const p = y * RS + x, k = p * 3, bk = (brow + cmap[x]) * 3;
+      for (let ch = 0; ch < 3; ch++) {
+        const v = bg[bk + ch] + acc[k + ch] * 0.75 + blr2[k + ch] * 2.7;
+        d[p * 4 + ch] = 255 * (1 - Math.exp(-1.6 * v));
+      }
+      d[p * 4 + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+const chart = document.getElementById("chart"), cctx = chart.getContext("2d");
+const css = getComputedStyle(document.documentElement);
+const C_ACC = css.getPropertyValue("--accent").trim(), C_CY = css.getPropertyValue("--cyan").trim(), C_LINE = css.getPropertyValue("--line").trim();
+function drawChart() {
+  const w = chart.width, h = chart.height;
+  cctx.clearRect(0, 0, w, h);
+  cctx.strokeStyle = C_LINE; cctx.lineWidth = 1;
+  for (let k = 1; k < 4; k++) { cctx.beginPath(); cctx.moveTo(0, h * k / 4); cctx.lineTo(w, h * k / 4); cctx.stroke(); }
+  if (hist.length < 2) return;
+  for (const [idx, color] of [[0, C_ACC], [1, C_CY]]) {
+    let m = 1; for (const e of hist) m = Math.max(m, e[idx]);
+    cctx.strokeStyle = color; cctx.lineWidth = 3; cctx.beginPath();
+    hist.forEach((e, n) => { const X = n / 319 * w, Y = h - 10 - e[idx] / m * (h - 20); n ? cctx.lineTo(X, Y) : cctx.moveTo(X, Y); });
+    cctx.stroke();
+  }
+}
+
+// ---------- UI ----------
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => Math.round(n).toLocaleString("nl-NL");
+let running = !matchMedia("(prefers-reduced-motion: reduce)").matches;
+let speed = 4, stepsDone = 0, lastT = performance.now(), sps = 0;
+$("play").textContent = running ? "Pauze" : "Start";
+$("play").onclick = () => { running = !running; $("play").textContent = running ? "Pauze" : "Start"; };
+$("reset").onclick = () => reset();
+$("mode").onchange = (e) => { mode = +e.target.value; computeStats(); };
+function bindRange(id, outId, f) { const el = $(id); const upd = () => { $(outId).textContent = f(+el.value); }; el.oninput = upd; upd(); }
+bindRange("speed", "oSpeed", (v) => (speed = v, v));
+bindRange("inflow", "oInflow", (v) => (params.inflow = v, v.toFixed(2) + "×"));
+bindRange("mut", "oMut", (v) => (params.mut = v, v.toFixed(2) + "×"));
+bindRange("temp", "oTemp", (v) => (params.temp = v, v.toFixed(2)));
+view.addEventListener("pointerdown", (e) => {
+  const r = view.getBoundingClientRect();
+  const gx = (e.clientX - r.left) / r.width * G, gy = (e.clientY - r.top) / r.height * G;
+  for (let y = -8; y <= 8; y++) for (let x = -8; x <= 8; x++) {
+    if (x * x + y * y > 64) continue;
+    const c = (((gy + y) | 0) + G) % G * G + ((((gx + x) | 0) + G) % G);
+    F[c] = FMAX;
+  }
+});
+
+function frame(now) {
+  if (running) { for (let s = 0; s < speed; s++) step(); stepsDone += speed; }
+  if (now - lastT > 500) { sps = stepsDone * 1000 / (now - lastT); stepsDone = 0; lastT = now; }
+  render();
+  $("hud").textContent = `t=${t}  ·  pop=${count}  ·  ${Math.round(sps)} stappen/s`;
+  $("sPop").textContent = fmt(count); $("sOrg").textContent = fmt(stats.org); $("sBig").textContent = fmt(stats.big);
+  $("sGen").textContent = fmt(stats.gen); $("sEc").textContent = fmt(stats.ec); $("sEf").textContent = fmt(stats.ef);
+  drawChart();
+  requestAnimationFrame(frame);
+}
+reset();
+window.__sim = { step, stats: () => ({ t, count, ...stats }), setRunning: (v) => (running = v) };
+requestAnimationFrame(frame);
+})();
+</script>
