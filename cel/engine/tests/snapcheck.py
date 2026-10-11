@@ -53,23 +53,28 @@ def cmd_snap(p):
         d = np.hypot(mi(s['x'][j] - s['x'][i], s['L']), mi(s['y'][j] - s['y'][i], s['L']))
         print(f'  bond length mean={d.mean():.4f} std={d.std():.4f} max={d.max():.4f}')
 
-def cmd_rdf(p, typ=None):
+def cmd_rdf(paths, typ=None):
     from scipy.spatial import cKDTree
-    s = read_snap(p)
-    L = s['L']
-    pos = np.c_[s['x'], s['y']].astype(np.float64) % L
-    if typ is not None:
-        pos = pos[s['t'] == int(typ)]
-    n = len(pos)
-    tr = cKDTree(pos, boxsize=L)
-    rmax, nbin = 3.0, 60
-    pr = tr.query_pairs(rmax, output_type='ndarray')
-    d = np.hypot(mi(pos[pr[:, 0], 0] - pos[pr[:, 1], 0], L), mi(pos[pr[:, 0], 1] - pos[pr[:, 1], 1], L))
-    h, e = np.histogram(d, bins=nbin, range=(0, rmax))
-    rho = n / L**2
-    shell = np.pi * (e[1:]**2 - e[:-1]**2)
-    g = 2 * h / (n * rho * shell)
+    if isinstance(paths, str): paths = [paths]
+    rmax, nbin = 3.0, 30
+    gs = []
+    for p in paths:
+        s = read_snap(p)
+        L = s['L']
+        pos = np.c_[s['x'], s['y']].astype(np.float64) % L
+        if typ is not None:
+            pos = pos[s['t'] == int(typ)]
+        n = len(pos)
+        tr = cKDTree(pos, boxsize=L)
+        pr = tr.query_pairs(rmax, output_type='ndarray')
+        d = np.hypot(mi(pos[pr[:, 0], 0] - pos[pr[:, 1], 0], L), mi(pos[pr[:, 0], 1] - pos[pr[:, 1], 1], L))
+        h, e = np.histogram(d, bins=nbin, range=(0, rmax))
+        rho = n / L**2
+        shell = np.pi * (e[1:]**2 - e[:-1]**2)
+        gs.append(2 * h / (n * rho * shell))
+    g = np.mean(gs, axis=0)
     rc = 0.5 * (e[1:] + e[:-1])
+    print(f'g(r) averaged over {len(paths)} snapshot(s)')
     for r_, g_ in zip(rc, g):
         print(f'{r_:.3f} {g_:.4f} ' + '#' * int(40 * g_ / max(g.max(), 1e-9)))
     return rc, g
@@ -106,7 +111,7 @@ if __name__ == '__main__':
     c = sys.argv[1]
     if c == 'stats': cmd_stats(sys.argv[2], float(sys.argv[3]) if len(sys.argv) > 3 else 10.0)
     elif c == 'snap': cmd_snap(sys.argv[2])
-    elif c == 'rdf': cmd_rdf(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
+    elif c == 'rdf': cmd_rdf([a for a in sys.argv[2:] if a.endswith('.bin')])
     elif c == 'cmp': sys.exit(0 if cmd_cmp(sys.argv[2], sys.argv[3]) else 1)
     elif c == 'tclust':
         for p in sys.argv[2:]: cmd_tclust(p)

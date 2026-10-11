@@ -14,6 +14,7 @@ python3 tools/render.py  runs/<name> --kind timelapse [--cell 7] [--panels 5] --
 python3 tools/video.py   runs/<name> --out beelden/<name>.mp4 [--fps 12 --width 1080 --interp 2]
 python3 tools/make_synthetic.py runs/synth                # FAKE test run (flagged synthetic = 1)
 python3 tools/debug_cells.py runs/<name> --step S --out /tmp/d.png   # beads + detected lumens
+python3 tools/render.py  runs/<name> --kind goodsell --step S --at X Y --zoom 40   # any region, no cell needed
 ```
 
 * `--cell` always means a **track id** ("spoor") from `lineage.json`. Track ids stay the same over
@@ -39,13 +40,22 @@ python3 tools/debug_cells.py runs/<name> --step S --out /tmp/d.png   # beads + d
 4. The membrane's H+T beads are stamped as disks (r = 0.75) on a 0.25 grid. Holes are solvent
    regions that are not connected to the outside (4-connectivity).
 5. A hole counts as a **cell** only if all of these hold:
-   * area ≥ 10 r_c²;
+   * area ≥ 16 r_c²;
    * it is aqueous (W+N+K beads ≥ 0.3·ρ·area);
-   * **exposure ≥ 0.5**: at least half of the lumen boundary lies within one membrane thickness
+   * **exposure ≥ 0.8**: at least 80 % of the lumen boundary lies within one membrane thickness
      (2·lipid length·r0 + 4) of the bulk medium. The bulk medium is the largest periodic solvent
-     region, the same idea as the engine's food flood fill. This rejects water pockets buried in a
-     lipid matrix, which were seen in a real `soup_small` run, and also a "lumen" that is itself
-     the bulk.
+     region, the same idea as the engine's food flood fill. A lumen that is itself part of the bulk
+     is rejected.
+   * **bilayer wall**: the share of wall heads facing the lumen is between 0.2 and 0.62.
+
+   These thresholds come from measurements on real engine runs:
+
+   | | exposure | median wall | inner-head share | area |
+   |---|---|---|---|---|
+   | genuine vesicles (seeded L = 48/64, synthetic) | 1.0 | 4.3–5.1 | 0.34–0.47 | ≥ 20 |
+   | water pockets in sponge or inverted lipid phases (`soup_small`) | mostly 0; a few 0.5–0.72 with wall 6.7–7.9 | | often 0.7–1.0 | often < 16 |
+
+   Use `tools/debug_cells.py` to check detections by eye.
 6. Wall lipids are the molecules of that membrane whose nearest bead is within one membrane
    thickness of the lumen. When one membrane encloses several lumens, each lipid goes to its
    nearest lumen. Contents (Ka, Kb, N, W, Z) are counted on a periodic label grid; nested lumens
@@ -112,8 +122,10 @@ Caveats such as synthetic data, a seeded init, or the fallback division are writ
   * Nutrients show as a faint blue haze.
   * Detector model: Poisson shot noise per channel, read noise, dark offset, vignetting, soft knee,
     gamma 1/1.45.
-  * Normalisation: the membrane percentile for single images; one fixed value for videos and
-    time-lapses, so there is no flicker.
+  * Normalisation ("exposure"): the membrane percentile; catalysts on the single-molecule scale,
+    with the GFP/YFP gain lowered (shared by both) only when dense clusters would saturate into
+    neon blobs. Videos and time-lapses use one fixed exposure (videos take it from the brightest
+    sampled frame), so there is no flicker.
 * **goodsell** (`render_goodsell.py`): every molecule is drawn at its simulated position; water is
   left out.
   * Lipids: ink-outlined heads, a tail band with one stroke per tail.
@@ -141,5 +153,13 @@ Caveats such as synthetic data, a seeded init, or the fallback division are writ
   short dropouts.
 * The fluorescence look is a stylised physical model, not a real microscope. The real resolution
   limit (~200 nm) is far larger than these structures.
-* Tested on synthetic data and on small engine runs (`init = seeded` L = 48, `soup_small` L = 64).
-  Large production runs (L = 128-160) have not been tested yet.
+* Tested on synthetic data (`make_synthetic.py`: division across the boundary, corner cell, fusion,
+  death, a one-frame dropout) and on real engine output:
+  * `runs/val_soup64` and `soup_small` in scratch: both become a lipid matrix with catalyst-filled
+    water pockets (inverted phase). The tools correctly report 0 cells.
+  * `soup_small` at L = 128 (open bilayer fragments): 0 cells.
+  * seeded vesicles at L = 48 and L = 64: tracked correctly. The L = 64 vesicle with strong
+    synthesis really ruptured at step ~12.500, and this was confirmed by eye with `debug_cells.py`.
+  * restart chains `val_chunk_D` and `val_restart_B`: the init mode is recovered.
+  Cost at N = 49k: about 40 ms per snapshot for analysis, about 13 s for a 2000 px micrograph,
+  about 0.4 s per video frame at 1080 px.

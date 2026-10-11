@@ -110,6 +110,8 @@ def main():
     ap.add_argument("--width", type=int, default=2000)
     ap.add_argument("--panels", type=int, default=5)
     ap.add_argument("--zoom", type=float, default=None, help="field of view in sim units (micro/goodsell)")
+    ap.add_argument("--at", type=float, nargs=2, default=None, metavar=("X", "Y"),
+                    help="centre the view on these sim coordinates instead of a cell (micro/goodsell)")
     ap.add_argument("--rc-nm", type=float, default=1.0, help="nm per DPD length unit for scale bars")
     ap.add_argument("--no-legend", action="store_true")
     a = ap.parse_args()
@@ -135,8 +137,9 @@ def main():
             title = f"cel (spoor) {a.cell}"
         else:
             snap = ocio.read_snapshot(path)
-            if a.zoom:
-                view = rm.cell_view(snap.L, snap.L / 2, snap.L / 2, a.zoom)
+            if a.zoom or a.at:
+                cx, cy = a.at if a.at else (snap.L / 2, snap.L / 2)
+                view = rm.cell_view(snap.L, cx, cy, min(a.zoom or 40.0, snap.L))
         if synth:
             title = (title + " · " if title else "") + "SYNTHETISCHE TESTDATA"
         img, info = rm.render(snap, view, a.width, ss=2, legend=not a.no_legend, title=title)
@@ -165,23 +168,29 @@ def main():
             step, path = nearest_snapshot(rundir, c and f["step"] if c else a.step)
         snap = ocio.read_snapshot(path)
         lab, h, cl = label_grid(rundir, snap)
+        if c is None and a.at is not None:
+            c = dict(x=a.at[0], y=a.at[1], extent=(a.zoom or 40.0) - 14, n_lipids=None)
         if c is None:
             if not cl:
-                raise SystemExit(f"geen cel gevonden in stap {snap.step}; kies --step of --cell")
+                raise SystemExit(f"geen cel gevonden in stap {snap.step}; kies --step, --cell of --at X Y")
             c = max(cl, key=lambda c: (c["n_Ka"] + c["n_Kb"] > 0, c["area"]))
         size = a.zoom or (1.05 * c["extent"] + 14)
         what = f"spoor {track}" if track is not None else "cel"
         title = f"Oercel – {what}, stap {ocio.fmt_int_nl(snap.step)}"
-        sub = (f"{c['n_lipids']} lipiden · {c['n_Ka']} katalysator a · {c['n_Kb']} katalysator b · "
-               f"lumen {ocio.fmt_float_nl(c['area'] * style.RC_NM ** 2, 0)} nm²  —  alle moleculen op hun gesimuleerde "
-               f"positie, water weggelaten")
+        if c.get("n_lipids") is None:
+            title = f"Oercel – uitsnede rond ({c['x']:.0f}, {c['y']:.0f}), stap {ocio.fmt_int_nl(snap.step)}"
+            sub = "alle moleculen op hun gesimuleerde positie, water weggelaten"
+        else:
+            sub = (f"{c['n_lipids']} lipiden · {c['n_Ka']} katalysator a · {c['n_Kb']} katalysator b · "
+                   f"lumen {ocio.fmt_float_nl(c['area'] * style.RC_NM ** 2, 0)} nm²  —  alle moleculen op hun "
+                   f"gesimuleerde positie, water weggelaten")
         if synth:
             sub = "SYNTHETISCHE TESTDATA  —  " + sub
         img = rg.render(snap, (c["x"], c["y"]), size, width=a.width, label_grid=lab, label_h=h, title=title,
                         subtitle=sub, legend=not a.no_legend)
         out = a.out or default_out(rundir, "goodsell", f"{snap.step:010d}" + (f"_spoor{track}" if track is not None else ""))
         img.save(out, optimize=True)
-        print(f"[render] {out}  ({img.size[0]}x{img.size[1]}, stap {snap.step}, cel bij ({c['x']:.1f}, {c['y']:.1f}))")
+        print(f"[render] {out}  ({img.size[0]}x{img.size[1]}, stap {snap.step}, centrum ({c['x']:.1f}, {c['y']:.1f}))")
 
     else:
         import render_timelapse as rt

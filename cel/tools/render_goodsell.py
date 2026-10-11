@@ -187,20 +187,25 @@ def render(snap, center, size, width=2000, ss=3, label_grid=None, label_h=None, 
     # fade objects near the painting's irregular border: skip beads outside the vignette
     vmask = vig
 
-    def visible(i):
+    def visible(i, rad=0.0):
+        """Bead (with an object radius rad in sim units) lies fully inside the painted area."""
         px, py = P(i)
-        ix, iy = int(px / ss), int(py / ss)
-        return 0 <= ix < Wp and 0 <= iy < Hp and vmask[iy, ix] > 0.85
+        rp = rad * S
+        for ox, oy in ((0, 0), (rp, 0), (-rp, 0), (0, rp), (0, -rp)):
+            ix, iy = int((px + ox) / ss), int((py + oy) / ss)
+            if not (0 <= ix < Wp and 0 <= iy < Hp and vmask[iy, ix] > 0.85):
+                return False
+        return True
 
     # nutrients
     for i in np.nonzero(inview & (t == N))[0]:
-        if visible(i):
+        if visible(i, SIZES["nut_r"]):
             circle(P(i), SIZES["nut_r"] * S, _c(PAL["nut"], 0.03, rng), _c(PAL["nut_ink"]), ink_w * 0.6)
 
     # lipids
     idx = np.nonzero(inview & ((t == H) | (t == T)))[0]
     chains = _molecules(snap, set(idx.tolist()))
-    chains = [c for c in chains if all(visible(i) for i in c)]
+    chains = [c for c in chains if all(visible(i, SIZES["head_r"]) for i in c)]
     tw = SIZES["tail_w"] * S
     # pass 1: tail band, union outline (all outlines, then all fills)
     for c in chains:
@@ -252,7 +257,7 @@ def render(snap, center, size, width=2000, ss=3, label_grid=None, label_h=None, 
 
     # catalysts: lobed blobs with one union outline and a soft highlight
     for i in np.nonzero(inview & ((t == KA) | (t == KB)))[0]:
-        if not visible(i):
+        if not visible(i, SIZES["cat_r"] + SIZES["ink"]):
             continue
         key = "ka" if t[i] == KA else "kb"
         r0 = SIZES["cat_r"] * S

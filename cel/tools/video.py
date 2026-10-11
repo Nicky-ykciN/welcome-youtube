@@ -39,13 +39,21 @@ def _frame(args):
     return np.asarray(img, dtype=np.uint8)
 
 
-def calibrate(paths, width, n=5):
+def calibrate(paths, width, n=6):
+    """One fixed exposure for the whole film: membrane = median over sample frames, catalysts =
+    the brightest sample (so late, crowded frames do not saturate; early frames are dimmer, as in
+    a real time-lapse with fixed settings)."""
     norms = []
     for p in [paths[int(i)] for i in np.linspace(0, len(paths) - 1, min(n, len(paths)))]:
         snap = ocio.read_snapshot(p)
-        ch = rm.channel_images(snap, rm.full_view(snap.L), width // 2, width // 2, dict(rm.DEFAULT), 1)
-        norms.append(rm.auto_norm(ch).get("memb", 1.0))
-    return {"memb": float(np.median(norms))}
+        ch = rm.channel_images(snap, rm.full_view(snap.L), width, width, dict(rm.DEFAULT), 1)
+        norms.append(rm.auto_norm(ch))
+    out = {"memb": float(np.median([d.get("memb", 1.0) for d in norms]))}
+    for k in ("ka", "kb", "z"):
+        v = [d[k] for d in norms if k in d]
+        if v:
+            out[k] = float(max(v))
+    return out
 
 
 def main():

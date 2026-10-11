@@ -22,6 +22,24 @@ def _fmt(v, nd=1):
     return ocio.fmt_float_nl(float(v), nd)
 
 
+def original_init(rundir, params):
+    """Initial condition of the run, also through restarts (engine keeps params_before_*.ini)."""
+    import glob
+    init = str(params.get("init", "onbekend"))
+    restarted = init == "restart" or bool(str(params.get("restart", "")).strip())
+    if not restarted:
+        return init
+    olds = sorted(glob.glob(os.path.join(rundir, "params_before_*.ini")))
+    for p in olds:
+        pi = ocio.read_params(p)
+        i0 = str(pi.get("init", ""))
+        if i0 in ("soup", "seeded") and not str(pi.get("restart", "")).strip():
+            return i0
+    if init in ("soup", "seeded"):
+        return init        # ini still says how the run was started
+    return "restart (oorsprong onbekend)"
+
+
 def _lin(x, y):
     x = np.asarray(x, float); y = np.asarray(y, float)
     if len(x) < 3 or np.ptp(x) == 0:
@@ -35,14 +53,17 @@ def evaluate(rundir, params, frames, tracks, tevents, events, ev_summary, tcfg):
     steps = [f["step"] for f in frames]
     snap_every = (steps[1] - steps[0]) if K > 1 else 1
     synthetic = bool(params.get("synthetic", 0))
-    init = str(params.get("init", "onbekend"))
+    init = original_init(rundir, params)
     m = tcfg["confirm_frames"]
     caveats = []
     if synthetic:
         caveats.append("SYNTHETISCHE TESTDATA (tools/make_synthetic.py) - dit is GEEN simulatie; "
                        "de uitkomsten zeggen alleen iets over de analysesoftware.")
-    if init != "soup":
-        caveats.append(f"init = {init}: membranen zijn (deels) geplaatst; criterium 1 telt dan niet als zelf-assemblage.")
+    if init == "seeded":
+        caveats.append("init = seeded: het eerste membraan is geplaatst; criterium 1 telt dan niet als zelf-assemblage.")
+    elif init != "soup":
+        caveats.append(f"init = {init}: begintoestand onbekend (herstart zonder geschiedenis); zelf-assemblage "
+                       f"alleen aantoonbaar als er een snapshot bij stap 0 zonder cellen is.")
     nZ = sum(f["counts"].get("Z", 0) for f in frames)
     fallback = nZ > 0 or str(params.get("division", params.get("division_mode", ""))).lower() in ("fallback", "ftsz", "z")
     mech = "terugvalmechanisme (Z-ring, SPEC par. 6)" if fallback else "emergent (geen Z-deeltjes aanwezig)"
@@ -75,7 +96,8 @@ def evaluate(rundir, params, frames, tracks, tevents, events, ev_summary, tcfg):
                                    lumen_oppervlak=s["area"][0], binnenkop_fractie=s["inner_frac"][0],
                                    blijft_bestaan_snapshots=t["n_frames"])
         bil = ev["bilaag_ok_fractie"] or 0
-        self_asm = init == "soup" and (len(first0["cells"]) == 0 or first0["step"] > 0) and (denovo or at_start)
+        no_cells_at_0 = first0["step"] == 0 and len(first0["cells"]) == 0
+        self_asm = (init == "soup" or (init != "seeded" and no_cells_at_0)) and bool(denovo)
         if self_asm and bil >= 0.8:
             c1["status"] = "ja"
         else:

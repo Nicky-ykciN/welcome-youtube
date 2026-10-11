@@ -47,6 +47,7 @@ static const char *TNAME[NTYPES] = {"W", "H", "T", "N", "Ka", "Kb", "Z"};
 
 static FILE *g_log = NULL;
 static volatile sig_atomic_t g_stop = 0;
+static int64_t g_warm_end = 0; /* step at which the warm-up of a fresh start ends (0 = none) */
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
 static void logmsg(const char *fmt, ...) {
@@ -176,6 +177,9 @@ typedef struct {
     /* run control */
     long steps, snap_every, stats_every, ckpt_every, log_every;
     int ckpt_keep;
+    long warmup;
+    int syn_tries;
+    int syn_relax;
     int threads;
     int nsub;
     uint64_t seed;
@@ -231,8 +235,9 @@ static const pdef_t PDEFS[] = {
     {"ckpt_every", PT_LONG, OFF(ckpt_every), "10000", "checkpoint interval (0 = only at the end)"},
     {"ckpt_keep", PT_INT, OFF(ckpt_keep), "0", "1 = also keep ckpt_<step>.bin copies"},
     {"log_every", PT_LONG, OFF(log_every), "1000", "log line interval"},
+    {"warmup", PT_LONG, OFF(warmup), "1000", "fresh soup/seeded starts: repulsion above 25 is ramped in linearly over the first warmup steps (0 = off; not applied after restart)"},
     {"threads", PT_INT, OFF(threads), "2", "OpenMP threads"},
-    {"nsub", PT_INT, OFF(nsub), "4", "performance only: y sub-cells per unit cell (1..8); results identical up to round-off order"},
+    {"nsub", PT_INT, OFF(nsub), "4", "performance only: y sub-cells per unit cell (1..8); same physics, different round-off order"},
     {"seed", PT_U64, OFF(seed), "1", "random seed"},
     {"init", PT_STR, OFF(init), "soup", "soup | seeded | restart"},
     {"restart", PT_STR, OFF(restart), "", "checkpoint file; if non-empty the run restarts from it"},
@@ -240,7 +245,9 @@ static const pdef_t PDEFS[] = {
     {"walltime", PT_DBL, OFF(walltime), "0", "stop cleanly (with checkpoint) after this many seconds (0 = off)"},
     {"chem", PT_INT, OFF(chem), "1", "1 = chemistry on"},
     {"n_chem", PT_LONG, OFF(n_chem), "10", "chemistry check interval (steps); all p_* are per check"},
-    {"r_cat", PT_DBL, OFF(r_cat), "1.2", "catalyst reaction radius (<= 2 cell sides)"},
+    {"r_cat", PT_DBL, OFF(r_cat), "1.2", "catalyst reaction radius"},
+    {"syn_tries", PT_INT, OFF(syn_tries), "8", "new lipid: orientation = lowest overlap energy of this many random ones (1 = purely random)"},
+    {"syn_relax", PT_INT, OFF(syn_relax), "20", "new lipid: steepest-descent iterations moving only its own beads (step <= 0.05 each; 0 = off)"},
     {"p_syn_a", PT_DBL, OFF(p_syn_a), "0.02", "lipid synthesis probability per check, Ka"},
     {"p_syn_b", PT_DBL, OFF(p_syn_b), "0.06", "lipid synthesis probability per check, Kb"},
     {"p_rep_a", PT_DBL, OFF(p_rep_a), "0.001", "catalyst replication probability per check, Ka"},
@@ -403,6 +410,8 @@ static void finalize_params(Params *P) {
     if (P->threads < 1) P->threads = 1;
     if (P->nsub < 1 || P->nsub > 8) die("nsub must be 1..8");
     if (P->n_chem < 1) P->n_chem = 1;
+    if (P->syn_tries < 1) P->syn_tries = 1;
+    if (P->warmup < 0) P->warmup = 0;
     if (strcmp(P->init, "soup") && strcmp(P->init, "seeded") && strcmp(P->init, "restart"))
         die("init must be soup, seeded or restart");
     if (!strcmp(P->init, "restart") && !P->restart[0]) die("init = restart needs restart = <checkpoint>");
@@ -910,11 +919,20 @@ static void pair_column(Sys *s, const pairpar_t *pp, const int cx) {
     }
 }
 
+/* repulsion used at a given step: during the warm-up of a fresh random start
+ * the part of a_ij above the water value 25 is ramped in linearly */
+static double a_eff(const Params *P, int i, int j, int64_t step, int64_t warm_end) {
+    const double a = P->a[i][j];
+    if (step >= warm_end || P->warmup <= 0 || a <= 25.0) return a;
+    const double f = 1.0 - (double)(warm_end - step) / (double)P->warmup;
+    return 25.0 + (a - 25.0) * (f < 0 ? 0 : f);
+}
+
 static void pair_forces(Sys *s, const Params *P, int64_t step) {
     pairpar_t pp;
     memset(&pp, 0, sizeof pp);
     for (int i = 0; i < NTYPES; i++)
-        for (int j = 0; j < NTYPES; j++) pp.a[8 * i + j] = P->a[i][j];
+        for (int j = 0; j < NTYPES; j++) pp.a[8 * i + j] = a_eff(P, i, j, step, g_warm_end);
     pp.gamma = P->gamma;
     pp.sdt = P->sigma / sqrt(P->dt);
     pp.sseed = step_seed(s->seed, step);
@@ -1073,6 +1091,131 @@ static int find_type_near(Sys *s, int ks, double rcut, int type, nbr_t *out, int
         (nout) = tot_;                                                                  \
     } while (0)
 
+/* conservative overlap energy sum 1/2 a (1-r)^2 between a would-be lipid chain
+ * (centre c, direction u) and all other beads within rc (excluding the beads
+ * sl[] that will form it).  Uses the cell index of the last sort. */
+static double chain_overlap_energy(Sys *s, const Params *P, double cx0, double cy0, double ux, double uy,
+                                   const int *sl) {
+    const int ml = s->mlen, ncx = s->ncx, ncy = s->ncy;
+    const double L = s->L;
+    double U = 0.0;
+    for (int b = 0; b < ml; b++) {
+        const double off = (b - 0.5 * (ml - 1)) * P->r0;
+        double px = cx0 + off * ux, py = cy0 + off * uy;
+        wrap1(&px, L);
+        wrap1(&py, L);
+        const int tb = b < s->nH ? TH : TT;
+        const int c = cell_of_pos(s, px, py);
+        const int cx = c / ncy, cy = c % ncy;
+        const int rx = (int)ceil((1.0 + CHEM_MARGIN) * s->icsx), ry = (int)ceil((1.0 + CHEM_MARGIN) * s->icsy);
+        for (int ox = -rx; ox <= rx; ox++) {
+            int cxx = cx + ox;
+            cxx += cxx < 0 ? ncx : 0;
+            cxx -= cxx >= ncx ? ncx : 0;
+            const int base = cxx * ncy;
+            for (int oy = -ry; oy <= ry; oy++) {
+                int cyy = cy + oy;
+                cyy += cyy < 0 ? ncy : 0;
+                cyy -= cyy >= ncy ? ncy : 0;
+                for (int j = s->cstart[base + cyy]; j < s->cstart[base + cyy + 1]; j++) {
+                    int skip = 0;
+                    for (int q = 0; q < ml; q++) skip |= j == sl[q];
+                    if (skip) continue;
+                    const double dx = minimg(s->x[j] - px, L), dy = minimg(s->y[j] - py, L);
+                    const double r2 = dx * dx + dy * dy;
+                    if (r2 >= 1.0) continue;
+                    const double w = 1.0 - sqrt(r2);
+                    U += 0.5 * P->a[tb][s->type[j]] * w * w;
+                }
+            }
+        }
+    }
+    return U;
+}
+
+/* Local insertion relaxation of a newly synthesised chain: steepest descent on
+ * (pair overlap with the frozen surroundings + its own bonds and angles),
+ * moving only the chain's beads, displacement per bead per iteration <= 0.05. */
+static void relax_new_chain(Sys *s, const Params *P, const int *sl) {
+    const int ml = s->mlen, ncx = s->ncx, ncy = s->ncy;
+    const double L = s->L, cap = 0.05, alpha = 0.002;
+    enum { MAXNB = 512 };
+    int nbj[MAXNB];
+    int nnb = 0;
+    /* neighbours within 1 + (iterations * cap) of any chain bead, collected once */
+    const double reach = 1.0 + cap * P->syn_relax;
+    const double reach2 = reach * reach;
+    for (int b = 0; b < ml && nnb < MAXNB; b++) {
+        const double px = s->x[sl[b]], py = s->y[sl[b]];
+        const int c = cell_of_pos(s, px, py);
+        const int cx = c / ncy, cy = c % ncy;
+        const int rx = (int)ceil((reach + CHEM_MARGIN) * s->icsx), ry = (int)ceil((reach + CHEM_MARGIN) * s->icsy);
+        for (int ox = -rx; ox <= rx; ox++) {
+            int cxx = cx + ox;
+            cxx += cxx < 0 ? ncx : 0;
+            cxx -= cxx >= ncx ? ncx : 0;
+            for (int oy = -ry; oy <= ry; oy++) {
+                int cyy = cy + oy;
+                cyy += cyy < 0 ? ncy : 0;
+                cyy -= cyy >= ncy ? ncy : 0;
+                const int cc = cxx * ncy + cyy;
+                for (int j = s->cstart[cc]; j < s->cstart[cc + 1]; j++) {
+                    int skip = 0;
+                    for (int q = 0; q < ml; q++) skip |= j == sl[q];
+                    for (int q = 0; q < nnb && !skip; q++) skip |= nbj[q] == j;
+                    if (skip) continue;
+                    const double dx = minimg(s->x[j] - px, L), dy = minimg(s->y[j] - py, L);
+                    if (dx * dx + dy * dy < reach2 && nnb < MAXNB) nbj[nnb++] = j;
+                }
+            }
+        }
+    }
+    for (int it = 0; it < P->syn_relax; it++) {
+        double fx[MAXMLEN] = {0}, fy[MAXMLEN] = {0};
+        for (int b = 0; b < ml; b++) {
+            const int i = sl[b];
+            for (int q = 0; q < nnb; q++) {
+                const int j = nbj[q];
+                const double dx = minimg(s->x[i] - s->x[j], L), dy = minimg(s->y[i] - s->y[j], L);
+                const double r2 = dx * dx + dy * dy;
+                if (r2 >= 1.0 || r2 < 1e-24) continue;
+                const double r = sqrt(r2);
+                const double f = P->a[s->type[i]][s->type[j]] * (1.0 - r) / r;
+                fx[b] += f * dx;
+                fy[b] += f * dy;
+            }
+        }
+        double bx[MAXMLEN], by[MAXMLEN], bl[MAXMLEN];
+        for (int b = 0; b < ml - 1; b++) {
+            const int i = sl[b], j = sl[b + 1];
+            bx[b] = minimg(s->x[j] - s->x[i], L);
+            by[b] = minimg(s->y[j] - s->y[i], L);
+            bl[b] = sqrt(bx[b] * bx[b] + by[b] * by[b]);
+            const double f = -P->k_bond * (bl[b] - P->r0) / bl[b];
+            fx[b + 1] += f * bx[b]; fy[b + 1] += f * by[b];
+            fx[b] -= f * bx[b]; fy[b] -= f * by[b];
+        }
+        for (int b = 0; b < ml - 2 && P->k_angle != 0.0; b++) {
+            const double ax = bx[b], ay = by[b], cxv = bx[b + 1], cyv = by[b + 1], la = bl[b], lc = bl[b + 1];
+            const double ilac = 1.0 / (la * lc), cs = (ax * cxv + ay * cyv) * ilac, ka = P->k_angle;
+            const double dUax = -ka * (cxv * ilac - cs * ax / (la * la)), dUay = -ka * (cyv * ilac - cs * ay / (la * la));
+            const double dUcx = -ka * (ax * ilac - cs * cxv / (lc * lc)), dUcy = -ka * (ay * ilac - cs * cyv / (lc * lc));
+            fx[b] += dUax; fy[b] += dUay;
+            fx[b + 1] += -dUax + dUcx; fy[b + 1] += -dUay + dUcy;
+            fx[b + 2] -= dUcx; fy[b + 2] -= dUcy;
+        }
+        for (int b = 0; b < ml; b++) {
+            double mx = alpha * fx[b], my = alpha * fy[b];
+            const double m = sqrt(mx * mx + my * my);
+            if (m > cap) { mx *= cap / m; my *= cap / m; }
+            s->x[sl[b]] += mx;
+            s->y[sl[b]] += my;
+            wrap1(&s->x[sl[b]], L);
+            wrap1(&s->y[sl[b]], L);
+        }
+    }
+}
+
 static int feed_outside(Sys *s, const Params *P, int64_t step);
 static double g_t_react = 0, g_t_decay = 0, g_t_feed = 0;
 
@@ -1120,8 +1263,15 @@ static int chemistry(Sys *s, const Params *P, int64_t step, int do_react, int do
                 }
                 cxm = xk + cxm / ml; cym = yk + cym / ml;
                 mvx /= ml; mvy /= ml; mtx /= ml; mty /= ml;
-                const double phi = 2.0 * M_PI * rng_unif(&s->rng);
-                const double ux = cos(phi), uy = sin(phi);
+                /* orientation: lowest conservative overlap energy with the
+                 * surroundings among syn_tries random orientations */
+                double ux = 1.0, uy = 0.0, ubest = INFINITY;
+                for (int tr = 0; tr < P->syn_tries; tr++) {
+                    const double phi = 2.0 * M_PI * rng_unif(&s->rng);
+                    const double cx_ = cos(phi), cy_ = sin(phi);
+                    const double U = P->syn_tries > 1 ? chain_overlap_energy(s, P, cxm, cym, cx_, cy_, sl) : 0.0;
+                    if (U < ubest) { ubest = U; ux = cx_; uy = cy_; }
+                }
                 for (int b = 0; b < ml; b++) {
                     const int j = sl[b];
                     const double off = (b - 0.5 * (ml - 1)) * P->r0;
@@ -1134,6 +1284,7 @@ static int chemistry(Sys *s, const Params *P, int64_t step, int do_react, int do
                     s->type[j] = b < s->nH ? TH : TT;
                 }
                 link_lipid(s, sl);
+                if (P->syn_relax > 0) relax_new_chain(s, P, sl);
                 add_event(s, step, EV_SYN, s->gid[k], xk, yk, var);
                 used = ml;
                 moved = 1;
@@ -1457,6 +1608,8 @@ static void write_ckpt(Sys *s, const char *dir, int keep) {
     fwrite(&s->L, 8, 1, f);
     fwrite(&s->seed, 8, 1, f);
     fwrite(s->rng.s, 8, 4, f);
+    fwrite(&s->maxbond, 8, 1, f);
+    fwrite(&g_warm_end, 8, 1, f);
     fwrite(s->gid, 4, N, f);
     fwrite(s->type, 1, N, f);
     fwrite(s->mpos, 1, N, f);
@@ -1503,6 +1656,9 @@ static void read_ckpt(Sys *s, const Params *P, const char *path) {
     freadx(&L, 8, 1, f, "L");
     freadx(&seed, 8, 1, f, "seed");
     freadx(rs, 8, 4, f, "rng");
+    double maxbond;
+    freadx(&maxbond, 8, 1, f, "maxbond");
+    freadx(&g_warm_end, 8, 1, f, "warm_end");
     if (ml != P->lip_nH + P->lip_nT || nH != P->lip_nH) die("checkpoint lipid architecture differs from parameters");
     if (fabs(L - P->L) > 1e-12) die("checkpoint L=%g differs from parameter L=%g", L, P->L);
     sys_alloc(s, N, L, ml, nH, P->threads, P->feed_grid, P->nsub);
@@ -1510,6 +1666,7 @@ static void read_ckpt(Sys *s, const Params *P, const char *path) {
     s->time = time;
     s->seed = seed;
     memcpy(s->rng.s, rs, sizeof rs);
+    s->maxbond = maxbond;
     freadx(s->gid, 4, N, f, "gid");
     freadx(s->type, 1, N, f, "type");
     freadx(s->mpos, 1, N, f, "mpos");
@@ -1594,15 +1751,24 @@ static double kinetic_T(const Sys *s, double dt, double *px, double *py) {
     return k2 / (2.0 * s->N - 2.0);
 }
 
-/* compare two params files ignoring comment lines and the restart key */
+/* lines that do not affect the trajectory: comments, restart, performance keys */
+static int params_line_ignored(const char *l) {
+    static const char *keys[] = {"restart ", "threads ", "walltime ", "log_every "}; /* nsub changes round-off order */
+    if (l[0] == '#') return 1;
+    for (size_t k = 0; k < sizeof keys / sizeof keys[0]; k++)
+        if (!strncmp(l, keys[k], strlen(keys[k]))) return 1;
+    return 0;
+}
+
+/* compare two params files ignoring lines that do not affect the trajectory */
 static int same_params_file(const char *a, const char *b) {
     FILE *fa = fopen(a, "r"), *fb = fopen(b, "r");
     int same = fa && fb;
     char la[2048], lb[2048];
     while (same) {
         char *ra, *rb;
-        do { ra = fgets(la, sizeof la, fa); } while (ra && (la[0] == '#' || !strncmp(la, "restart ", 8)));
-        do { rb = fgets(lb, sizeof lb, fb); } while (rb && (lb[0] == '#' || !strncmp(lb, "restart ", 8)));
+        do { ra = fgets(la, sizeof la, fa); } while (ra && params_line_ignored(la));
+        do { rb = fgets(lb, sizeof lb, fb); } while (rb && params_line_ignored(lb));
         if (!ra || !rb) { same = !ra && !rb; break; }
         if (strcmp(la, lb)) same = 0;
     }
@@ -1681,6 +1847,8 @@ int main(int argc, char **argv) {
         if (!strcmp(P.init, "soup")) init_soup(s, &P);
         else init_seeded(s, &P);
         set_velocities(s, &P);
+        g_warm_end = P.warmup;
+        if (P.warmup > 0) logmsg("warm-up: repulsion above 25 ramped in over steps 0..%ld\n", P.warmup);
         for (int i = 0; i < N; i++) { s->vtx[i] = s->vx[i]; s->vty[i] = s->vy[i]; }
         s->step = 0;
         s->time = 0.0;

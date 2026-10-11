@@ -26,7 +26,7 @@ import ocio  # noqa: E402
 import cells as celldet  # noqa: E402
 import tracking  # noqa: E402
 
-TOOLS_VERSION = "6"
+TOOLS_VERSION = "7"
 CACHE = "analysis_cache"
 
 

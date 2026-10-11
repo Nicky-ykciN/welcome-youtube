@@ -86,7 +86,7 @@ def scale_bar(img, ppu, corner="br", color=(255, 255, 255, 235), margin=None, fr
     L_units = nice_length(frac * W / ppu * RC_NM) / RC_NM
     bar = L_units * ppu
     th = max(3, int(round(0.0055 * W)))
-    fs = max(12, int(0.021 * W * font_scale))
+    fs = max(14, int(0.021 * W * font_scale))
     fnt = font("Medium", fs)
     txt = fmt_len_nm(L_units)
     if corner == "br":

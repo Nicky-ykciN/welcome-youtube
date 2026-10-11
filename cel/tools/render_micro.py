@@ -211,12 +211,25 @@ def compose(chans, prm, norm=None, rng=None, ss=1):
 
 
 def auto_norm(chans):
-    """Normalisation from the data: membrane 99.7th percentile of lit pixels -> ~1."""
+    """'Exposure' from the data, like a microscopist setting the gain per channel.
+
+    membrane: 99th percentile of lit pixels -> 1.  catalysts (one shared setting for GFP and YFP so
+    their brightness stays comparable): a single isolated molecule = 1, unless dense clusters would
+    saturate - then the gain is lowered so the 99.7th percentile of lit pixels maps to ~1.3."""
     n = {}
     m = chans.get("memb")
     if m is not None:
         lit = m[m > 0.15 * m.max()] if m.max() > 0 else m
         n["memb"] = float(max(np.percentile(lit, 99.0), 1e-6)) if lit.size else 1.0
+    ks = [chans[k] for k in ("ka", "kb") if k in chans]
+    if ks:
+        k = ks[0] if len(ks) == 1 else ks[0] + ks[1]
+        lit = k[k > 0.2]
+        kn = float(np.percentile(lit, 99.7)) / 1.3 if lit.size > 50 else 1.0
+        n["ka"] = n["kb"] = kn if kn > 1.5 else 1.0
+    if "z" in chans:
+        z = chans["z"]; lit = z[z > 0.2]
+        n["z"] = max(1.0, float(np.percentile(lit, 99.7)) / 1.3) if lit.size > 50 else 1.0
     return n
 
 
@@ -244,10 +257,10 @@ def render(snap, view=None, width=2000, height=None, ss=2, prm=None, norm=None, 
 def draw_overlay(img, ppu, snap, legend_channels=(), title=None, time_corner="tl"):
     W, H = img.size
     m = int(0.035 * W)
-    f_big = style.font("Medium", int(0.026 * W))
-    f_small = style.font("Regular", int(0.0165 * W))
+    f_big = style.font("Medium", max(18, int(0.026 * W)))
+    f_small = style.font("Regular", max(13, int(0.0165 * W)))
     style.text_with_shadow(img, (m, m), style.fmt_time(snap.time), f_big, anchor="lt")
-    style.text_with_shadow(img, (m, m + int(0.034 * W)), f"stap {ocio.fmt_int_nl(snap.step)}", f_small,
+    style.text_with_shadow(img, (m, m + int(1.3 * f_big.size)), f"stap {ocio.fmt_int_nl(snap.step)}", f_small,
                            fill=(255, 255, 255, 190), anchor="lt")
     if title:
         style.text_with_shadow(img, (W - m, m), title, f_small, fill=(255, 255, 255, 210), anchor="rt")
@@ -257,5 +270,5 @@ def draw_overlay(img, ppu, snap, legend_channels=(), title=None, time_corner="tl
         col = COLORS[name] / COLORS[name].max()
         col = tuple(int(255 * (0.35 + 0.65 * c) ** 0.6) for c in col) + (235,)
         style.text_with_shadow(img, (m, y), LEGEND[name], f_small, fill=col, anchor="ls")
-        y -= int(0.026 * W)
+        y -= int(1.55 * f_small.size)
     return img

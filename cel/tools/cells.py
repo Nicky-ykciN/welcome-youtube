@@ -28,16 +28,18 @@ DEFAULTS = dict(
     h=0.25,                   # raster pixel size (sim units); adjusted so L/h is integer
     r_stamp=0.75,             # disk radius drawn around each membrane bead
     min_membrane_lipids=12,   # smaller aggregates (micelles) cannot be a membrane
-    min_lumen_area=10.0,      # unit^2
+    min_lumen_area=16.0,      # unit^2 (smaller enclosed pockets in real runs were never vesicles)
     min_aqueous_frac=0.30,    # hydrophilic beads in lumen >= frac * rho * area
     rho=3.0,
     pad=2.5,                  # padding around an aggregate's bounding box (units)
     leaflet_in=1.5,           # head within this distance of the lumen = inner leaflet
     leaflet_max=6.0,          # heads further than this are not counted as wall heads
-    min_exposure=0.5,         # fraction of the lumen boundary that must lie within one membrane
+    min_exposure=0.8,         # fraction of the lumen boundary that must lie within one membrane
                               # thickness of the bulk outside medium (rejects water pockets
                               # buried in a lipid matrix / inverted phases)
     wall_extra=4.0,           # wall_max = 2 * lipid length * r0 + wall_extra (units)
+    inner_frac_range=(0.2, 0.62),  # bilayer: wall heads face both the lumen and the medium
+                                   # (vesicles 0.34-0.47; inverted pockets 0.7-1.0)
 )
 
 _S4 = ndimage.generate_binary_structure(2, 1)
@@ -375,6 +377,13 @@ def detect(snap, cfg=None):
         np.add.at(inner, hl[dist <= c["leaflet_in"]], 1)
         np.add.at(outer, hl[(dist > c["leaflet_in"]) & (dist <= c["leaflet_max"])], 1)
 
+    # bilayer test on the wall (needs the leaflet counts above)
+    lo_if, hi_if = c["inner_frac_range"]
+    bil_ok = []
+    for j in range(len(lumens)):
+        tot = inner[j] + outer[j]
+        f_in = inner[j] / max(tot, 1)
+        bil_ok.append(tot >= 6 and lo_if <= f_in <= hi_if)
     cells = []
     for j, lu in enumerate(lumens):
         gp = lu["gpix"].astype(np.float64)
@@ -407,6 +416,23 @@ def detect(snap, cfg=None):
             wraps_membrane=bool(lu["wraps_agg"]),
             exposure=round(lu["exposure"], 3), wall=round(lu["wall"], 2) if np.isfinite(lu["wall"]) else None,
         ))
+    # drop lumens whose wall is not bilayer-like; relabel grid, bead map and ids consistently
+    if cells and not all(bil_ok):
+        keep_ids = [j for j in range(len(cells)) if bil_ok[j]]
+        m = np.full(len(cells) + 1, -1, np.int64)
+        m[keep_ids] = np.arange(len(keep_ids))
+        label = m[label].astype(np.int32)
+        bc = bead_cell.astype(np.int64)
+        lum = bc >= 0
+        mem = bc <= -2
+        nb_ = np.full(len(bc), -1, np.int64)
+        nb_[lum] = m[bc[lum]]
+        mm = m[-bc[mem] - 2]
+        nb_[mem] = np.where(mm >= 0, -mm - 2, -1)
+        bead_cell = nb_.astype(np.int32)
+        cells = [cells[j] for j in keep_ids]
+        for k, cl in enumerate(cells):
+            cl["id"] = k
     n_free = int(np.sum(agg_size[agg_of_mol] < c["min_membrane_lipids"])) if nmol else 0
     summary = dict(n_molecules=int(nmol), n_aggregates=int(nagg),
                    n_membranes=int(len(cand_aggs)), lipids_in_small_aggregates=n_free,
