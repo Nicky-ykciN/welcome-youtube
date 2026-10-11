@@ -32,6 +32,10 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__AVX512BW__) && defined(__AVX512VL__) && !defined(OERCEL_SCALAR)
+#include <immintrin.h>
+#define OERCEL_AVX512 1
+#endif
 
 #define NTYPES 7
 enum { TW = 0, TH = 1, TT = 2, TN = 3, TKA = 4, TKB = 5, TZ = 6 };
@@ -438,16 +442,26 @@ static const char *EVNAME[] = {"syn", "rep", "mut", "dlip", "dK", "dN", "feed"};
 typedef struct {
     int N;
     double L;
-    /* slot-ordered state */
-    double *x, *y, *vx, *vy, *fx, *fy, *vtx, *vty;
+    /* slot-ordered state (permuted by the cell sort every step) */
+    double *x, *y;     /* positions in [0, L) */
+    double *vx, *vy;   /* half-step velocity vh; full v = vh + dt/2 f */
+    double *fx, *fy;   /* forces of the current configuration */
+    double *vtx, *vty; /* Groot-Warren predicted velocity (force input) */
     uint8_t *type;
-    uint32_t *gid;
-    /* sort buffers */
+    uint32_t *gid;     /* permanent bead id */
+    int32_t *nxt;      /* slot of the next bead in the lipid chain, -1 if none */
+    int8_t *mpos;      /* position in the lipid (0 = first head), -1 = not a lipid */
+    /* sort buffers / scratch */
     double *x2, *y2, *vx2, *vy2, *vtx2, *vty2;
     uint8_t *type2;
     uint32_t *gid2;
+    int32_t *nxt2;
+    int8_t *mpos2;
     int *cellof;
-    int *slot; /* slot[gid] */
+    int *src;  /* old slot of each new slot */
+    int *dest; /* new slot of each old slot */
+    int *slot; /* slot[gid], rebuilt on demand (output only) */
+    int blocksum[256];
     /* cells */
     int ncx, ncy, ncell;
     double icsx, icsy, csx, csy;
@@ -456,11 +470,8 @@ typedef struct {
     int nthr_alloc;
     int nstrip;
     int *strip_c0;   /* nstrip+1 */
-    /* molecules (lipids) */
+    /* lipid architecture */
     int mlen, nH;
-    int nmol, molcap;
-    int32_t *mol;    /* nmol*mlen gids, head first */
-    int32_t *mol_of; /* per gid: molecule index or -1 */
     /* time */
     int64_t step;
     double time;
@@ -470,9 +481,17 @@ typedef struct {
     /* events */
     event_t *ev;
     int nev, evcap;
+    /* chemistry / feed scratch */
+    int *tlist;      /* per-thread lists, nthreads * N */
+    int tcount[256];
+    int *glist;      /* merged list, N */
+    int *gc;         /* feed grid cell of each slot */
+    int *fgrid;      /* nthreads * ngrid feed T counts */
+    int *flab, *fqueue;
+    int fng;
 } Sys;
 
-static void sys_alloc(Sys *s, int N, double L, int mlen, int nH, int nthreads) {
+static void sys_alloc(Sys *s, int N, double L, int mlen, int nH, int nthreads, double feed_grid) {
     memset(s, 0, sizeof *s);
     s->N = N;
     s->L = L;
@@ -486,12 +505,18 @@ static void sys_alloc(Sys *s, int N, double L, int mlen, int nH, int nthreads) {
     s->x2 = SA(dn); s->y2 = SA(dn); s->vx2 = SA(dn); s->vy2 = SA(dn);
     s->vtx2 = SA(dn); s->vty2 = SA(dn);
     s->type = SA(N); s->type2 = SA(N);
+    s->mpos = SA(N); s->mpos2 = SA(N);
     s->gid = SA(N * sizeof(uint32_t)); s->gid2 = SA(N * sizeof(uint32_t));
+    s->nxt = SA(N * sizeof(int32_t)); s->nxt2 = SA(N * sizeof(int32_t));
     s->cellof = SA(N * sizeof(int));
+    s->src = SA(N * sizeof(int));
+    s->dest = SA(N * sizeof(int));
     s->slot = SA(N * sizeof(int));
-    s->mol_of = SA(N * sizeof(int32_t));
+    s->gc = SA(N * sizeof(int));
+    s->glist = SA(N * sizeof(int));
+    s->tlist = SA((size_t)nthreads * N * sizeof(int));
 #undef SA
-    for (int i = 0; i < N; i++) s->mol_of[i] = -1;
+    for (int i = 0; i < N; i++) { s->nxt[i] = -1; s->mpos[i] = -1; }
     s->ncx = (int)floor(L);
     s->ncy = (int)floor(L);
     s->ncell = s->ncx * s->ncy;
@@ -500,6 +525,7 @@ static void sys_alloc(Sys *s, int N, double L, int mlen, int nH, int nthreads) {
     s->icsx = s->ncx / L;
     s->icsy = s->ncy / L;
     s->cstart = xcalloc((size_t)(s->ncell + 1) * sizeof(int));
+    if (nthreads > 256) die("at most 256 threads");
     s->nthr_alloc = nthreads;
     s->hist = xmalloc((size_t)nthreads * s->ncell * sizeof(int));
     /* strips: even count, width >= 1 column */
@@ -509,10 +535,15 @@ static void sys_alloc(Sys *s, int N, double L, int mlen, int nH, int nthreads) {
     s->nstrip = ns;
     s->strip_c0 = xmalloc((ns + 1) * sizeof(int));
     for (int k = 0; k <= ns; k++) s->strip_c0[k] = (int)(((long)k * s->ncx) / ns);
-    s->molcap = 1024;
-    s->mol = xmalloc((size_t)s->molcap * mlen * sizeof(int32_t));
     s->evcap = 4096;
     s->ev = xmalloc(s->evcap * sizeof(event_t));
+    /* feed grid */
+    int ng = (int)floor(L / feed_grid);
+    if (ng < 3) ng = 3;
+    s->fng = ng;
+    s->fgrid = xmalloc((size_t)nthreads * ng * ng * sizeof(int));
+    s->flab = xmalloc((size_t)ng * ng * sizeof(int));
+    s->fqueue = xmalloc((size_t)ng * ng * sizeof(int));
 }
 
 static inline void wrap1(double *p, double L) {
@@ -554,40 +585,36 @@ static void add_event(Sys *s, int64_t step, int kind, int64_t i, double x, doubl
     e->step = step; e->kind = kind; e->i = i; e->x = x; e->y = y; e->variant = variant;
 }
 
-static int add_molecule(Sys *s, const int32_t *g) {
-    if (s->nmol == s->molcap) {
-        s->molcap *= 2;
-        int32_t *n = xmalloc((size_t)s->molcap * s->mlen * sizeof(int32_t));
-        memcpy(n, s->mol, (size_t)s->nmol * s->mlen * sizeof(int32_t));
-        free(s->mol);
-        s->mol = n;
-    }
-    int m = s->nmol++;
+/* make slots sl[0..mlen-1] one lipid chain (types set by the caller) */
+static void link_lipid(Sys *s, const int *sl) {
     for (int b = 0; b < s->mlen; b++) {
-        s->mol[(size_t)m * s->mlen + b] = g[b];
-        s->mol_of[g[b]] = m;
+        s->mpos[sl[b]] = (int8_t)b;
+        s->nxt[sl[b]] = b + 1 < s->mlen ? sl[b + 1] : -1;
     }
-    return m;
 }
 
-static void remove_molecule(Sys *s, int m) {
-    const int ml = s->mlen;
-    for (int b = 0; b < ml; b++) s->mol_of[s->mol[(size_t)m * ml + b]] = -1;
-    int last = s->nmol - 1;
-    if (m != last) {
-        for (int b = 0; b < ml; b++) {
-            int32_t g = s->mol[(size_t)last * ml + b];
-            s->mol[(size_t)m * ml + b] = g;
-            s->mol_of[g] = m;
-        }
-    }
-    s->nmol--;
+static int count_lipids(const Sys *s) {
+    int n = 0;
+    for (int i = 0; i < s->N; i++) n += s->mpos[i] == 0;
+    return n;
 }
 
-/* ------------------------------------------------------------------ sort */
+/* rebuild slot[gid] (needed only for output) */
+static void build_slot(Sys *s) {
+    for (int d = 0; d < s->N; d++) s->slot[s->gid[d]] = d;
+}
 
-/* Stable parallel counting sort of all slot arrays by cell index.  The result
- * is the unique stable order, independent of the thread count. */
+/* counter-based uniform deviate for parallel, order-independent decisions */
+static inline double hash_u01(uint64_t seed, int64_t step, uint32_t g, uint64_t salt) {
+    uint64_t h = mix13(seed ^ mix13((uint64_t)step * 0x9e3779b97f4a7c15ULL + salt));
+    h = mix13(h ^ ((uint64_t)g * 0xd1b54a32d192ed03ULL));
+    return (double)(h >> 11) * 0x1.0p-53;
+}
+
+/* Stable parallel counting sort of all slot arrays by cell index (column-major).
+ * The result is the unique stable order, independent of the thread count.
+ * Implemented in "gather form" (src[] = inverse permutation): contiguous
+ * stores and nearly contiguous loads, one array at a time. */
 static void sort_cells(Sys *s) {
     const int N = s->N, nc = s->ncell, ncx = s->ncx, ncy = s->ncy;
     const double icsx = s->icsx, icsy = s->icsy;
@@ -596,15 +623,20 @@ static void sort_cells(Sys *s) {
     int *restrict hist = s->hist;
     int *restrict cs = s->cstart;
     int *restrict cellof = s->cellof;
-    int *restrict slot = s->slot;
+    int *restrict src = s->src;
+    int *restrict dest = s->dest;
     const double *restrict x = s->x, *restrict y = s->y, *restrict vx = s->vx, *restrict vy = s->vy;
     const double *restrict vtx = s->vtx, *restrict vty = s->vty;
     const uint8_t *restrict type = s->type;
     const uint32_t *restrict gid = s->gid;
+    const int32_t *restrict nxt = s->nxt;
+    const int8_t *restrict mpos = s->mpos;
     double *restrict x2 = s->x2, *restrict y2 = s->y2, *restrict vx2 = s->vx2, *restrict vy2 = s->vy2;
     double *restrict vtx2 = s->vtx2, *restrict vty2 = s->vty2;
     uint8_t *restrict type2 = s->type2;
     uint32_t *restrict gid2 = s->gid2;
+    int32_t *restrict nxt2 = s->nxt2;
+    int8_t *restrict mpos2 = s->mpos2;
 #pragma omp parallel num_threads(nth)
     {
         const int t = omp_get_thread_num(), nt = omp_get_num_threads();
@@ -620,10 +652,19 @@ static void sort_cells(Sys *s) {
             h[c]++;
         }
 #pragma omp barrier
-#pragma omp single
+        /* exclusive scan over (cell, thread) in parallel: block sums first */
         {
+            const int c0 = (int)(((long)t * nc) / nt), c1 = (int)(((long)(t + 1) * nc) / nt);
+            int sum = 0;
+            for (int tt = 0; tt < nt; tt++) {
+                const int *restrict ht = hist + (size_t)tt * nc;
+                for (int c = c0; c < c1; c++) sum += ht[c];
+            }
+            s->blocksum[t] = sum;
+#pragma omp barrier
             int run = 0;
-            for (int c = 0; c < nc; c++) {
+            for (int tt = 0; tt < t; tt++) run += s->blocksum[tt];
+            for (int c = c0; c < c1; c++) {
                 cs[c] = run;
                 for (int tt = 0; tt < nt; tt++) {
                     const int v = hist[(size_t)tt * nc + c];
@@ -631,19 +672,37 @@ static void sort_cells(Sys *s) {
                     run += v;
                 }
             }
-            cs[nc] = run;
+            if (t == nt - 1) cs[nc] = run;
         }
+#pragma omp barrier
         for (int i = lo; i < hi; i++) {
             const int d = h[cellof[i]]++;
-            x2[d] = x[i];
-            y2[d] = y[i];
-            vx2[d] = vx[i];
-            vy2[d] = vy[i];
-            vtx2[d] = vtx[i];
-            vty2[d] = vty[i];
-            type2[d] = type[i];
-            gid2[d] = gid[i];
-            slot[gid[i]] = d;
+            src[d] = i;
+            dest[i] = d;
+        }
+#pragma omp barrier
+#pragma omp for schedule(static) nowait
+        for (int d = 0; d < N; d++) x2[d] = x[src[d]];
+#pragma omp for schedule(static) nowait
+        for (int d = 0; d < N; d++) y2[d] = y[src[d]];
+#pragma omp for schedule(static) nowait
+        for (int d = 0; d < N; d++) vx2[d] = vx[src[d]];
+#pragma omp for schedule(static) nowait
+        for (int d = 0; d < N; d++) vy2[d] = vy[src[d]];
+#pragma omp for schedule(static) nowait
+        for (int d = 0; d < N; d++) vtx2[d] = vtx[src[d]];
+#pragma omp for schedule(static) nowait
+        for (int d = 0; d < N; d++) vty2[d] = vty[src[d]];
+#pragma omp for schedule(static) nowait
+        for (int d = 0; d < N; d++) type2[d] = type[src[d]];
+#pragma omp for schedule(static) nowait
+        for (int d = 0; d < N; d++) gid2[d] = gid[src[d]];
+#pragma omp for schedule(static) nowait
+        for (int d = 0; d < N; d++) mpos2[d] = mpos[src[d]];
+#pragma omp for schedule(static)
+        for (int d = 0; d < N; d++) {
+            const int32_t o = nxt[src[d]];
+            nxt2[d] = o < 0 ? -1 : dest[o];
         }
     }
     double *t;
@@ -655,6 +714,8 @@ static void sort_cells(Sys *s) {
     t = s->vty; s->vty = s->vty2; s->vty2 = t;
     uint8_t *tu = s->type; s->type = s->type2; s->type2 = tu;
     uint32_t *tg = s->gid; s->gid = s->gid2; s->gid2 = tg;
+    int32_t *tn = s->nxt; s->nxt = s->nxt2; s->nxt2 = tn;
+    int8_t *tm = s->mpos; s->mpos = s->mpos2; s->mpos2 = tm;
 }
 
 /* ------------------------------------------------------------------ forces */
@@ -665,6 +726,7 @@ typedef struct {
     uint64_t sseed;
 } pairpar_t;
 
+#ifndef OERCEL_AVX512
 #define PBUF 128
 static inline __attribute__((always_inline)) void
 pair_seg(const int j0, const int j1, const double xi, const double yi, const double vxi, const double vyi,
@@ -708,6 +770,73 @@ pair_seg(const int j0, const int j1, const double xi, const double yi, const dou
     *fyi += ay;
 }
 
+#endif
+
+#ifdef OERCEL_AVX512
+/* AVX-512 version: the j candidates of bead i form contiguous slot ranges, so
+ * 8 of them are processed per vector with masked contiguous loads/stores. */
+typedef struct {
+    __m512d xi, yi, vxi, vyi, arow;
+    __m256i gi;
+    __m512d ax, ay;
+} ivec_t;
+
+static inline __attribute__((always_inline)) void
+pair_seg_v(const int j0, const int j1, ivec_t *iv, const double shx, const double shy, const double gam,
+           const double sdt, const uint64_t sseed, const double *restrict x, const double *restrict y,
+           const double *restrict vx, const double *restrict vy, const uint8_t *restrict ty,
+           const uint32_t *restrict gid, double *restrict fx, double *restrict fy) {
+    const __m512d one = _mm512_set1_pd(1.0), tiny = _mm512_set1_pd(1e-24);
+    const __m512d half = _mm512_set1_pd(0.5), c15 = _mm512_set1_pd(1.5);
+    const __m512d xi = _mm512_sub_pd(iv->xi, _mm512_set1_pd(shx));
+    const __m512d yi = _mm512_sub_pd(iv->yi, _mm512_set1_pd(shy));
+    for (int j = j0; j < j1; j += 8) {
+        const int rem = j1 - j;
+        const __mmask8 tail = rem >= 8 ? (__mmask8)0xFF : (__mmask8)((1u << rem) - 1u);
+        const __m512d dx = _mm512_sub_pd(xi, _mm512_maskz_loadu_pd(tail, x + j));
+        const __m512d dy = _mm512_sub_pd(yi, _mm512_maskz_loadu_pd(tail, y + j));
+        const __m512d r2 = _mm512_fmadd_pd(dx, dx, _mm512_mul_pd(dy, dy));
+        __mmask8 m = _mm512_mask_cmp_pd_mask(tail, r2, one, _CMP_LT_OQ);
+        m = _mm512_mask_cmp_pd_mask(m, r2, tiny, _CMP_GT_OQ);
+        if (!m) continue;
+        /* 1/r: rsqrt14 + two Newton steps (full double precision) */
+        __m512d ir = _mm512_rsqrt14_pd(r2);
+        const __m512d hr2 = _mm512_mul_pd(half, r2);
+        ir = _mm512_mul_pd(ir, _mm512_fnmadd_pd(hr2, _mm512_mul_pd(ir, ir), c15));
+        ir = _mm512_mul_pd(ir, _mm512_fnmadd_pd(hr2, _mm512_mul_pd(ir, ir), c15));
+        const __m512d r = _mm512_mul_pd(r2, ir);
+        const __m512d w = _mm512_sub_pd(one, r);
+        const __m512d dvx = _mm512_sub_pd(iv->vxi, _mm512_maskz_loadu_pd(m, vx + j));
+        const __m512d dvy = _mm512_sub_pd(iv->vyi, _mm512_maskz_loadu_pd(m, vy + j));
+        const __m512d rv = _mm512_mul_pd(_mm512_fmadd_pd(dx, dvx, _mm512_mul_pd(dy, dvy)), ir);
+        /* repulsion parameter from the 8-entry row of bead i */
+        const __m512i tj = _mm512_cvtepu8_epi64(_mm_maskz_loadu_epi8(m, ty + j));
+        const __m512d aij = _mm512_permutexvar_pd(tj, iv->arow);
+        /* symmetric pair noise, identical to pair_theta() */
+        const __m256i gj = _mm256_maskz_loadu_epi32(m, gid + j);
+        const __m512i lo = _mm512_cvtepu32_epi64(_mm256_min_epu32(iv->gi, gj));
+        const __m512i hi = _mm512_cvtepu32_epi64(_mm256_max_epu32(iv->gi, gj));
+        __m512i h = _mm512_or_si512(_mm512_slli_epi64(lo, 32), hi);
+        h = _mm512_xor_si512(_mm512_mullo_epi64(h, _mm512_set1_epi64((long long)0x9e3779b97f4a7c15ULL)),
+                             _mm512_set1_epi64((long long)sseed));
+        h = _mm512_mullo_epi64(_mm512_xor_si512(h, _mm512_srli_epi64(h, 30)), _mm512_set1_epi64((long long)0xbf58476d1ce4e5b9ULL));
+        h = _mm512_mullo_epi64(_mm512_xor_si512(h, _mm512_srli_epi64(h, 27)), _mm512_set1_epi64((long long)0x94d049bb133111ebULL));
+        h = _mm512_xor_si512(h, _mm512_srli_epi64(h, 31));
+        const __m512d th = _mm512_mul_pd(_mm512_cvtepi64_pd(h), _mm512_set1_pd(SQRT12 / 18446744073709551616.0));
+        /* fm = w (a - gamma w rv + sdt th) / r */
+        __m512d fm = _mm512_fmadd_pd(_mm512_set1_pd(sdt), th, aij);
+        fm = _mm512_fnmadd_pd(_mm512_mul_pd(_mm512_set1_pd(gam), w), rv, fm);
+        fm = _mm512_mul_pd(_mm512_mul_pd(w, fm), ir);
+        const __m512d ffx = _mm512_maskz_mul_pd(m, fm, dx);
+        const __m512d ffy = _mm512_maskz_mul_pd(m, fm, dy);
+        iv->ax = _mm512_add_pd(iv->ax, ffx);
+        iv->ay = _mm512_add_pd(iv->ay, ffy);
+        _mm512_mask_storeu_pd(fx + j, m, _mm512_sub_pd(_mm512_maskz_loadu_pd(m, fx + j), ffx));
+        _mm512_mask_storeu_pd(fy + j, m, _mm512_sub_pd(_mm512_maskz_loadu_pd(m, fy + j), ffy));
+    }
+}
+#endif
+
 static void pair_column(Sys *s, const pairpar_t *pp, const int cx) {
     const int ncx = s->ncx, ncy = s->ncy;
     const double L = s->L;
@@ -743,6 +872,24 @@ static void pair_column(Sys *s, const pairpar_t *pp, const int cx) {
             sj0[nseg] = cs[nb + ncy - 2]; sj1[nseg] = cs[nb + ncy]; ssx[nseg] = shx; ssy[nseg] = 0.0; nseg++;
             sj0[nseg] = cs[nb]; sj1[nseg] = cs[nb + 1]; ssx[nseg] = shx; ssy[nseg] = L; nseg++;
         }
+#ifdef OERCEL_AVX512
+        for (int i = i0; i < i1; i++) {
+            ivec_t iv;
+            iv.xi = _mm512_set1_pd(x[i]);
+            iv.yi = _mm512_set1_pd(y[i]);
+            iv.vxi = _mm512_set1_pd(vx[i]);
+            iv.vyi = _mm512_set1_pd(vy[i]);
+            iv.arow = _mm512_loadu_pd(pp->a + 8 * ty[i]);
+            iv.gi = _mm256_set1_epi32((int)gid[i]);
+            iv.ax = _mm512_setzero_pd();
+            iv.ay = _mm512_setzero_pd();
+            pair_seg_v(i + 1, selfend, &iv, 0.0, 0.0, gam, sdt, sseed, x, y, vx, vy, ty, gid, fx, fy);
+            for (int k = 0; k < nseg; k++)
+                pair_seg_v(sj0[k], sj1[k], &iv, ssx[k], ssy[k], gam, sdt, sseed, x, y, vx, vy, ty, gid, fx, fy);
+            fx[i] += _mm512_reduce_add_pd(iv.ax);
+            fy[i] += _mm512_reduce_add_pd(iv.ay);
+        }
+#else
         for (int i = i0; i < i1; i++) {
             const double xi = x[i], yi = y[i], vxi = vx[i], vyi = vy[i];
             const uint32_t gi = gid[i];
@@ -755,6 +902,7 @@ static void pair_column(Sys *s, const pairpar_t *pp, const int cx) {
             fx[i] += fxi;
             fy[i] += fyi;
         }
+#endif
     }
 }
 
@@ -775,52 +923,72 @@ static void pair_forces(Sys *s, const Params *P, int64_t step) {
             s->fy[i] = 0.0;
         }
         for (int ph = 0; ph < 2; ph++) {
-#pragma omp for schedule(dynamic, 1)
+#pragma omp for schedule(static)
             for (int st = ph; st < ns; st += 2)
                 for (int cx = s->strip_c0[st]; cx < s->strip_c0[st + 1]; cx++) pair_column(s, &pp, cx);
         }
     }
 }
 
-static void bonded_forces(Sys *s, const Params *P) {
+/* harmonic bonds + angle term of the lipid chain starting at slot h */
+static inline void chain_forces(Sys *s, const int h, const double kb, const double r0, const double ka, double *mb) {
     const int ml = s->mlen;
-    const double L = s->L, kb = P->k_bond, r0 = P->r0, ka = P->k_angle;
-    double *x = s->x, *y = s->y, *fx = s->fx, *fy = s->fy;
-    double mb = s->maxbond;
-    for (int m = 0; m < s->nmol; m++) {
-        const int32_t *g = s->mol + (size_t)m * ml;
-        int sl[MAXMLEN];
-        double bx[MAXMLEN], by[MAXMLEN], bl[MAXMLEN];
-        for (int b = 0; b < ml; b++) sl[b] = s->slot[g[b]];
-        for (int b = 0; b < ml - 1; b++) {
-            const int i = sl[b], j = sl[b + 1];
-            const double dx = minimg(x[j] - x[i], L), dy = minimg(y[j] - y[i], L);
-            const double r = sqrt(dx * dx + dy * dy);
-            bx[b] = dx; by[b] = dy; bl[b] = r;
-            if (r > mb) mb = r;
-            const double f = -kb * (r - r0) / r; /* force on j along (dx,dy) */
-            fx[j] += f * dx; fy[j] += f * dy;
-            fx[i] -= f * dx; fy[i] -= f * dy;
-        }
-        if (ka != 0.0) {
-            for (int b = 0; b < ml - 2; b++) {
-                const int i = sl[b], j = sl[b + 1], k = sl[b + 2];
-                const double ax = bx[b], ay = by[b], cxv = bx[b + 1], cyv = by[b + 1];
-                const double la = bl[b], lc = bl[b + 1];
-                const double ilac = 1.0 / (la * lc);
-                const double cs = (ax * cxv + ay * cyv) * ilac;
-                /* U = ka (1 - cos); dU/da = -ka (c/(la lc) - cos a/la^2) */
-                const double dUax = -ka * (cxv * ilac - cs * ax / (la * la));
-                const double dUay = -ka * (cyv * ilac - cs * ay / (la * la));
-                const double dUcx = -ka * (ax * ilac - cs * cxv / (lc * lc));
-                const double dUcy = -ka * (ay * ilac - cs * cyv / (lc * lc));
-                fx[i] += dUax; fy[i] += dUay;
-                fx[j] += -dUax + dUcx; fy[j] += -dUay + dUcy;
-                fx[k] -= dUcx; fy[k] -= dUcy;
-            }
+    const double L = s->L;
+    const double *restrict x = s->x, *restrict y = s->y;
+    double *restrict fx = s->fx, *restrict fy = s->fy;
+    int sl[MAXMLEN];
+    double bx[MAXMLEN], by[MAXMLEN], bl[MAXMLEN];
+    int n = 0;
+    for (int d = h; d >= 0 && n < ml; d = s->nxt[d]) sl[n++] = d;
+    for (int b = 0; b < n - 1; b++) {
+        const int i = sl[b], j = sl[b + 1];
+        const double dx = minimg(x[j] - x[i], L), dy = minimg(y[j] - y[i], L);
+        const double r = sqrt(dx * dx + dy * dy);
+        bx[b] = dx; by[b] = dy; bl[b] = r;
+        if (r > *mb) *mb = r;
+        const double f = -kb * (r - r0) / r; /* force on j along (dx,dy) */
+        fx[j] += f * dx; fy[j] += f * dy;
+        fx[i] -= f * dx; fy[i] -= f * dy;
+    }
+    if (ka != 0.0) {
+        for (int b = 0; b < n - 2; b++) {
+            const int i = sl[b], j = sl[b + 1], k = sl[b + 2];
+            const double ax = bx[b], ay = by[b], cxv = bx[b + 1], cyv = by[b + 1];
+            const double la = bl[b], lc = bl[b + 1];
+            const double ilac = 1.0 / (la * lc);
+            const double cs = (ax * cxv + ay * cyv) * ilac;
+            /* U = ka (1 - cos); dU/da = -ka (c/(la lc) - cos a/la^2) */
+            const double dUax = -ka * (cxv * ilac - cs * ax / (la * la));
+            const double dUay = -ka * (cyv * ilac - cs * ay / (la * la));
+            const double dUcx = -ka * (ax * ilac - cs * cxv / (lc * lc));
+            const double dUcy = -ka * (ay * ilac - cs * cyv / (lc * lc));
+            fx[i] += dUax; fy[i] += dUay;
+            fx[j] += -dUax + dUcx; fy[j] += -dUay + dUcy;
+            fx[k] -= dUcx; fy[k] -= dUcy;
         }
     }
-    s->maxbond = mb;
+}
+
+/* Bonded forces.  Every bead belongs to at most one chain, so chains can be
+ * processed concurrently without write conflicts; each thread takes the chains
+ * whose first bead lies in its slot range (cache locality, the beads of a chain
+ * are spatial neighbours), and the per-bead summation order is fixed ->
+ * deterministic for any thread count. */
+static void bonded_forces(Sys *s, const Params *P) {
+    const int N = s->N;
+    const double kb = P->k_bond, r0 = P->r0, ka = P->k_angle;
+    double mbt = s->maxbond;
+#pragma omp parallel reduction(max : mbt)
+    {
+        const int t = omp_get_thread_num(), nt = omp_get_num_threads();
+        const int lo = (int)(((long)t * N) / nt), hi = (int)(((long)(t + 1) * N) / nt);
+        const int8_t *restrict mpos = s->mpos;
+        double mb = 0.0;
+        for (int d = lo; d < hi; d++)
+            if (mpos[d] == 0) chain_forces(s, d, kb, r0, ka, &mb);
+        if (mb > mbt) mbt = mb;
+    }
+    s->maxbond = mbt;
 }
 
 /* ------------------------------------------------------------------ chemistry */
