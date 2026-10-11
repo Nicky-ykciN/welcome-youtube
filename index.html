@@ -568,7 +568,10 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 reset();
-window.__sim = { step, stats: () => ({ t, count, ...stats }), setRunning: (v) => (running = v) };
+window.__sim = {
+  step, stats: () => ({ t, count, ...stats }), setRunning: (v) => (running = v),
+  peek: () => ({ px, py, bonds, alive, nbond, col, en, gen, MAXN, W, t }),
+};
 requestAnimationFrame(frame);
 })();
 </script>
