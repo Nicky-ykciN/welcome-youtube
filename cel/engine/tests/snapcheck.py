@@ -7,6 +7,7 @@ usage:
   snapcheck.py rdf    SNAPFILE [type]       radial distribution function g(r)
   snapcheck.py cmp    SNAP_A SNAP_B         bitwise / max |dx| comparison
   snapcheck.py tclust SNAPFILE              tail-bead cluster statistics (aggregation)
+library: read_snap(path), read_ckpt(path) (checkpoint v2 -> gid-ordered arrays, full velocities)
 """
 import sys, struct
 import numpy as np
@@ -25,6 +26,32 @@ def read_snap(path):
     bonds = np.frombuffer(b, '<i4', 2 * nb, o).reshape(nb, 2); o += 8 * nb
     assert o == len(b), (o, len(b))
     return dict(ver=ver, N=N, nb=nb, step=step, time=time, L=L, x=x, y=y, t=t, bonds=bonds)
+
+def read_ckpt(path):
+    """engine checkpoint (format version 2, see engine/README.md); arrays in gid order,
+    with the full velocity v = vh + dt/2 f."""
+    with open(path, 'rb') as f:
+        b = f.read()
+    if b[:4] != b'OCKP':
+        raise SystemExit('bad checkpoint magic')
+    ver, N, ml, nH = struct.unpack_from('<iiii', b, 4)
+    if ver != 2:
+        raise SystemExit(f'checkpoint version {ver} not supported')
+    o = 20
+    step, time, L, seed = struct.unpack_from('<qddQ', b, o); o += 32
+    o += 32                                   # rng state
+    maxbond, warm_end, t_anchor, step_anchor, dt, soup_seed = struct.unpack_from('<dqdqdQ', b, o); o += 48
+    def arr(dt_, n=N):
+        nonlocal o
+        a = np.frombuffer(b, dt_, n, o); o += np.dtype(dt_).itemsize * n
+        return a
+    gid = arr('<u4'); typ = arr('u1'); mpos = arr('i1'); nxt = arr('<i4')
+    x, y, vx, vy, fx, fy = (arr('<f8') for _ in range(6))
+    assert b[o:o + 4] == b'END!' and o + 4 == len(b)
+    order = np.argsort(gid)
+    v = lambda a: a[order]
+    return dict(N=N, step=step, time=time, L=L, dt=dt, seed=seed, soup_seed=soup_seed, t=v(typ),
+                x=v(x), y=v(y), vx=v(vx + 0.5 * dt * fx), vy=v(vy + 0.5 * dt * fy))
 
 def mi(d, L):
     return d - L * np.round(d / L)

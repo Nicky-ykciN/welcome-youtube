@@ -196,19 +196,25 @@ typedef struct {
     long n_chem;
     double r_cat;
     double p_syn_a, p_syn_b, p_rep_a, p_rep_b, mu, p_ld, p_kd, p_nd;
-    int feed;
-    long feed_every;
-    double c_N, feed_grid;
-    int feed_tmin;
+    /* food supply (structure blind, SPEC 3.4) */
+    char feed[16];
+    double p_feed, feed_cap;
+    char vent_shape[16];
+    double vent_x, vent_y, vent_r, vent_w;
     int events;
+    /* environment (uniform for every bead, SPEC 0/6) */
+    double stir_A;
+    int stir_n;
+    double kT_amp, kT_period;
     /* init soup */
-    double f_lip, f_Ka, f_Kb;
-    /* init seeded */
-    double seed_R, seed_spacing, seed_cN_in;
-    int seed_nKa;
+    double f_lip, f_Ka, f_Kb, c_N;
     /* derived */
     double sigma;
+    int feed_mode, vent_kind;
 } Params;
+
+enum { FEED_NONE = 0, FEED_UNIFORM = 1, FEED_VENT = 2 };
+enum { VENT_DISK = 0, VENT_VSTRIP = 1, VENT_HSTRIP = 2 };
 
 typedef enum { PT_INT, PT_LONG, PT_DBL, PT_STR, PT_U64 } ptype_t;
 typedef struct {
@@ -239,15 +245,15 @@ static const pdef_t PDEFS[] = {
     {"ckpt_every", PT_LONG, OFF(ckpt_every), "10000", "checkpoint interval (0 = only at the end)"},
     {"ckpt_keep", PT_INT, OFF(ckpt_keep), "0", "1 = also keep ckpt_<step>.bin copies"},
     {"log_every", PT_LONG, OFF(log_every), "1000", "log line interval"},
-    {"warmup", PT_LONG, OFF(warmup), "1000", "fresh soup/seeded starts: repulsion above 25 is ramped in linearly over the first warmup steps (0 = off; not applied after restart)"},
+    {"warmup", PT_LONG, OFF(warmup), "1000", "fresh soup starts: repulsion above 25 is ramped in linearly over the first warmup steps (0 = off; not applied after restart)"},
     {"threads", PT_INT, OFF(threads), "2", "OpenMP threads"},
     {"nsub", PT_INT, OFF(nsub), "4", "performance only: y sub-cells per unit cell (1..8); same physics, different round-off order"},
     {"seed", PT_U64, OFF(seed), "1", "random seed"},
-    {"init", PT_STR, OFF(init), "soup", "soup, seeded or restart"},
+    {"init", PT_STR, OFF(init), "soup", "soup (random well-mixed start) or restart (continue a checkpoint of a soup run)"},
     {"restart", PT_STR, OFF(restart), "", "checkpoint file; if non-empty the run restarts from it"},
     {"restart_reseed", PT_INT, OFF(restart_reseed), "0", "1 = on restart use this ini's seed (branch) instead of the checkpoint's"},
     {"walltime", PT_DBL, OFF(walltime), "0", "stop cleanly (with checkpoint) after this many seconds (0 = off)"},
-    {"chem", PT_INT, OFF(chem), "1", "1 = chemistry on"},
+    {"chem", PT_INT, OFF(chem), "1", "1 = chemistry on (reactions, decay and food supply)"},
     {"n_chem", PT_LONG, OFF(n_chem), "10", "chemistry check interval (steps); all p_* are per check"},
     {"r_cat", PT_DBL, OFF(r_cat), "1.2", "catalyst reaction radius"},
     {"syn_tries", PT_INT, OFF(syn_tries), "8", "new lipid: orientation = lowest overlap energy of this many random ones (1 = purely random)"},
@@ -260,20 +266,27 @@ static const pdef_t PDEFS[] = {
     {"p_ld", PT_DBL, OFF(p_ld), "2e-4", "lipid decay probability per molecule per check"},
     {"p_kd", PT_DBL, OFF(p_kd), "5e-4", "catalyst decay probability per check"},
     {"p_nd", PT_DBL, OFF(p_nd), "1e-4", "nutrient decay probability per check"},
-    {"feed", PT_INT, OFF(feed), "1", "1 = food supply in the outside medium"},
-    {"feed_every", PT_LONG, OFF(feed_every), "0", "food supply interval in steps (0 = n_chem)"},
-    {"c_N", PT_DBL, OFF(c_N), "0.12", "target nutrient fraction in the outside medium"},
-    {"feed_grid", PT_DBL, OFF(feed_grid), "1.6", "coarse grid cell size for the outside flood fill"},
-    {"feed_tmin", PT_INT, OFF(feed_tmin), "1", "a grid cell with >= feed_tmin T beads is membrane"},
+    {"feed", PT_STR, OFF(feed), "uniform", "food supply W -> N, structure blind: none, uniform (every W anywhere) or vent (every W inside the fixed vent region)"},
+    {"p_feed", PT_DBL, OFF(p_feed), "1e-3", "probability per chemistry check that an eligible W becomes N"},
+    {"feed_cap", PT_DBL, OFF(feed_cap), "0.12", "global cap on the nutrient fraction nN/N_beads: conversions that would exceed it are dropped at random (0 = no cap)"},
+    {"vent_shape", PT_STR, OFF(vent_shape), "disk", "feed = vent: disk (radius vent_r around (vent_x, vent_y)), vstrip (abs(x - vent_x) < vent_w/2, all y) or hstrip (abs(y - vent_y) < vent_w/2, all x)"},
+    {"vent_x", PT_DBL, OFF(vent_x), "-1", "vent centre x (-1 = L/2); fixed coordinates"},
+    {"vent_y", PT_DBL, OFF(vent_y), "-1", "vent centre y (-1 = L/2); fixed coordinates"},
+    {"vent_r", PT_DBL, OFF(vent_r), "5", "vent disk radius"},
+    {"vent_w", PT_DBL, OFF(vent_w), "4", "vent strip width"},
     {"events", PT_INT, OFF(events), "1", "1 = write events.csv"},
+    {"stir_A", PT_DBL, OFF(stir_A), "0", "stirring: Kolmogorov body force f_x = stir_A sin(2 pi stir_n y / L) on every bead (net force removed; 0 = off)"},
+    {"stir_n", PT_INT, OFF(stir_n), "1", "stirring: number of sine periods across the box"},
+    {"kT_amp", PT_DBL, OFF(kT_amp), "0", "temperature cycle: kT(t) = kT + kT_amp sin(2 pi t / kT_period), applied through sigma (0 = off)"},
+    {"kT_period", PT_DBL, OFF(kT_period), "1000", "temperature cycle period (time units)"},
     {"f_lip", PT_DBL, OFF(f_lip), "0.10", "soup: fraction of beads in lipids"},
     {"f_Ka", PT_DBL, OFF(f_Ka), "0.005", "soup: fraction of beads that are Ka"},
     {"f_Kb", PT_DBL, OFF(f_Kb), "0", "soup: fraction of beads that are Kb"},
-    {"seed_R", PT_DBL, OFF(seed_R), "10", "seeded: vesicle bilayer mid-plane radius"},
-    {"seed_spacing", PT_DBL, OFF(seed_spacing), "0.7", "seeded: lipid spacing along each leaflet"},
-    {"seed_cN_in", PT_DBL, OFF(seed_cN_in), "-1", "seeded: nutrient fraction inside (-1 = c_N)"},
-    {"seed_nKa", PT_INT, OFF(seed_nKa), "6", "seeded: number of Ka placed in the lumen"},
+    {"c_N", PT_DBL, OFF(c_N), "0.12", "soup: initial nutrient fraction"},
 };
+
+/* keys of removed features (SPEC section 0): a clear error instead of "unknown" */
+static const char *REMOVED_KEYS[] = {"seed_R", "seed_spacing", "seed_cN_in", "seed_nKa", "feed_every", "feed_grid", "feed_tmin"};
 #define NPDEFS ((int)(sizeof(PDEFS) / sizeof(PDEFS[0])))
 
 static void default_amatrix(Params *P) {
@@ -361,6 +374,10 @@ static void set_param(Params *P, const char *key, const char *val) {
         }
         return;
     }
+    for (size_t k = 0; k < sizeof REMOVED_KEYS / sizeof REMOVED_KEYS[0]; k++)
+        if (!strcmp(key, REMOVED_KEYS[k]))
+            die("parameter '%s' was removed: init = seeded and the flood-fill food supply violate SPEC section 0 "
+                "(see engine/README.md, 'Food supply')", key);
     die("unknown parameter '%s'", key);
 }
 
@@ -405,8 +422,6 @@ static int read_ini(const char *path, kv_t **out) {
 
 static void finalize_params(Params *P) {
     P->sigma = sqrt(2.0 * P->gamma * P->kT);
-    if (P->feed_every <= 0) P->feed_every = P->n_chem;
-    if (P->seed_cN_in < 0) P->seed_cN_in = P->c_N;
     int mlen = P->lip_nH + P->lip_nT;
     if (P->lip_nH < 1 || P->lip_nT < 1 || mlen > MAXMLEN) die("lipid length must be 2..%d with >=1 head and tail", MAXMLEN);
     if (P->L < 8) die("L must be >= 8");
@@ -416,9 +431,40 @@ static void finalize_params(Params *P) {
     if (P->n_chem < 1) P->n_chem = 1;
     if (P->syn_tries < 1) P->syn_tries = 1;
     if (P->warmup < 0) P->warmup = 0;
-    if (strcmp(P->init, "soup") && strcmp(P->init, "seeded") && strcmp(P->init, "restart"))
-        die("init must be soup, seeded or restart");
+    if (!strcmp(P->init, "seeded"))
+        die("init = seeded was removed (SPEC section 0): the only start state is a random soup or a checkpoint of one");
+    if (strcmp(P->init, "soup") && strcmp(P->init, "restart")) die("init must be soup or restart");
     if (!strcmp(P->init, "restart") && !P->restart[0]) die("init = restart needs restart = <checkpoint>");
+    /* food supply */
+    if (!strcmp(P->feed, "none") || !strcmp(P->feed, "0")) { P->feed_mode = FEED_NONE; strcpy(P->feed, "none"); }
+    else if (!strcmp(P->feed, "uniform")) P->feed_mode = FEED_UNIFORM;
+    else if (!strcmp(P->feed, "vent")) P->feed_mode = FEED_VENT;
+    else if (!strcmp(P->feed, "1"))
+        die("feed = 1 (flood fill of the 'outside medium') was removed (SPEC section 0); use feed = uniform, vent or none");
+    else die("feed must be none, uniform or vent");
+    if (P->p_feed < 0 || P->p_feed > 1) die("p_feed must be in [0, 1]");
+    if (P->feed_cap < 0 || P->feed_cap >= 1) die("feed_cap must be in [0, 1) (0 = no cap)");
+    if (!strcmp(P->vent_shape, "disk")) P->vent_kind = VENT_DISK;
+    else if (!strcmp(P->vent_shape, "vstrip")) P->vent_kind = VENT_VSTRIP;
+    else if (!strcmp(P->vent_shape, "hstrip")) P->vent_kind = VENT_HSTRIP;
+    else die("vent_shape must be disk, vstrip or hstrip");
+    if (P->vent_x < 0) P->vent_x = 0.5 * P->L;
+    if (P->vent_y < 0) P->vent_y = 0.5 * P->L;
+    if (P->feed_mode == FEED_VENT) {
+        if (P->vent_x >= P->L || P->vent_y >= P->L) die("vent_x and vent_y must lie in [0, L)");
+        if (P->vent_kind == VENT_DISK && (P->vent_r <= 0 || P->vent_r >= 0.5 * P->L)) die("vent_r must be in (0, L/2)");
+        if (P->vent_kind != VENT_DISK && (P->vent_w <= 0 || P->vent_w > P->L)) die("vent_w must be in (0, L]");
+    }
+    /* environment */
+    if (P->stir_n < 1) die("stir_n must be >= 1");
+    if (P->kT <= 0) die("kT must be > 0");
+    if (fabs(P->kT_amp) >= P->kT) die("|kT_amp| must be < kT (the temperature must stay positive)");
+    if (P->kT_amp != 0 && P->kT_period <= 0) die("kT_period must be > 0");
+}
+
+/* thermostat temperature at time t (slow global cycle, SPEC section 0/6) */
+static inline double kT_at(const Params *P, double t) {
+    return P->kT_amp == 0.0 ? P->kT : P->kT + P->kT_amp * sin(2.0 * M_PI * t / P->kT_period);
 }
 
 static void write_params(const Params *P, const char *path, int argc_over, char **over) {
@@ -442,7 +488,8 @@ static void write_params(const Params *P, const char *path, int argc_over, char 
         }
         fprintf(f, "    # %s\n", d->help);
     }
-    fprintf(f, "# derived: sigma = %.17g\n", P->sigma);
+    fprintf(f, "# derived: sigma = %.17g%s\n", P->sigma,
+            P->kT_amp != 0 ? " at kT; with the temperature cycle sigma(t) = sqrt(2 gamma kT(t))" : "");
     fprintf(f, "# repulsion matrix a_ij (symmetric)\n");
     for (int i = 0; i < NTYPES; i++)
         for (int j = i; j < NTYPES; j++) fprintf(f, "a_%s_%s = %.17g\n", TNAME[i], TNAME[j], P->a[i][j]);
@@ -494,22 +541,21 @@ typedef struct {
     double t_anchor, dt_anchor; /* time = t_anchor + (step - step_anchor) * dt */
     int64_t step_anchor;
     uint64_t seed;
+    uint64_t soup_seed; /* provenance: seed of the random soup this run descends from */
     rng_t rng;
     double maxbond;  /* running max since last stats row */
     /* events */
     event_t *ev;
     int nev, evcap;
-    /* chemistry / feed scratch */
+    /* chemistry scratch */
     int *tlist;      /* per-thread lists, nthreads * N */
     int tcount[256];
     int *glist;      /* merged list, N */
-    int *gc;         /* feed grid cell of each slot */
-    int *fgrid;      /* nthreads * ngrid feed T counts */
-    int *flab, *fqueue;
-    int fng;
+    double bsum[64]; /* fixed-block partial sums of the stirring force (thread-count independent) */
 } Sys;
+#define NBSUM 64
 
-static void sys_alloc(Sys *s, int N, double L, int mlen, int nH, int nthreads, double feed_grid, int nsub) {
+static void sys_alloc(Sys *s, int N, double L, int mlen, int nH, int nthreads, int nsub) {
     memset(s, 0, sizeof *s);
     s->N = N;
     s->L = L;
@@ -530,7 +576,6 @@ static void sys_alloc(Sys *s, int N, double L, int mlen, int nH, int nthreads, d
     s->src = SA(N * sizeof(int));
     s->dest = SA(N * sizeof(int));
     s->slot = SA(N * sizeof(int));
-    s->gc = SA(N * sizeof(int));
     s->glist = SA(N * sizeof(int));
     s->tlist = SA((size_t)nthreads * N * sizeof(int));
 #undef SA
@@ -555,13 +600,6 @@ static void sys_alloc(Sys *s, int N, double L, int mlen, int nH, int nthreads, d
     for (int k = 0; k <= ns; k++) s->strip_c0[k] = (int)(((long)k * s->ncx) / ns);
     s->evcap = 4096;
     s->ev = xmalloc(s->evcap * sizeof(event_t));
-    /* feed grid */
-    int ng = (int)floor(L / feed_grid);
-    if (ng < 3) ng = 3;
-    s->fng = ng;
-    s->fgrid = xmalloc((size_t)nthreads * ng * ng * sizeof(int));
-    s->flab = xmalloc((size_t)ng * ng * sizeof(int));
-    s->fqueue = xmalloc((size_t)ng * ng * sizeof(int));
 }
 
 static inline void wrap1(double *p, double L) {
@@ -934,22 +972,85 @@ static double a_eff(const Params *P, int i, int j, int64_t step, int64_t warm_en
     return 25.0 + (a - 25.0) * (f < 0 ? 0 : f);
 }
 
-static void pair_forces(Sys *s, const Params *P, int64_t step) {
+/* sin(2 pi u) for any finite u, branch free (vectorisable): reduce to
+ * |2 pi r| <= pi/2 and use the Taylor series up to x^21 (truncation < 2e-18;
+ * agrees with libm sin(2 pi u) to < 3e-15, which is the rounding of 2 pi u
+ * itself, see tests/forcetest.c) */
+static inline double sin2pi(double u) {
+    u -= rint(u);                              /* [-1/2, 1/2] */
+    const double a = fabs(u);
+    const double r = a > 0.25 ? 0.5 - a : a;   /* sin(2 pi (1/2 - a)) = sin(2 pi a) */
+    const double x = 6.283185307179586476925286766559 * r, x2 = x * x;
+    double p = -1.9572941063391261e-20;         /* -1/21! */
+    p = p * x2 + 8.2206352466243298e-18;        /* 1/19! */
+    p = p * x2 - 2.8114572543455206e-15;        /* -1/17! */
+    p = p * x2 + 7.6471637318198164e-13;        /* 1/15! */
+    p = p * x2 - 1.6059043836821613e-10;        /* -1/13! */
+    p = p * x2 + 2.5052108385441720e-08;        /* 1/11! */
+    p = p * x2 - 2.7557319223985893e-06;        /* -1/9! */
+    p = p * x2 + 1.9841269841269841e-04;        /* 1/7! */
+    p = p * x2 - 8.3333333333333333e-03;        /* -1/5! */
+    p = p * x2 + 1.6666666666666667e-01;        /* 1/3! */
+    const double v = x - x * x2 * p;           /* x - x^3/3! + ... */
+    return u < 0.0 ? -v : v;
+}
+
+/* Pair forces of the configuration at time t (step), plus the stirring body
+ * force.  kT(t) enters only through sigma = sqrt(2 gamma kT(t)).
+ * Stirring (Kolmogorov flow): every bead gets f_x = A sin(2 pi n y / L); the
+ * net force of the finite sample (sum over beads, ~A sqrt(N/2), zero on
+ * average) is subtracted uniformly from every bead so total momentum stays
+ * exactly conserved.  The sum runs over NBSUM fixed blocks -> the result does
+ * not depend on the thread count. */
+/* Start of the force computation, called by every thread inside the parallel
+ * region of pair_forces (orphaned worksharing loops): f = 0, or f = stirring
+ * force minus its mean.  Kept out of line so that the hot pair kernel of the
+ * region is compiled exactly as without stirring. */
+static void __attribute__((noinline)) force_init(Sys *s, const Params *P) {
+    const int N = s->N;
+    const double A = P->stir_A, kn = (double)P->stir_n / s->L;
+    double *restrict fx = s->fx, *restrict fy = s->fy;
+    if (A == 0.0) {
+#pragma omp for schedule(static)
+        for (int i = 0; i < N; i++) {
+            fx[i] = 0.0;
+            fy[i] = 0.0;
+        }
+        return;
+    }
+    const double *restrict y = s->y;
+#pragma omp for schedule(static)
+    for (int b = 0; b < NBSUM; b++) {
+        const int lo = (int)(((long)b * N) / NBSUM), hi = (int)(((long)(b + 1) * N) / NBSUM);
+        double sum = 0.0;
+#pragma omp simd reduction(+ : sum)
+        for (int i = lo; i < hi; i++) {
+            const double f = A * sin2pi(kn * y[i]);
+            fx[i] = f;
+            fy[i] = 0.0;
+            sum += f;
+        }
+        s->bsum[b] = sum;
+    }
+    double tot = 0.0; /* every thread sums the NBSUM blocks in the same order */
+    for (int b = 0; b < NBSUM; b++) tot += s->bsum[b];
+    const double mean = tot / N;
+#pragma omp for schedule(static)
+    for (int i = 0; i < N; i++) fx[i] -= mean;
+}
+
+static void pair_forces(Sys *s, const Params *P, int64_t step, double t) {
     pairpar_t pp;
     memset(&pp, 0, sizeof pp);
     for (int i = 0; i < NTYPES; i++)
         for (int j = 0; j < NTYPES; j++) pp.a[8 * i + j] = a_eff(P, i, j, step, g_warm_end);
     pp.gamma = P->gamma;
-    pp.sdt = P->sigma / sqrt(P->dt);
+    pp.sdt = sqrt(2.0 * P->gamma * kT_at(P, t)) / sqrt(P->dt);
     pp.sseed = step_seed(s->seed, step);
     const int ns = s->nstrip;
 #pragma omp parallel
     {
-#pragma omp for schedule(static)
-        for (int i = 0; i < s->N; i++) {
-            s->fx[i] = 0.0;
-            s->fy[i] = 0.0;
-        }
+        force_init(s, P);
         for (int ph = 0; ph < 2; ph++) {
 #pragma omp for schedule(static)
             for (int st = ph; st < ns; st += 2)
@@ -1222,16 +1323,17 @@ static void relax_new_chain(Sys *s, const Params *P, const int *sl) {
     }
 }
 
-static int feed_outside(Sys *s, const Params *P, int64_t step);
+static int feed_supply(Sys *s, const Params *P, int64_t step);
 static double g_t_react = 0, g_t_decay = 0, g_t_feed = 0;
 
-/* lipid synthesis / catalyst replication / decay; returns 1 if beads moved */
-static int chemistry(Sys *s, const Params *P, int64_t step, int do_react, int do_feed) {
+/* One chemistry check: lipid synthesis / catalyst replication, decay, food
+ * supply.  Returns 1 if beads moved. */
+static int chemistry(Sys *s, const Params *P, int64_t step) {
     int moved = 0;
     const int ml = s->mlen;
     const double L = s->L;
     double tc0 = wtime();
-    if (do_react) {
+    {
         /* catalysts, in slot order, then shuffled with the serial RNG */
         int nk;
         const uint8_t *ty = s->type;
@@ -1348,92 +1450,63 @@ static int chemistry(Sys *s, const Params *P, int64_t step, int do_react, int do
             }
         }
     }
-    if (do_react) g_t_decay += wtime() - tc0;
+    g_t_decay += wtime() - tc0;
     tc0 = wtime();
-    if (do_feed) feed_outside(s, P, step);
+    if (P->feed_mode != FEED_NONE) feed_supply(s, P, step);
     g_t_feed += wtime() - tc0;
     return moved;
 }
 
-/* Food supply: coarse grid, cells holding >= feed_tmin T beads are membrane;
- * the largest 4-connected (periodic) region of non-membrane cells is the
- * outside medium; W there is converted to N until the N fraction among all
- * beads in that region reaches c_N. */
-static int feed_outside(Sys *s, const Params *P, int64_t step) {
-    const int N = s->N, ng = s->fng, ngc = ng * ng;
-    const double ig = ng / s->L;
-    int nth = omp_get_max_threads();
-    if (nth > s->nthr_alloc) nth = s->nthr_alloc;
-    int *restrict gc = s->gc;
-    int *restrict lab = s->flab;
-    int *restrict queue = s->fqueue;
-    const double *restrict x = s->x, *restrict y = s->y;
+/* is (x, y) inside the fixed vent region?  Fixed box coordinates, periodic. */
+static inline int in_vent(const Params *P, double L, double x, double y) {
+    if (P->vent_kind == VENT_DISK) {
+        const double dx = minimg(x - P->vent_x, L), dy = minimg(y - P->vent_y, L);
+        return dx * dx + dy * dy < P->vent_r * P->vent_r;
+    }
+    if (P->vent_kind == VENT_VSTRIP) return fabs(minimg(x - P->vent_x, L)) < 0.5 * P->vent_w;
+    return fabs(minimg(y - P->vent_y, L)) < 0.5 * P->vent_w;
+}
+
+/* Food supply (SPEC 3.4), a local, structure-blind law: every eligible W bead
+ * (feed = uniform: any W anywhere; feed = vent: any W inside the fixed vent
+ * region) becomes N with probability p_feed per check.  Each decision is a
+ * counter-based hash of (seed, step, gid): parallel, order and thread-count
+ * independent.  Optional global cap: if the conversions would raise the total
+ * number of N above feed_cap * N_beads, a uniformly random subset of them
+ * (serial RNG) is kept.  The only inputs are a bead's own type and position
+ * and the global N count; nothing here knows about membranes or compartments. */
+static int feed_supply(Sys *s, const Params *P, int64_t step) {
+    const int N = s->N;
+    const double L = s->L, pf = P->p_feed;
     const uint8_t *restrict ty = s->type;
-#pragma omp parallel num_threads(nth)
-    {
-        const int t = omp_get_thread_num(), nt = omp_get_num_threads();
-        const int lo = (int)(((long)t * N) / nt), hi = (int)(((long)(t + 1) * N) / nt);
-        int *restrict g = s->fgrid + (size_t)t * ngc;
-        memset(g, 0, ngc * sizeof(int));
-        for (int i = lo; i < hi; i++) {
-            int gx = (int)(x[i] * ig), gy = (int)(y[i] * ig);
-            gx = gx >= ng ? ng - 1 : gx;
-            gy = gy >= ng ? ng - 1 : gy;
-            gc[i] = gx * ng + gy;
-            g[gc[i]] += ty[i] == TT;
-        }
-#pragma omp barrier
-#pragma omp for schedule(static)
-        for (int c = 0; c < ngc; c++) {
-            int tc = 0;
-            for (int tt = 0; tt < nt; tt++) tc += s->fgrid[(size_t)tt * ngc + c];
-            lab[c] = tc >= P->feed_tmin ? -2 : -1;
+    const uint32_t *restrict gd = s->gid;
+    const double *restrict x = s->x, *restrict y = s->y;
+    const uint64_t kf = hash_key(s->seed, step, 14);
+    if (pf <= 0.0) return 0;
+    int nc;
+    if (P->feed_mode == FEED_UNIFORM) COLLECT_SLOTS(s, (ty[d] == TW && hash_u01(kf, gd[d]) < pf), nc);
+    else COLLECT_SLOTS(s, (ty[d] == TW && in_vent(P, L, x[d], y[d]) && hash_u01(kf, gd[d]) < pf), nc);
+    long add = nc;
+    if (P->feed_cap > 0.0 && nc > 0) {
+        int nth = omp_get_max_threads();
+        if (nth > s->nthr_alloc) nth = s->nthr_alloc;
+        long nN = 0;
+#pragma omp parallel for schedule(static) num_threads(nth) reduction(+ : nN)
+        for (int i = 0; i < N; i++) nN += ty[i] == TN;
+        long room = (long)floor(P->feed_cap * (double)N + 1e-9) - nN;
+        if (room < 0) room = 0;
+        if (add > room) {
+            int *wl = s->glist; /* partial Fisher-Yates: a random subset of size room */
+            for (long a = 0; a < room; a++) {
+                const long b = a + rng_below(&s->rng, nc - a);
+                const int t = wl[a]; wl[a] = wl[b]; wl[b] = t;
+            }
+            add = room;
         }
     }
-    int nlab = 0, best = -1, bestsize = 0;
-    for (int c0 = 0; c0 < ngc; c0++) {
-        if (lab[c0] != -1) continue;
-        int qh = 0, qt = 0, size = 0;
-        lab[c0] = nlab;
-        queue[qt++] = c0;
-        while (qh < qt) {
-            const int c = queue[qh++];
-            size++;
-            const int gx = c / ng, gy = c % ng;
-            const int nbs[4] = {((gx + 1) % ng) * ng + gy, ((gx + ng - 1) % ng) * ng + gy, gx * ng + (gy + 1) % ng,
-                                gx * ng + (gy + ng - 1) % ng};
-            for (int k = 0; k < 4; k++)
-                if (lab[nbs[k]] == -1) {
-                    lab[nbs[k]] = nlab;
-                    queue[qt++] = nbs[k];
-                }
-        }
-        if (size > bestsize) { bestsize = size; best = nlab; }
-        nlab++;
-    }
-    int added = 0;
-    if (best >= 0) {
-        long tot = 0, nN = 0;
-#pragma omp parallel for schedule(static) num_threads(nth) reduction(+ : tot, nN)
-        for (int i = 0; i < N; i++) {
-            const int in = lab[gc[i]] == best;
-            tot += in;
-            nN += in & (ty[i] == TN);
-        }
-        int nW;
-        COLLECT_SLOTS(s, (lab[gc[d]] == best && ty[d] == TW), nW);
-        long need = (long)ceil(P->c_N * (double)tot - 1e-9) - nN;
-        if (need > nW) need = nW;
-        int *wl = s->glist;
-        for (long a = 0; a < need; a++) {
-            long b = a + rng_below(&s->rng, nW - a);
-            int t = wl[a]; wl[a] = wl[b]; wl[b] = t;
-            s->type[wl[a]] = TN;
-        }
-        if (need > 0) added = (int)need;
-    }
-    if (added > 0) add_event(s, step, EV_FEED, added, NAN, NAN, -1);
-    return added;
+    for (long a = 0; a < add; a++) s->type[s->glist[a]] = TN;
+    if (add > 0) add_event(s, step, EV_FEED, add, NAN, NAN, -1);
+    return (int)add;
 }
 
 /* ------------------------------------------------------------------ init */
@@ -1491,59 +1564,6 @@ static void init_soup(Sys *s, const Params *P) {
     logmsg("init soup: N=%d lipids=%ld (%ld beads) Ka=%ld Kb=%ld N=%ld\n", N, nlip, nlip * ml, nKa, nKb, nN);
 }
 
-static void init_seeded(Sys *s, const Params *P) {
-    const int N = s->N, ml = s->mlen;
-    const double L = s->L, R = P->seed_R, c0 = 0.5 * L;
-    const double sp = P->seed_spacing;
-    const int nout = (int)lround(2.0 * M_PI * (R + 1.0) / sp), nin = (int)lround(2.0 * M_PI * (R - 1.0) / sp);
-    const double hw = 0.25 + (ml - 1) * P->r0 + 0.25; /* half width of the excluded annulus */
-    if (R - hw < 2.0 || R + hw > 0.5 * L - 2.0) die("seed_R does not fit in the box");
-    if ((long)(nout + nin) * ml >= N) die("vesicle larger than system");
-    int gi = 0;
-    for (int leaf = 0; leaf < 2; leaf++) {
-        const int n = leaf == 0 ? nout : nin;
-        for (int k = 0; k < n; k++) {
-            const double phi = 2.0 * M_PI * (k + 0.5 * leaf) / n;
-            int sl[MAXMLEN];
-            for (int b = 0; b < ml; b++) {
-                const double depth = 0.25 + (ml - 1 - b) * P->r0;
-                const double rad = leaf == 0 ? R + depth : R - depth;
-                s->x[gi] = c0 + rad * cos(phi);
-                s->y[gi] = c0 + rad * sin(phi);
-                s->type[gi] = b < s->nH ? TH : TT;
-                s->gid[gi] = gi;
-                sl[b] = gi;
-                gi++;
-            }
-            link_lipid(s, sl);
-        }
-    }
-    int nKa = 0;
-    long nin_s = 0, nout_s = 0;
-    for (; gi < N; gi++) {
-        double x, y, rr;
-        do {
-            x = L * rng_unif(&s->rng);
-            y = L * rng_unif(&s->rng);
-            rr = hypot(x - c0, y - c0);
-        } while (fabs(rr - R) < hw);
-        s->x[gi] = x;
-        s->y[gi] = y;
-        s->gid[gi] = gi;
-        if (rr < R) {
-            nin_s++;
-            if (nKa < P->seed_nKa && rr < R - hw - 0.5) { s->type[gi] = TKA; nKa++; }
-            else s->type[gi] = rng_unif(&s->rng) < P->seed_cN_in ? TN : TW;
-        } else {
-            nout_s++;
-            s->type[gi] = rng_unif(&s->rng) < P->c_N ? TN : TW;
-        }
-    }
-    logmsg("init seeded: N=%d vesicle R=%.2f lipids out=%d in=%d, solvent inside=%ld outside=%ld, Ka=%d\n", N, R, nout,
-           nin, nin_s, nout_s, nKa);
-    if (nKa < P->seed_nKa) logmsg("warning: only %d Ka could be placed\n", nKa);
-}
-
 /* ------------------------------------------------------------------ IO */
 
 static int file_exists(const char *p) {
@@ -1596,7 +1616,11 @@ static void write_snapshot(Sys *s, const char *dir) {
     if (rename(tmp, path) != 0) die("rename %s failed", tmp);
 }
 
-#define CKPT_VERSION 1
+/* Version 2: written only by engines without any placed-structure start
+ * (init = seeded removed) and without the flood-fill food supply, so a v2
+ * checkpoint always descends from a random soup.  Version 1 files (older
+ * engine) are refused: their history cannot be verified (SPEC section 0). */
+#define CKPT_VERSION 2
 static void write_ckpt(Sys *s, const char *dir, int keep) {
     char path[2048], tmp[2100];
     snprintf(path, sizeof path, "%s/ckpt.bin", dir);
@@ -1619,6 +1643,7 @@ static void write_ckpt(Sys *s, const char *dir, int keep) {
     fwrite(&s->t_anchor, 8, 1, f);
     fwrite(&s->step_anchor, 8, 1, f);
     fwrite(&s->dt_anchor, 8, 1, f);
+    fwrite(&s->soup_seed, 8, 1, f);
     fwrite(s->gid, 4, N, f);
     fwrite(s->type, 1, N, f);
     fwrite(s->mpos, 1, N, f);
@@ -1656,6 +1681,9 @@ static void read_ckpt(Sys *s, const Params *P, const char *path) {
     freadx(mg, 1, 4, f, "magic");
     if (memcmp(mg, "OCKP", 4)) die("%s is not an Oercel checkpoint", path);
     freadx(&ver, 4, 1, f, "version");
+    if (ver == 1)
+        die("%s is a version 1 checkpoint, written by the old engine that still had init = seeded and the flood-fill "
+            "food supply; its history cannot be verified (SPEC section 0). Start from a new soup.", path);
     if (ver != CKPT_VERSION) die("unsupported checkpoint version %d", ver);
     freadx(&N, 4, 1, f, "N");
     freadx(&ml, 4, 1, f, "mlen");
@@ -1673,12 +1701,15 @@ static void read_ckpt(Sys *s, const Params *P, const char *path) {
     freadx(&ta, 8, 1, f, "t_anchor");
     freadx(&sa, 8, 1, f, "step_anchor");
     freadx(&da, 8, 1, f, "dt_anchor");
+    uint64_t soup_seed;
+    freadx(&soup_seed, 8, 1, f, "soup_seed");
     if (ml != P->lip_nH + P->lip_nT || nH != P->lip_nH) die("checkpoint lipid architecture differs from parameters");
     if (fabs(L - P->L) > 1e-12) die("checkpoint L=%g differs from parameter L=%g", L, P->L);
-    sys_alloc(s, N, L, ml, nH, P->threads, P->feed_grid, P->nsub);
+    sys_alloc(s, N, L, ml, nH, P->threads, P->nsub);
     s->step = step;
     s->time = time;
     s->seed = seed;
+    s->soup_seed = soup_seed;
     memcpy(s->rng.s, rs, sizeof rs);
     s->maxbond = maxbond;
     if (da == P->dt) { s->t_anchor = ta; s->step_anchor = sa; s->dt_anchor = da; }
@@ -1701,6 +1732,7 @@ static void read_ckpt(Sys *s, const Params *P, const char *path) {
     build_slot(s);
     for (int d = 0; d < N; d++) {
         if (s->gid[d] >= (uint32_t)N || s->slot[s->gid[d]] != d) die("checkpoint: gid table is not a permutation");
+        if (s->type[d] >= TZ) die("checkpoint: bead type %d at slot %d (Z is unused, SPEC section 6)", s->type[d], d);
         if (s->nxt[d] >= N || (s->mpos[d] < 0) != (s->type[d] != TH && s->type[d] != TT))
             die("checkpoint: inconsistent lipid links at slot %d", d);
     }
@@ -1776,7 +1808,8 @@ static int params_line_ignored(const char *l) {
     return 0;
 }
 
-/* compare two params files ignoring lines that do not affect the trajectory */
+/* compare two params files ignoring lines that do not affect the trajectory
+ * and the trailing help comments (only "key = value" counts) */
 static int same_params_file(const char *a, const char *b) {
     FILE *fa = fopen(a, "r"), *fb = fopen(b, "r");
     int same = fa && fb;
@@ -1786,7 +1819,10 @@ static int same_params_file(const char *a, const char *b) {
         do { ra = fgets(la, sizeof la, fa); } while (ra && params_line_ignored(la));
         do { rb = fgets(lb, sizeof lb, fb); } while (rb && params_line_ignored(lb));
         if (!ra || !rb) { same = !ra && !rb; break; }
-        if (strcmp(la, lb)) same = 0;
+        char *ha = strchr(la, '#'), *hb = strchr(lb, '#');
+        if (ha) *ha = 0;
+        if (hb) *hb = 0;
+        if (strcmp(trim(la), trim(lb))) same = 0;
     }
     if (fa) fclose(fa);
     if (fb) fclose(fb);
@@ -1875,15 +1911,16 @@ int main(int argc, char **argv) {
             logmsg("note: using checkpoint seed %llu (ini seed %llu ignored; set restart_reseed=1 to branch)\n",
                    (unsigned long long)s->seed, (unsigned long long)P.seed);
         }
-        logmsg("restart from %s at step %lld (t=%.4f), N=%d, lipids=%d\n", P.restart, (long long)s->step, s->time, s->N,
-               count_lipids(s));
+        logmsg("restart from %s at step %lld (t=%.4f), N=%d, lipids=%d, descends from the random soup with seed %llu\n",
+               P.restart, (long long)s->step, s->time, s->N, count_lipids(s), (unsigned long long)s->soup_seed);
     } else {
         const int N = (int)lround(P.rho * P.L * P.L);
-        sys_alloc(s, N, P.L, mlen, P.lip_nH, P.threads, P.feed_grid, P.nsub);
+        if (strcmp(P.init, "soup")) die("init = %s needs restart = <checkpoint>", P.init);
+        sys_alloc(s, N, P.L, mlen, P.lip_nH, P.threads, P.nsub);
         s->seed = P.seed;
+        s->soup_seed = P.seed;
         rng_seed(&s->rng, P.seed);
-        if (!strcmp(P.init, "soup")) init_soup(s, &P);
-        else init_seeded(s, &P);
+        init_soup(s, &P); /* the only start state (SPEC section 0) */
         set_velocities(s, &P);
         g_warm_end = P.warmup;
         if (P.warmup > 0) logmsg("warm-up: repulsion above 25 ramped in over steps 0..%ld\n", P.warmup);
@@ -1894,7 +1931,7 @@ int main(int argc, char **argv) {
         s->step_anchor = 0;
         s->dt_anchor = P.dt;
         sort_cells(s);
-        pair_forces(s, &P, 0);
+        pair_forces(s, &P, 0, 0.0);
         bonded_forces(s, &P);
         /* stored velocity is the half-step one: vh = v - dt/2 f */
         for (int i = 0; i < N; i++) {
@@ -1954,6 +1991,14 @@ int main(int argc, char **argv) {
 
     logmsg("oercel: N=%d L=%g cells=%dx%d strips=%d threads=%d dt=%g gamma=%g sigma=%g steps->%ld\n", s->N, s->L, s->ncx,
            s->ncy, s->nstrip, P.threads, P.dt, P.gamma, P.sigma, P.steps);
+    if (P.chem && P.feed_mode == FEED_UNIFORM)
+        logmsg("feed: uniform, every W -> N with p_feed=%g per check (every %ld steps), cap nN/N=%g\n", P.p_feed, P.n_chem,
+               P.feed_cap);
+    if (P.chem && P.feed_mode == FEED_VENT)
+        logmsg("feed: vent %s at x=%g y=%g (r=%g, w=%g), W -> N with p_feed=%g per check, cap nN/N=%g\n", P.vent_shape,
+               P.vent_x, P.vent_y, P.vent_r, P.vent_w, P.p_feed, P.feed_cap);
+    if (P.stir_A != 0) logmsg("stirring: f_x = %g sin(2 pi %d y / L) on every bead (net force removed)\n", P.stir_A, P.stir_n);
+    if (P.kT_amp != 0) logmsg("temperature cycle: kT(t) = %g + %g sin(2 pi t / %g)\n", P.kT, P.kT_amp, P.kT_period);
 
     long cnt[NTYPES];
     if (!restarting) {
@@ -2020,25 +2065,22 @@ int main(int argc, char **argv) {
         tm.integ += t1 - t0;
         /* 2. chemistry on the new configuration, using the cell index of the
          *    previous sort (valid: every bead moved less than CHEM_MARGIN) */
-        if (P.chem) {
-            const int do_react = (ns % P.n_chem) == 0;
-            const int do_feed = P.feed && (ns % P.feed_every) == 0;
-            if (do_react || do_feed) {
-                if (dmax >= CHEM_MARGIN) {
-                    logmsg("warning: step %lld max displacement %.3f >= %.2f, extra cell sort\n", (long long)ns, dmax,
-                           CHEM_MARGIN);
-                    sort_cells(s);
-                }
-                chemistry(s, &P, ns, do_react, do_feed);
+        if (P.chem && (ns % P.n_chem) == 0) {
+            if (dmax >= CHEM_MARGIN) {
+                logmsg("warning: step %lld max displacement %.3f >= %.2f, extra cell sort\n", (long long)ns, dmax,
+                       CHEM_MARGIN);
+                sort_cells(s);
             }
+            chemistry(s, &P, ns);
         }
         double t2 = wtime();
         tm.chem += t2 - t1;
         sort_cells(s);
         double t3 = wtime();
         tm.sort += t3 - t2;
-        /* 3. forces */
-        pair_forces(s, &P, ns);
+        /* 3. forces (pair + stirring body force, noise amplitude from kT(t)) */
+        const double tn = s->t_anchor + (double)(ns - s->step_anchor) * dt;
+        pair_forces(s, &P, ns, tn);
         double t4 = wtime();
         tm.pair += t4 - t3;
         bonded_forces(s, &P);
@@ -2046,7 +2088,7 @@ int main(int argc, char **argv) {
         tm.bond += t5 - t4;
         double t6 = t5;
         s->step = ns;
-        s->time = s->t_anchor + (double)(ns - s->step_anchor) * dt;
+        s->time = tn;
         /* 5. output */
         if (P.stats_every > 0 && ns % P.stats_every == 0) {
             double px, py;
@@ -2070,8 +2112,8 @@ int main(int argc, char **argv) {
             double px, py;
             double T = kinetic_T(s, dt, &px, &py);
             count_types(s, cnt);
-            logmsg("step %lld t=%.2f T=%.4f p=(%.2e,%.2e) lip=%d Ka=%ld Kb=%ld N=%ld  %.3f ms/step\n", (long long)ns,
-                   s->time, T, px, py, count_lipids(s), cnt[TKA], cnt[TKB], cnt[TN],
+            logmsg("step %lld t=%.2f T=%.4f (kT=%.4f) p=(%.2e,%.2e) lip=%d Ka=%ld Kb=%ld N=%ld  %.3f ms/step\n",
+                   (long long)ns, s->time, T, kT_at(&P, s->time), px, py, count_lipids(s), cnt[TKA], cnt[TKB], cnt[TN],
                    1e3 * (now - t_lastlog) / (double)(ns - lastlog_step));
             t_lastlog = now;
             lastlog_step = ns;

@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
     omp_set_num_threads(P.threads);
     Sys S, *s = &S;
     int N = (int)lround(P.rho * P.L * P.L);
-    sys_alloc(s, N, P.L, P.lip_nH + P.lip_nT, P.lip_nH, P.threads, P.feed_grid, P.nsub);
+    sys_alloc(s, N, P.L, P.lip_nH + P.lip_nT, P.lip_nH, P.threads, P.nsub);
     s->seed = 99; rng_seed(&s->rng, 99);
     init_soup(s, &P);
     set_velocities(s, &P);
@@ -65,42 +65,73 @@ int main(int argc, char **argv) {
         printf("chain/cell integrity after sorts: heads=%d errors=%d\n", heads, bad);
         if (bad) { printf("FORCETEST FAIL\n"); return 1; }
     }
-    pair_forces(s, &P, 12345);
-    /* brute force */
-    double *bfx = calloc(N, sizeof(double)), *bfy = calloc(N, sizeof(double));
-    const double sdt = P.sigma / sqrt(P.dt);
+    /* pair forces (+ stirring body force, + kT(t) in sigma) vs O(N^2) brute force,
+     * for plain physics and with the environmental physics switched on */
+    int ok = 1;
     const uint64_t ss = step_seed(s->seed, 12345);
-    long npair = 0;
-    for (int i = 0; i < N; i++)
-        for (int j = i + 1; j < N; j++) {
-            double dx = minimg(s->x[i] - s->x[j], P.L), dy = minimg(s->y[i] - s->y[j], P.L);
-            double r2 = dx * dx + dy * dy;
-            if (r2 >= 1.0) continue;
-            npair++;
-            double r = sqrt(r2), w = 1 - r;
-            double ex = dx / r, ey = dy / r;
-            double rv = ex * (s->vtx[i] - s->vtx[j]) + ey * (s->vty[i] - s->vty[j]);
-            double th = pair_theta(ss, s->gid[i], s->gid[j]);
-            double fm = P.a[s->type[i]][s->type[j]] * w - P.gamma * w * w * rv + sdt * w * th;
-            bfx[i] += fm * ex; bfy[i] += fm * ey; bfx[j] -= fm * ex; bfy[j] -= fm * ey;
+    double *bfx = calloc(N, sizeof(double)), *bfy = calloc(N, sizeof(double));
+    for (int env = 0; env < 2; env++) {
+        P.stir_A = env ? 0.7 : 0.0;
+        P.stir_n = env ? 2 : 1;
+        P.kT_amp = env ? 0.3 : 0.0;
+        P.kT_period = 10.0;
+        const double t = env ? 2.5 : 0.0; /* sin(2 pi 2.5/10) = 1 -> kT = 1.3 */
+        omp_set_num_threads(P.threads);
+        pair_forces(s, &P, 12345, t);
+        const double kTt = P.kT + P.kT_amp * sin(2 * M_PI * t / P.kT_period);
+        const double sdt = sqrt(2 * P.gamma * kTt) / sqrt(P.dt);
+        long npair = 0;
+        double fsum = 0;
+        for (int i = 0; i < N; i++) {
+            bfx[i] = P.stir_A * sin(2 * M_PI * P.stir_n * s->y[i] / P.L);
+            bfy[i] = 0;
+            fsum += bfx[i];
         }
-    double maxd = 0, maxf = 0, sumx = 0, sumy = 0;
-    for (int i = 0; i < N; i++) {
-        maxd = fmax(maxd, fmax(fabs(bfx[i] - s->fx[i]), fabs(bfy[i] - s->fy[i])));
-        maxf = fmax(maxf, fabs(bfx[i]));
-        sumx += s->fx[i]; sumy += s->fy[i];
+        for (int i = 0; i < N; i++) bfx[i] -= fsum / N;
+        for (int i = 0; i < N; i++)
+            for (int j = i + 1; j < N; j++) {
+                double dx = minimg(s->x[i] - s->x[j], P.L), dy = minimg(s->y[i] - s->y[j], P.L);
+                double r2 = dx * dx + dy * dy;
+                if (r2 >= 1.0) continue;
+                npair++;
+                double r = sqrt(r2), w = 1 - r;
+                double ex = dx / r, ey = dy / r;
+                double rv = ex * (s->vtx[i] - s->vtx[j]) + ey * (s->vty[i] - s->vty[j]);
+                double th = pair_theta(ss, s->gid[i], s->gid[j]);
+                double fm = P.a[s->type[i]][s->type[j]] * w - P.gamma * w * w * rv + sdt * w * th;
+                bfx[i] += fm * ex; bfy[i] += fm * ey; bfx[j] -= fm * ex; bfy[j] -= fm * ey;
+            }
+        double maxd = 0, maxf = 0, sumx = 0, sumy = 0;
+        for (int i = 0; i < N; i++) {
+            maxd = fmax(maxd, fmax(fabs(bfx[i] - s->fx[i]), fabs(bfy[i] - s->fy[i])));
+            maxf = fmax(maxf, fabs(bfx[i]));
+            sumx += s->fx[i]; sumy += s->fy[i];
+        }
+        printf("pair forces%s: N=%d L=%g cells=%dx%d pairs=%ld  max|F_cell - F_brute|=%.3e (max|F|=%.1f)  sum F=(%.2e,%.2e)\n",
+               env ? " + stirring (A=0.7, n=2) + kT(t)=1.3" : "", N, P.L, s->ncx, s->ncy, npair, maxd, maxf, sumx, sumy);
+        ok &= maxd < 1e-9 && fabs(sumx) < 1e-9 && fabs(sumy) < 1e-9;
+        /* thread-count independence of the kernel */
+        double *f4 = malloc(N * sizeof(double));
+        memcpy(f4, s->fx, N * sizeof(double));
+        omp_set_num_threads(1);
+        pair_forces(s, &P, 12345, t);
+        int same = memcmp(f4, s->fx, N * sizeof(double)) == 0;
+        printf("pair forces%s bitwise identical with 1 vs %d threads: %s\n", env ? " + environment" : "", P.threads,
+               same ? "yes" : "NO");
+        ok &= same;
+        free(f4);
     }
-    printf("pair forces: N=%d L=%g cells=%dx%d pairs=%ld  max|F_cell - F_brute|=%.3e (max|F|=%.1f)  sum F=(%.2e,%.2e)\n", N,
-           P.L, s->ncx, s->ncy, npair, maxd, maxf, sumx, sumy);
-    int ok = maxd < 1e-9;
-    /* thread-count independence of the kernel */
-    double *f4 = malloc(N * sizeof(double));
-    memcpy(f4, s->fx, N * sizeof(double));
-    omp_set_num_threads(1);
-    pair_forces(s, &P, 12345);
-    int same = memcmp(f4, s->fx, N * sizeof(double)) == 0;
-    printf("pair forces bitwise identical with 1 vs 4 threads: %s\n", same ? "yes" : "NO");
-    ok &= same;
+    P.stir_A = 0; P.kT_amp = 0;
+    /* fast sine of the stirring force vs libm */
+    {
+        double me = 0;
+        for (long k = -2000000; k <= 2000000; k++) {
+            const double u = k * 1.37e-6 + 1e-9 * (k % 7);
+            me = fmax(me, fabs(sin2pi(u) - sin(2 * M_PI * u)));
+        }
+        printf("sin2pi vs libm sin(2 pi u), u in [-2.74, 2.74]: max|diff|=%.2e\n", me);
+        ok &= me < 1e-14;
+    }
     /* noise statistics */
     double m1 = 0, m2 = 0, c1 = 0;
     long nn = 0;

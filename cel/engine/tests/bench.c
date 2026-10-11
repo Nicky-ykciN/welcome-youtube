@@ -16,7 +16,7 @@ int main(int argc, char **argv) {
     omp_set_num_threads(th);
     Sys S, *s = &S;
     int N = (int)lround(P.rho * P.L * P.L);
-    sys_alloc(s, N, P.L, P.lip_nH + P.lip_nT, P.lip_nH, th, P.feed_grid, P.nsub);
+    sys_alloc(s, N, P.L, P.lip_nH + P.lip_nT, P.lip_nH, th, P.nsub);
     s->seed = 1; rng_seed(&s->rng, 1);
     init_soup(s, &P);
     set_velocities(s, &P);
@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
         double t1 = wtime();
         sort_cells(s);
         double t2 = wtime();
-        pair_forces(s, &P, r);
+        pair_forces(s, &P, r, 0.0);
         double t3 = wtime();
         tint += t1 - t0; tsort += t2 - t1; tpair += t3 - t2;
     }
