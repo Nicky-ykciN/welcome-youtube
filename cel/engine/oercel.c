@@ -1032,24 +1032,44 @@ static int find_type_near(Sys *s, int ks, double rcut, int type, nbr_t *out, int
     return n;
 }
 
+/* Parallel scan: slots for which pred(d) holds go to s->glist in increasing
+ * slot order (independent of the thread count).  Returns the count. */
+#define COLLECT_SLOTS(s, COND, nout)                                                    \
+    do {                                                                                \
+        int nth_ = omp_get_max_threads();                                               \
+        if (nth_ > (s)->nthr_alloc) nth_ = (s)->nthr_alloc;                             \
+        int tot_ = 0;                                                                   \
+        _Pragma("omp parallel num_threads(nth_) reduction(+ : tot_)") {                 \
+            const int t_ = omp_get_thread_num(), nt_ = omp_get_num_threads();          \
+            const int lo_ = (int)(((long)t_ * (s)->N) / nt_);                           \
+            const int hi_ = (int)(((long)(t_ + 1) * (s)->N) / nt_);                     \
+            int *lst_ = (s)->tlist + (size_t)t_ * (s)->N, n_ = 0;                       \
+            for (int d = lo_; d < hi_; d++)                                             \
+                if (COND) lst_[n_++] = d;                                               \
+            (s)->tcount[t_] = n_;                                                       \
+            tot_ += n_;                                                                 \
+            _Pragma("omp barrier") int off_ = 0;                                        \
+            for (int tt_ = 0; tt_ < t_; tt_++) off_ += (s)->tcount[tt_];                \
+            memcpy((s)->glist + off_, lst_, (size_t)n_ * sizeof(int));                  \
+        }                                                                               \
+        (nout) = tot_;                                                                  \
+    } while (0)
+
 static int feed_outside(Sys *s, const Params *P, int64_t step);
 
-/* returns 1 if any bead was moved (cells must be re-sorted) */
+/* lipid synthesis / catalyst replication / decay; returns 1 if beads moved */
 static int chemistry(Sys *s, const Params *P, int64_t step, int do_react, int do_feed) {
     int moved = 0;
     const int ml = s->mlen;
     const double L = s->L;
-    const int N = s->N;
     if (do_react) {
-        /* collect catalysts */
-        int nk = 0;
-        for (int i = 0; i < N; i++)
-            if (s->type[i] == TKA || s->type[i] == TKB) nk++;
+        /* catalysts, in slot order, then shuffled with the serial RNG */
+        int nk;
+        const uint8_t *ty = s->type;
+        COLLECT_SLOTS(s, (ty[d] == TKA || ty[d] == TKB), nk);
         int *ks = xmalloc((nk + 1) * sizeof(int));
-        nk = 0;
-        for (int i = 0; i < N; i++)
-            if (s->type[i] == TKA || s->type[i] == TKB) ks[nk++] = i;
-        for (int a = nk - 1; a > 0; a--) { /* shuffle */
+        memcpy(ks, s->glist, nk * sizeof(int));
+        for (int a = nk - 1; a > 0; a--) {
             int b = (int)rng_below(&s->rng, a + 1);
             int t = ks[a]; ks[a] = ks[b]; ks[b] = t;
         }
@@ -1065,10 +1085,14 @@ static int chemistry(Sys *s, const Params *P, int64_t step, int do_react, int do
             int used = 0;
             const double xk = s->x[k], yk = s->y[k];
             if (nn >= ml && rng_unif(&s->rng) < psyn) {
-                /* lipid synthesis from the ml nearest N */
+                /* lipid synthesis from the ml nearest N: straight chain with
+                 * spacing r0 through their centroid, random orientation, mean
+                 * velocity (momentum conserving), bonds at rest length */
                 double cxm = 0, cym = 0, mvx = 0, mvy = 0, mtx = 0, mty = 0;
+                int sl[MAXMLEN];
                 for (int b = 0; b < ml; b++) {
                     const int j = nb[b].slot;
+                    sl[b] = j;
                     cxm += minimg(s->x[j] - xk, L);
                     cym += minimg(s->y[j] - yk, L);
                     mvx += s->vx[j]; mvy += s->vy[j];
@@ -1078,9 +1102,8 @@ static int chemistry(Sys *s, const Params *P, int64_t step, int do_react, int do
                 mvx /= ml; mvy /= ml; mtx /= ml; mty /= ml;
                 const double phi = 2.0 * M_PI * rng_unif(&s->rng);
                 const double ux = cos(phi), uy = sin(phi);
-                int32_t g[MAXMLEN];
                 for (int b = 0; b < ml; b++) {
-                    const int j = nb[b].slot;
+                    const int j = sl[b];
                     const double off = (b - 0.5 * (ml - 1)) * P->r0;
                     s->x[j] = cxm + off * ux;
                     s->y[j] = cym + off * uy;
@@ -1089,9 +1112,8 @@ static int chemistry(Sys *s, const Params *P, int64_t step, int do_react, int do
                     s->vx[j] = mvx; s->vy[j] = mvy;
                     s->vtx[j] = mtx; s->vty[j] = mty;
                     s->type[j] = b < s->nH ? TH : TT;
-                    g[b] = (int32_t)s->gid[j];
                 }
-                add_molecule(s, g);
+                link_lipid(s, sl);
                 add_event(s, step, EV_SYN, s->gid[k], xk, yk, var);
                 used = ml;
                 moved = 1;
@@ -1107,33 +1129,41 @@ static int chemistry(Sys *s, const Params *P, int64_t step, int do_react, int do
             }
         }
         free(ks);
-        /* decay */
-        if (P->p_ld > 0) {
-            for (int m = s->nmol - 1; m >= 0; m--) {
-                if (rng_unif(&s->rng) < P->p_ld) {
-                    const int32_t *g = s->mol + (size_t)m * ml;
-                    const int h = s->slot[g[0]];
-                    const double hx = s->x[h], hy = s->y[h];
-                    const int32_t g0 = g[0];
-                    for (int b = 0; b < ml; b++) s->type[s->slot[g[b]]] = TW;
-                    remove_molecule(s, m);
+        /* decay: independent per-bead decisions from a counter-based hash of
+         * (seed, step, gid), so the scan is parallel and order independent */
+        if (P->p_ld > 0 || P->p_kd > 0 || P->p_nd > 0) {
+            const int8_t *mp = s->mpos;
+            const uint32_t *gd = s->gid;
+            const uint64_t sd = s->seed;
+            const double pld = P->p_ld, pkd = P->p_kd, pnd = P->p_nd;
+            int nd;
+            COLLECT_SLOTS(s,
+                          ((mp[d] == 0 && pld > 0 && hash_u01(sd, step, gd[d], 11) < pld) ||
+                           ((ty[d] == TKA || ty[d] == TKB) && pkd > 0 && hash_u01(sd, step, gd[d], 12) < pkd) ||
+                           (ty[d] == TN && pnd > 0 && hash_u01(sd, step, gd[d], 13) < pnd)),
+                          nd);
+            for (int q = 0; q < nd; q++) {
+                const int d = s->glist[q];
+                const int t = s->type[d];
+                if (s->mpos[d] == 0) {
+                    const double hx = s->x[d], hy = s->y[d];
+                    const uint32_t g0 = s->gid[d];
+                    int c = d, n = 0;
+                    while (c >= 0 && n < ml) {
+                        const int nx = s->nxt[c];
+                        s->type[c] = TW;
+                        s->mpos[c] = -1;
+                        s->nxt[c] = -1;
+                        c = nx;
+                        n++;
+                    }
                     add_event(s, step, EV_DLIP, g0, hx, hy, -1);
-                }
-            }
-        }
-        if (P->p_kd > 0 || P->p_nd > 0) {
-            for (int i = 0; i < N; i++) {
-                const int t = s->type[i];
-                if ((t == TKA || t == TKB) && P->p_kd > 0) {
-                    if (rng_unif(&s->rng) < P->p_kd) {
-                        s->type[i] = TW;
-                        add_event(s, step, EV_DK, s->gid[i], s->x[i], s->y[i], t == TKB);
-                    }
-                } else if (t == TN && P->p_nd > 0) {
-                    if (rng_unif(&s->rng) < P->p_nd) {
-                        s->type[i] = TW;
-                        add_event(s, step, EV_DN, s->gid[i], s->x[i], s->y[i], -1);
-                    }
+                } else if (t == TKA || t == TKB) {
+                    s->type[d] = TW;
+                    add_event(s, step, EV_DK, s->gid[d], s->x[d], s->y[d], t == TKB);
+                } else if (t == TN) {
+                    s->type[d] = TW;
+                    add_event(s, step, EV_DN, s->gid[d], s->x[d], s->y[d], -1);
                 }
             }
         }
@@ -1147,23 +1177,36 @@ static int chemistry(Sys *s, const Params *P, int64_t step, int do_react, int do
  * outside medium; W there is converted to N until the N fraction among all
  * beads in that region reaches c_N. */
 static int feed_outside(Sys *s, const Params *P, int64_t step) {
-    const double L = s->L;
-    int ng = (int)floor(L / P->feed_grid);
-    if (ng < 3) ng = 3;
-    const double ig = ng / L;
-    const int ngc = ng * ng;
-    int *tcnt = xcalloc(ngc * sizeof(int));
-    int *lab = xmalloc(ngc * sizeof(int));
-    int *queue = xmalloc(ngc * sizeof(int));
-    int *gc = xmalloc(s->N * sizeof(int));
-    for (int i = 0; i < s->N; i++) {
-        int gx = (int)(s->x[i] * ig), gy = (int)(s->y[i] * ig);
-        if (gx >= ng) gx = ng - 1;
-        if (gy >= ng) gy = ng - 1;
-        gc[i] = gx * ng + gy;
-        if (s->type[i] == TT) tcnt[gc[i]]++;
+    const int N = s->N, ng = s->fng, ngc = ng * ng;
+    const double ig = ng / s->L;
+    int nth = omp_get_max_threads();
+    if (nth > s->nthr_alloc) nth = s->nthr_alloc;
+    int *restrict gc = s->gc;
+    int *restrict lab = s->flab;
+    int *restrict queue = s->fqueue;
+    const double *restrict x = s->x, *restrict y = s->y;
+    const uint8_t *restrict ty = s->type;
+#pragma omp parallel num_threads(nth)
+    {
+        const int t = omp_get_thread_num(), nt = omp_get_num_threads();
+        const int lo = (int)(((long)t * N) / nt), hi = (int)(((long)(t + 1) * N) / nt);
+        int *restrict g = s->fgrid + (size_t)t * ngc;
+        memset(g, 0, ngc * sizeof(int));
+        for (int i = lo; i < hi; i++) {
+            int gx = (int)(x[i] * ig), gy = (int)(y[i] * ig);
+            gx = gx >= ng ? ng - 1 : gx;
+            gy = gy >= ng ? ng - 1 : gy;
+            gc[i] = gx * ng + gy;
+            g[gc[i]] += ty[i] == TT;
+        }
+#pragma omp barrier
+#pragma omp for schedule(static)
+        for (int c = 0; c < ngc; c++) {
+            int tc = 0;
+            for (int tt = 0; tt < nt; tt++) tc += s->fgrid[(size_t)tt * ngc + c];
+            lab[c] = tc >= P->feed_tmin ? -2 : -1;
+        }
     }
-    for (int c = 0; c < ngc; c++) lab[c] = tcnt[c] >= P->feed_tmin ? -2 : -1;
     int nlab = 0, best = -1, bestsize = 0;
     for (int c0 = 0; c0 < ngc; c0++) {
         if (lab[c0] != -1) continue;
@@ -1187,26 +1230,26 @@ static int feed_outside(Sys *s, const Params *P, int64_t step) {
     }
     int added = 0;
     if (best >= 0) {
-        long tot = 0, nN = 0, nW = 0;
-        int *wl = xmalloc(s->N * sizeof(int));
-        for (int i = 0; i < s->N; i++) {
-            if (lab[gc[i]] != best) continue;
-            tot++;
-            if (s->type[i] == TN) nN++;
-            else if (s->type[i] == TW) wl[nW++] = i;
+        long tot = 0, nN = 0;
+#pragma omp parallel for schedule(static) num_threads(nth) reduction(+ : tot, nN)
+        for (int i = 0; i < N; i++) {
+            const int in = lab[gc[i]] == best;
+            tot += in;
+            nN += in & (ty[i] == TN);
         }
+        int nW;
+        COLLECT_SLOTS(s, (lab[gc[d]] == best && ty[d] == TW), nW);
         long need = (long)ceil(P->c_N * (double)tot - 1e-9) - nN;
         if (need > nW) need = nW;
+        int *wl = s->glist;
         for (long a = 0; a < need; a++) {
             long b = a + rng_below(&s->rng, nW - a);
             int t = wl[a]; wl[a] = wl[b]; wl[b] = t;
             s->type[wl[a]] = TN;
         }
         if (need > 0) added = (int)need;
-        free(wl);
     }
     if (added > 0) add_event(s, step, EV_FEED, added, NAN, NAN, -1);
-    free(tcnt); free(lab); free(queue); free(gc);
     return added;
 }
 
