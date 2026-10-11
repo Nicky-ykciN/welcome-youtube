@@ -39,9 +39,16 @@ def resample_closed(P, m=1500):
     return np.stack([np.interp(s, d, Pc[:, 0]), np.interp(s, d, Pc[:, 1])], 1)
 
 
-def circle(cx, cy, r, m=1500):
+_WOB = np.random.default_rng(12345)
+
+
+def circle(cx, cy, r, m=1500, wobble=0.035):
+    """Closed CCW curve: circle with small random low-mode shape fluctuations."""
     t = np.linspace(0, 2 * np.pi, m, endpoint=False)
-    return np.stack([cx + r * np.cos(t), cy + r * np.sin(t)], 1)
+    rr = np.ones_like(t)
+    for k in range(2, 7):
+        rr += _WOB.normal(0, wobble / k ** 0.8) * np.cos(k * t + _WOB.uniform(0, 2 * np.pi))
+    return resample_closed(np.stack([cx + r * rr * np.cos(t), cy + r * rr * np.sin(t)], 1), m)
 
 
 def cassini(cx, cy, a, c, angle, m=3000):
@@ -272,7 +279,7 @@ def main():
     L = a.L
     with open(os.path.join(a.outdir, "params.ini"), "w") as f:
         f.write("# SYNTHETIC test data made by tools/make_synthetic.py -- NOT a simulation\n")
-        f.write(f"synthetic = 1\nL = {L}\nrho = 3\ndt = {a.dt}\nsteps = {a.frames * a.snap_every}\n")
+        f.write(f"synthetic = 1\nstable_ids = 0\nL = {L}\nrho = 3\ndt = {a.dt}\nsteps = {a.frames * a.snap_every}\n")
         f.write(f"snap_every = {a.snap_every}\nseed = {a.seed}\nthreads = 1\ninit = soup\n")
         f.write("p_syn_a = 0.01\np_syn_b = 0.03\np_rep = 0.005\nmu = 0.01\nc_N = 0.08\n")
     stats_rows = []

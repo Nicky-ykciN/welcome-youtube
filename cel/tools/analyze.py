@@ -26,7 +26,7 @@ import ocio  # noqa: E402
 import cells as celldet  # noqa: E402
 import tracking  # noqa: E402
 
-TOOLS_VERSION = "3"
+TOOLS_VERSION = "4"
 CACHE = "analysis_cache"
 
 
@@ -68,7 +68,7 @@ def _detect_one(args):
     d = dict(key=key, step=snap.step, time=snap.time, L=snap.L, N=int(snap.n),
              h=r["h"], ng=r["ng"], cells=r["cells"], summary=r["summary"],
              counts={nm: int(c) for nm, c in zip(ocio.TYPE_NAMES, np.bincount(snap.type, minlength=7))})
-    np.savez_compressed(gp + ".tmp.npz", label=r["label"], bead_cell=r["bead_cell"])
+    np.savez_compressed(gp + ".tmp.npz", label=r["label"], bead_cell=r["bead_cell"], types=snap.type)
     os.replace(gp + ".tmp.npz", gp)
     with open(jp + ".tmp", "w") as f:
         json.dump(d, f, default=np_default)
@@ -79,7 +79,7 @@ def _detect_one(args):
 def load_grid(rundir, step):
     _, gp = cache_paths(rundir, step)
     with np.load(gp) as z:
-        return z["label"].astype(np.int32), z["bead_cell"].astype(np.int32)
+        return z["label"].astype(np.int32), z["bead_cell"].astype(np.int32), z["types"]
 
 
 def run_detection(rundir, cfg, jobs=2, every=1, use_cache=True, quiet=False):
@@ -121,7 +121,7 @@ def wrap_dilate_labels(label, rad_px):
     return near[pad:-pad, pad:-pad]
 
 
-def links_and_attribution(rundir, frames, events, tcfg, quiet=False):
+def links_and_attribution(rundir, frames, events, tcfg, quiet=False, stable_ids=True):
     """Overlap links (gaps 1..max_gap+1) and attribution of events to cells."""
     K = len(frames)
     G = tcfg["max_gap"] + 1
@@ -144,10 +144,27 @@ def links_and_attribution(rundir, frames, events, tcfg, quiet=False):
         ex = events["x"].to_numpy(); ey = events["y"].to_numpy(); ei = events["i"].to_numpy()
         kinds = events["kind"].to_numpy()
     ring = {}
+    prev_types = None
     t0 = time.time()
     for k in range(K):
-        lab, bead_cell = load_grid(rundir, frames[k]["step"])
+        lab, bead_cell, types = load_grid(rundir, frames[k]["step"])
         ring[k] = lab
+        nk = len(frames[k]["cells"])
+        # newly synthesised lipid beads since the previous snapshot (indices are global ids)
+        for c in frames[k]["cells"]:
+            c["new_wall_beads"] = 0; c["new_lumen_beads"] = 0
+        nl = dict(total=0, wall=0, lumen=0, outside=0)
+        if stable_ids and k > 0 and prev_types is not None and len(prev_types) == len(types):
+            new = (prev_types == ocio.N) & ((types == ocio.H) | (types == ocio.T))
+            bc = bead_cell[new]
+            nl = dict(total=int(new.sum()), wall=int((bc <= -2).sum()), lumen=int((bc >= 0).sum()),
+                      outside=int((bc == -1).sum()))
+            wc = np.bincount(-bc[bc <= -2] - 2, minlength=nk) if nk else []
+            lc = np.bincount(bc[bc >= 0], minlength=nk) if nk else []
+            for c in frames[k]["cells"]:
+                c["new_wall_beads"] = int(wc[c["id"]]); c["new_lumen_beads"] = int(lc[c["id"]])
+        frames[k]["new_lipid_beads"] = nl
+        prev_types = types
         ring.pop(k - G - 1, None)
         nk = len(frames[k]["cells"])
         ak = tracking.area_px(lab, nk)
@@ -195,12 +212,12 @@ def links_and_attribution(rundir, frames, events, tcfg, quiet=False):
 def summarise_tracks(frames, tr):
     out = []
     for t in tr.tracks:
-        ser = {k: [] for k in ("step", "area", "n_lipids", "n_Ka", "n_Kb", "n_N", "x", "y", "aspect", "solidity", "inner_frac", "agg_lumens")}
+        ser = {k: [] for k in ("step", "area", "n_lipids", "n_Ka", "n_Kb", "n_N", "x", "y", "aspect", "solidity", "inner_frac", "agg_lumens", "new_wall_beads")}
         for (k, c) in t["nodes"]:
             cl = frames[k]["cells"][c]
             ser["step"].append(int(frames[k]["step"]))
-            for key in ("area", "n_lipids", "n_Ka", "n_Kb", "n_N", "x", "y", "aspect", "solidity", "inner_frac", "agg_lumens"):
-                v = cl[key]
+            for key in ("area", "n_lipids", "n_Ka", "n_Kb", "n_N", "x", "y", "aspect", "solidity", "inner_frac", "agg_lumens", "new_wall_beads"):
+                v = cl.get(key, 0)
                 ser[key].append(round(v, 2) if isinstance(v, float) else v)
         d = dict(id=t["id"], start_step=ser["step"][0], end_step=ser["step"][-1], n_frames=len(t["nodes"]),
                  start_reason=t["start_reason"], end_reason=t["end_reason"], parents=t["parents"],
@@ -238,7 +255,8 @@ def main():
         print(f"[analyze] {rundir}")
     frames = run_detection(rundir, cfg, a.jobs, a.every, not a.no_cache, a.quiet)
     events = ocio.read_events(rundir, kinds=("syn", "rep", "mut", "dK", "dlip"))
-    links, attr = links_and_attribution(rundir, frames, events, tcfg, a.quiet)
+    stable = int(params.get("stable_ids", 1)) != 0   # engine snapshots are in global-id order
+    links, attr = links_and_attribution(rundir, frames, events, tcfg, a.quiet, stable)
     tr = tracking.Tracker(frames, links, tcfg).run()
     # node -> track
     for (k, c), tid in tr.track_of.items():
@@ -293,7 +311,7 @@ def main():
     for k, f in enumerate(frames):
         cells_out["frames"].append(dict(k=k, step=f["step"], time=f["time"], L=f["L"], N=f["N"],
                                         n_cells=len(f["cells"]), summary=f["summary"], counts=f["counts"],
-                                        cells=f["cells"]))
+                                        new_lipid_beads=f.get("new_lipid_beads"), cells=f["cells"]))
     with open(os.path.join(rundir, "cells.json"), "w") as fh:
         json.dump(cells_out, fh, separators=(",", ":"), default=np_default)
     lineage = dict(run=os.path.basename(rundir), tracks=tracks, events=tr.events,

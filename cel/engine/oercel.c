@@ -589,31 +589,44 @@ static void remove_molecule(Sys *s, int m) {
 /* Stable parallel counting sort of all slot arrays by cell index.  The result
  * is the unique stable order, independent of the thread count. */
 static void sort_cells(Sys *s) {
-    const int N = s->N, nc = s->ncell;
+    const int N = s->N, nc = s->ncell, ncx = s->ncx, ncy = s->ncy;
+    const double icsx = s->icsx, icsy = s->icsy;
     int nth = omp_get_max_threads();
     if (nth > s->nthr_alloc) nth = s->nthr_alloc;
-    int *hist = s->hist;
-    int *cs = s->cstart;
+    int *restrict hist = s->hist;
+    int *restrict cs = s->cstart;
+    int *restrict cellof = s->cellof;
+    int *restrict slot = s->slot;
+    const double *restrict x = s->x, *restrict y = s->y, *restrict vx = s->vx, *restrict vy = s->vy;
+    const double *restrict vtx = s->vtx, *restrict vty = s->vty;
+    const uint8_t *restrict type = s->type;
+    const uint32_t *restrict gid = s->gid;
+    double *restrict x2 = s->x2, *restrict y2 = s->y2, *restrict vx2 = s->vx2, *restrict vy2 = s->vy2;
+    double *restrict vtx2 = s->vtx2, *restrict vty2 = s->vty2;
+    uint8_t *restrict type2 = s->type2;
+    uint32_t *restrict gid2 = s->gid2;
 #pragma omp parallel num_threads(nth)
     {
         const int t = omp_get_thread_num(), nt = omp_get_num_threads();
         const int lo = (int)(((long)t * N) / nt), hi = (int)(((long)(t + 1) * N) / nt);
-        int *h = hist + (size_t)t * nc;
+        int *restrict h = hist + (size_t)t * nc;
         memset(h, 0, nc * sizeof(int));
         for (int i = lo; i < hi; i++) {
-            int c = cell_of_pos(s, s->x[i], s->y[i]);
-            s->cellof[i] = c;
+            int cx = (int)(x[i] * icsx), cy = (int)(y[i] * icsy);
+            cx = cx >= ncx ? ncx - 1 : cx;
+            cy = cy >= ncy ? ncy - 1 : cy;
+            const int c = cx * ncy + cy;
+            cellof[i] = c;
             h[c]++;
         }
 #pragma omp barrier
-        /* exclusive scan over (cell, thread): parallel over cell blocks */
 #pragma omp single
         {
             int run = 0;
             for (int c = 0; c < nc; c++) {
                 cs[c] = run;
                 for (int tt = 0; tt < nt; tt++) {
-                    int v = hist[(size_t)tt * nc + c];
+                    const int v = hist[(size_t)tt * nc + c];
                     hist[(size_t)tt * nc + c] = run;
                     run += v;
                 }
@@ -621,16 +634,16 @@ static void sort_cells(Sys *s) {
             cs[nc] = run;
         }
         for (int i = lo; i < hi; i++) {
-            const int d = h[s->cellof[i]]++;
-            s->x2[d] = s->x[i];
-            s->y2[d] = s->y[i];
-            s->vx2[d] = s->vx[i];
-            s->vy2[d] = s->vy[i];
-            s->vtx2[d] = s->vtx[i];
-            s->vty2[d] = s->vty[i];
-            s->type2[d] = s->type[i];
-            s->gid2[d] = s->gid[i];
-            s->slot[s->gid[i]] = d;
+            const int d = h[cellof[i]]++;
+            x2[d] = x[i];
+            y2[d] = y[i];
+            vx2[d] = vx[i];
+            vy2[d] = vy[i];
+            vtx2[d] = vtx[i];
+            vty2[d] = vty[i];
+            type2[d] = type[i];
+            gid2[d] = gid[i];
+            slot[gid[i]] = d;
         }
     }
     double *t;

@@ -90,32 +90,54 @@ def evaluate(rundir, params, frames, tracks, tevents, events, ev_summary, tcfg):
     # ---------------------------------------------------------------- 2 metabolism
     c2 = dict(id=2, naam="Metabolisme", status="nee", samenvatting="geen synthese-gebeurtenissen in cellen", bewijs={})
     syn = ev_summary.get("syn")
+    # molecule length from the data (H+T beads per molecule)
+    nmol = sum(f["summary"]["n_molecules"] for f in frames)
+    nlb = sum(f["counts"].get("H", 0) + f["counts"].get("T", 0) for f in frames)
+    mlen = nlb / nmol if nmol else 4.0
+    nl = [f.get("new_lipid_beads") or {} for f in frames]
+    new_tot = sum(d.get("total", 0) for d in nl)
+    new_wall = sum(d.get("wall", 0) for d in nl)
+    new_lumen = sum(d.get("lumen", 0) for d in nl)
     if syn:
         act = sorted([t for t in real if t["events"].get("syn", 0) >= MIN_SYN_PER_CELL],
                      key=lambda t: -t["events"].get("syn", 0))
-        inc = ev_summary.get("syn_incorporation", {})
         ev = dict(syn_totaal=syn["total"], syn_in_lumen=syn["in_cells"], syn_bij_cel=syn["near_cells"],
-                  fractie_in_lumen=round(syn["in_cells"] / max(syn["total"], 1), 3),
-                  actieve_cellen=len(act), inbouw=inc)
+                  fractie_in_lumen=round(syn["in_cells"] / max(syn["total"], 1), 3), actieve_cellen=len(act),
+                  nieuwe_lipiden_totaal=round(new_tot / mlen, 1),
+                  nieuwe_lipiden_in_celwand=round(new_wall / mlen, 1),
+                  nieuwe_lipiden_vrij_in_lumen=round(new_lumen / mlen, 1),
+                  molecuullengte=round(mlen, 2))
+        # per track: attributed syntheses vs new lipids that appeared in its own wall
+        xs, ys = [], []
+        for t in real:
+            if t["n_frames"] >= 2:
+                xs.append(t["events"].get("syn", 0)); ys.append(sum(t["series"].get("new_wall_beads", [0])[1:]) / mlen)
+        if len(xs) >= 5 and np.ptp(xs) > 0 and np.ptp(ys) > 0:
+            rho, p = sst.spearmanr(xs, ys)
+            ev["spearman_syn_vs_nieuwe_wandlipiden"] = dict(rho=round(float(rho), 3), p=float(f"{p:.2g}"), n=len(xs))
         if act:
             t = act[0]
             s = t["series"]
             ev["voorbeeld"] = dict(spoor=t["id"], syntheses=t["events"].get("syn", 0),
                                    syn_a=t["events"].get("syn_a", 0), syn_b=t["events"].get("syn_b", 0),
+                                   nieuwe_lipiden_in_eigen_wand=round(sum(s.get("new_wall_beads", [0])[1:]) / mlen, 1),
                                    van_stap=t["start_step"], tot_stap=t["end_step"],
                                    katalysatoren_gem=round(float(np.mean(np.array(s["n_Ka"]) + np.array(s["n_Kb"]))), 1))
-        inc_ok = inc.get("lipid_bead_tracked", 0) > 0 and inc.get("into_same_cell_membrane", 0) > 0
-        if act and (inc_ok or inc.get("lipid_bead_tracked", 0) == 0):
+        wall_ok = new_tot > 0 and new_wall / max(new_tot, 1) >= 0.25 and new_wall / mlen >= 5
+        if act and wall_ok:
             c2["status"] = "ja"
         elif syn["in_cells"] > 0:
             c2["status"] = "deels"
         msg = (f"{_fmt(syn['in_cells'])} van {_fmt(syn['total'])} lipide-syntheses gebeurden in een lumen; "
                f"{len(act)} cellen met >= {MIN_SYN_PER_CELL}")
-        if inc.get("lipid_bead_tracked", 0) > 0:
-            msg += (f"; {_fmt(inc['into_same_cell_membrane'])}/{_fmt(inc['lipid_bead_tracked'])} nieuwe lipiden "
-                    f"zitten in de volgende snapshot in het membraan van dezelfde cel")
+        if new_tot > 0:
+            msg += (f"; van {_fmt(round(new_tot / mlen))} nieuw gemaakte lipiden zaten er bij de volgende snapshot "
+                    f"{_fmt(round(new_wall / mlen))} in een celwand en {_fmt(round(new_lumen / mlen))} los in een lumen")
         else:
-            msg += "; inbouw in het membraan niet controleerbaar (event-index is geen lipidekraal)"
+            msg += "; inbouw van nieuwe lipiden niet te volgen (kraal-indices niet stabiel tussen snapshots)"
+        if "spearman_syn_vs_nieuwe_wandlipiden" in ev:
+            sp = ev["spearman_syn_vs_nieuwe_wandlipiden"]
+            msg += f" (Spearman syntheses vs nieuwe wandlipiden per cel: rho = {_fmt(sp['rho'], 2)}, p = {sp['p']:.2g})"
         c2["samenvatting"] = msg
         c2["bewijs"] = ev
         c2["stappen"] = [t["start_step"] for t in act[:5]]
@@ -282,7 +304,7 @@ def evaluate(rundir, params, frames, tracks, tevents, events, ev_summary, tcfg):
                                   oppervlak_bij_verlies=s["area"][j0], oppervlak_eind=s["area"][-1],
                                   groei_na_verlies_per_1e5=round(after["slope"] * 1e5, 2),
                                   groei_voor_verlies_per_1e5=None if not np.isfinite(before["slope"]) else round(before["slope"] * 1e5, 2),
-                                  stopt_met_groeien=after["slope"] * 1e5 <= 0.5 * max(1e-9, abs(np.mean(dl_with) if dl_with else 1)),
+                                  stopt_met_groeien=bool(after["slope"] <= 0 or after["p"] > GROWTH_P),
                                   vergaat=bool(decayed)))
     c6 = dict(id=6, naam="Dood", status="nee", samenvatting="geen cel die zijn katalysatoren verliest",
               bewijs=dict(lipidegroei_per_1e5_stappen_met_katalysator=round(float(np.mean(dl_with)), 2) if dl_with else None,
