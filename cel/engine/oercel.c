@@ -665,6 +665,7 @@ typedef struct {
     uint64_t sseed;
 } pairpar_t;
 
+#define PBUF 128
 static inline __attribute__((always_inline)) void
 pair_seg(const int j0, const int j1, const double xi, const double yi, const double vxi, const double vyi,
          const uint32_t gi, const double *restrict arow, const double gam, const double sdt, const uint64_t sseed,
@@ -672,21 +673,36 @@ pair_seg(const int j0, const int j1, const double xi, const double yi, const dou
          const uint8_t *restrict ty, const uint32_t *restrict gid, double *restrict fx, double *restrict fy,
          double *fxi, double *fyi) {
     double ax = 0.0, ay = 0.0;
-    for (int j = j0; j < j1; j++) {
-        const double dx = xi - x[j], dy = yi - y[j];
-        const double r2 = dx * dx + dy * dy;
-        if (r2 >= 1.0 || r2 < 1e-24) continue;
-        const double r = sqrt(r2);
-        const double ir = 1.0 / r;
-        const double w = 1.0 - r;
-        const double rv = (dx * (vxi - vx[j]) + dy * (vyi - vy[j])) * ir;
-        const double th = pair_theta(sseed, gi, gid[j]);
-        const double fm = w * (arow[ty[j]] - gam * w * rv + sdt * th) * ir;
-        const double ffx = fm * dx, ffy = fm * dy;
-        ax += ffx;
-        ay += ffy;
-        fx[j] -= ffx;
-        fy[j] -= ffy;
+    int jb[PBUF];
+    double dxb[PBUF], dyb[PBUF], r2b[PBUF];
+    for (int c0 = j0; c0 < j1; c0 += PBUF) {
+        const int c1 = j1 - c0 > PBUF ? c0 + PBUF : j1;
+        int n = 0;
+        /* branchless compaction of candidates inside the cutoff */
+        for (int j = c0; j < c1; j++) {
+            const double dx = xi - x[j], dy = yi - y[j];
+            const double r2 = dx * dx + dy * dy;
+            jb[n] = j;
+            dxb[n] = dx;
+            dyb[n] = dy;
+            r2b[n] = r2;
+            n += (r2 < 1.0) & (r2 > 1e-24);
+        }
+        for (int k = 0; k < n; k++) {
+            const int j = jb[k];
+            const double dx = dxb[k], dy = dyb[k], r2 = r2b[k];
+            const double r = sqrt(r2);
+            const double ir = 1.0 / r;
+            const double w = 1.0 - r;
+            const double rv = (dx * (vxi - vx[j]) + dy * (vyi - vy[j])) * ir;
+            const double th = pair_theta(sseed, gi, gid[j]);
+            const double fm = w * (arow[ty[j]] - gam * w * rv + sdt * th) * ir;
+            const double ffx = fm * dx, ffy = fm * dy;
+            ax += ffx;
+            ay += ffy;
+            fx[j] -= ffx;
+            fy[j] -= ffy;
+        }
     }
     *fxi += ax;
     *fyi += ay;
