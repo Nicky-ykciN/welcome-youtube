@@ -404,7 +404,11 @@ def do_longrun(e, dry):
         if rc != 0 and GPU_RE.search(out):
             return f"{head}: WACHT OP GPU — nog niet gestart\n{indent(out)}", "wacht_gpu"
         if rc != 0:
-            return f"{head}: FOUT bij starten (code {rc})\n{indent(out)}", "fout"
+            msg = f"{head}: FOUT bij starten (code {rc})\n{indent(out)}"
+            if "kent deze parameters niet" in out and e["cond"] and e["cond"]["kind"] == "als":
+                msg += (f"\n      Tot dan start deze regel niet; de 'anders:'-regel geldt ook niet, want "
+                        f"{e['cond']['path']} bestaat.")
+            return msg, "fout"
         src = ""
         if e["cond"]:
             c = e["cond"] if e["cond"]["kind"] == "als" else None

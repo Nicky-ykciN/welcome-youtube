@@ -7,7 +7,7 @@ cd "$(dirname "$0")/../.." || exit 1     # -> cel/
 mkdir -p pc/_test
 bad=0
 for t in test_longrun_kill test_longrun_extra test_thinning test_sweep_kill test_reboot test_disk_guard \
-         test_gpu_fallback test_stop_hervat test_kill_stress; do
+         test_gpu_fallback test_stop_hervat test_kill_stress test_start; do
   echo "######## $t $(date +%T)"
   if timeout 1200 bash pc/tests/$t.sh > pc/_test/$t.txt 2>&1; then echo "OK"; else echo "FOUT (zie pc/_test/$t.txt)"; bad=$((bad + 1)); fi
   grep -E "^(PASS|FAIL)" pc/_test/$t.txt | cut -c1-160

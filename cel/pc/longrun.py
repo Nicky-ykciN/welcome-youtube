@@ -440,7 +440,7 @@ class Supervisor:
             if self.stop_req:
                 return False
             p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=P.CEL,
-                                 preexec_fn=P._set_pdeathsig)
+                                 preexec_fn=P._set_pdeathsig, env=P.tool_env())
             self.tool_proc = p
             try:
                 rc = p.wait(timeout=timeout)
@@ -818,7 +818,8 @@ def main():
         miss = P.unsupported_keys(binary, set(base) | set(ov))
         if miss:
             raise SystemExit(f"de {label}-engine ({binary}) kent deze parameters niet: {', '.join(miss)}.\n"
-                             f"Kies een engine die ze wel kent met --engine PAD (bijv. een build van runs/memB_src/oercel.c).")
+                             f"Neem eerst de engine-wijzigingen die erbij horen over in engine/ (en engine_gpu/), of kies een "
+                             f"engine die ze wel kent met --engine PAD.")
         os.makedirs(rundir, exist_ok=True)
         if P.list_snaps(rundir) and not os.path.exists(stp):
             raise SystemExit(f"{rundir} bestaat al met snapshots maar is geen longrun-map; kies een andere naam")

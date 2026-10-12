@@ -15,7 +15,7 @@ ALLES=0
 for arg in "$@"; do
   case "$arg" in
     --alles) ALLES=1 ;;
-    -h|--help) sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "onbekende optie: $arg (alleen --alles)"; exit 2 ;;
   esac
 done

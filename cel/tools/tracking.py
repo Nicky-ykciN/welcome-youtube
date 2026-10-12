@@ -34,9 +34,10 @@ def overlaps(lab_a, lab_b):
     if not m.any():
         return []
     ka = lab_a[m].astype(np.int64); kb = lab_b[m].astype(np.int64)
-    keys = ka * 65536 + kb
+    mul = max(65536, int(kb.max()) + 1)          # any number of cells (labels may exceed int16)
+    keys = ka * mul + kb
     u, c = np.unique(keys, return_counts=True)
-    return [(int(x // 65536), int(x % 65536), int(n)) for x, n in zip(u, c)]
+    return [(int(x // mul), int(x % mul), int(n)) for x, n in zip(u, c)]
 
 
 def area_px(lab, n):

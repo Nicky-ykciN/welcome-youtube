@@ -158,7 +158,7 @@ def main():
           f"(CPU-engine: {'ok' if os.path.exists(P.ENGINE_CPU) else 'ONTBREEKT'}, "
           f"GPU-engine: {'gebouwd' if os.path.exists(P.ENGINE_GPU) else 'niet gebouwd'})")
     if P.on_windows_drive(P.CEL):
-        print("  LET OP: de repo staat op de Windows-schijf (/mnt/...): veel trager; clone hem in ~ (zie pc/README.md)")
+        print("  LET OP: de repo staat op de Windows-schijf (/mnt/...): veel trager; kloon hem in ~ (zie pc/README.md)")
     lr, sw = [], []
     for d in sorted(glob.glob(os.path.join(runs, "*"))):
         if a.namen and os.path.basename(d) not in a.namen:

@@ -6,13 +6,14 @@ formats of SPEC §5. Fonts: Inter (SIL OFL) in `tools/fonts`, with DejaVu as fal
 ## Commands
 
 ```bash
-python3 tools/analyze.py runs/<name>                      # cells.json lineage.json checklist.md checklist.json
+python3 tools/analyze.py runs/<name> [--jobs 8] [--ram-gb 64]   # cells.json lineage.json checklist.md checklist.json
 python3 tools/render.py  runs/<name> --kind micro         # fluorescence micrograph, whole dish (last snapshot)
 python3 tools/render.py  runs/<name> --kind micro --cell 7 --step 120000    # zoom on track 7
 python3 tools/render.py  runs/<name> --kind goodsell [--cell 7] [--step S]  # watercolour molecular illustration
 python3 tools/render.py  runs/<name> --kind timelapse [--cell 7] [--panels 5] --width 3600
 python3 tools/video.py   runs/<name> --out beelden/<name>.mp4 [--fps 12 --width 1080 --interp 2]
 python3 tools/make_synthetic.py runs/synth                # FAKE test run (flagged synthetic = 1)
+python3 tools/selftest.py                                 # self-test of all tools on synthetic data (~1 min)
 python3 tools/debug_cells.py runs/<name> --step S --out /tmp/d.png   # beads + detected lumens
 python3 tools/render.py  runs/<name> --kind goodsell --step S --at X Y --zoom 40   # any region, no cell needed
 ```
@@ -22,8 +23,13 @@ python3 tools/render.py  runs/<name> --kind goodsell --step S --at X Y --zoom 40
 * By default images go to `cel/beelden/<run>_<kind>_<...>.png`. Synthetic runs write to
   `runs/<name>/beelden_test/` instead and carry a "SYNTHETISCHE TESTDATA" label.
 * `analyze.py` caches per-snapshot detection in `runs/<name>/analysis_cache/`, so re-running it on a
-  growing run only processes new snapshots. Detection uses 2 processes (`--jobs`). Measured cost:
-  about 25 ms per snapshot at N = 28k beads.
+  growing run only processes new snapshots. Detection and linking use 2 processes (`--jobs`; the
+  number is lowered automatically when the processes would not fit in the free RAM, see "Large
+  boxes" below). Measured cost: about 25 ms per snapshot at N = 28k beads.
+* Every output file (cells.json, lineage.json, checklist.*, the cache, PNGs, MP4s) is written to
+  a temporary file `name.<pid>.tmp.<ext>` in the same directory and then renamed over the target,
+  so a killed tool never leaves a truncated file. Leftovers of killed processes are removed the
+  next time the tool runs.
 * Scale bars assume 1 r_c ≈ 1 nm (a bilayer in this model is about 4 r_c thick; a real one is
   4-5 nm). Change this with `--rc-nm`. Time is shown in DPD units τ, and the step number is
   always shown too.
@@ -34,9 +40,11 @@ python3 tools/render.py  runs/<name> --kind goodsell --step S --at X Y --zoom 40
    (`H-T-T-T`, `H-H-T-T-T-T`, ...).
 2. A membrane is a set of molecules joined by tail-tail contacts (T-T < 1.0, periodic KD-tree).
 3. Each membrane with at least 12 lipids is unwrapped across the periodic boundaries by a
-   breadth-first walk over its bonds and tail contacts. If the walk is inconsistent, the membrane
-   wraps the torus. It is then rasterised on the full periodic grid with 3x3 tiling, where
-   "enclosed" means "does not reach the edge of the tiling" (contractible).
+   breadth-first walk over its bonds and tail contacts, and rasterised in its own bounding box.
+   If the walk is inconsistent, the membrane wraps the torus. It is then rasterised on one
+   periodic copy of the full grid; a solvent region counts as enclosed when it is contractible,
+   i.e. when following it across the box edges never brings it back onto itself with a shift
+   (this is what the former 3x3 tiling tested, at 1/9 of the pixels).
 4. The membrane's H+T beads are stamped as disks (r = 0.75) on a 0.25 grid. Holes are solvent
    regions that are not connected to the outside (4-connectivity).
 5. A hole counts as a **cell** only if all of these hold:
@@ -145,6 +153,45 @@ Caveats such as synthetic data, a seeded init, or the fallback division are writ
 * **video** (`video.py`): whole-dish micrographs, rendered with 2 processes and piped into ffmpeg
   (H.264, yuv420p, crf 18). Camera noise is new each frame, molecules keep their dye load, and
   `--interp k` adds cross-fades.
+
+## Large boxes (GPU runs, L = 512-2048)
+
+Measured on real snapshots (`runs/memA_F2`, L = 128, 11 vesicles) tiled k x k into bigger
+periodic boxes, 1 thread per process. Detection results are identical to the former code at every
+size; the micrographs are bit-identical where the former code could make them.
+
+| L | beads | detection per snapshot (before -> now) | micro whole dish (before -> now) |
+|---|---|---|---|
+| 128 | 49 k | 0.14 s / 94 MB -> 0.08 s / 77 MB | |
+| 256 | 197 k | 0.56 s / 162 MB -> 0.36 s / 99 MB | |
+| 512 | 786 k | 2.8 s / 392 MB -> 1.8 s / 189 MB | |
+| 1024 | 3.1 M | 14 s / 1.33 GB -> 6.3 s / 0.55 GB | 2000 px: 15.6 s / 1.54 GB -> 14.9 s / 0.96 GB |
+| 2048 | 12.6 M | 131 s / 4.9 GB -> 28.5 s / 2.0 GB | 2000 px: 24.9 s / 2.06 GB -> 19.8 s / 1.49 GB; 4000 px: 30 s / 1.49 GB |
+
+* `cells.py`: per-aggregate work no longer touches arrays of all beads; disks are stamped by a
+  periodic dilation; wrapping membranes use one grid copy; the wall-to-medium distance is computed
+  in a window around each lumen; full-box grids are bool/int16 (int32 above 32 767 cells, so
+  labels never overflow).
+* `analyze.py --jobs N` is capped to what fits in `MemAvailable` (or `--ram-gb G`) with an
+  estimate of 1.25 x (90 MB + 80 B/bead + 26 B/pixel) per detection process (about 1.0 GB at
+  L = 1024, 3.6 GB at L = 2048). It prints a line when it lowers N. The estimate is set by the
+  worst case measured, one membrane network spanning the whole box (sponge phase, `memA_n05`
+  tiled, 25 % lipid beads): 0.73 GB at L = 1000 and 2.67 GB at L = 2000 (a box of vesicles,
+  `memA_F2` tiled to L = 2048: 1.44 GB). Review 2026-10-12: the first estimate (2.6 GB at L = 2000)
+  was below the sponge peak (then 3.49 GB); `_unwrap_tree` and the torus hole search now free
+  their temporaries early, which brought the peak down to 2.67 GB with identical results.
+* The linking phase (lumen overlaps between snapshots, new lipids, event attribution) runs in
+  parallel over blocks of consecutive snapshots. Events are attributed with a distance transform
+  in small windows around them, not over the whole box (same result, checked pixel by pixel).
+* The main process keeps every cell observation in memory: about 2 KB per cell per snapshot
+  (cells.json about 0.4 KB). An L = 2048 box with ~3000 cells and 500 snapshots needs ~3 GB here;
+  use `--every k` if that is too much.
+* `render.py --kind micro` without `--width` makes whole-dish images of boxes larger than
+  L = 1024 2000 x L / 1024 px wide (at most 4000 px), so membranes stay about 2 px per unit. Very
+  large images run in single precision and without supersampling once the PSF spans a pixel.
+  Zoomed views (`--at/--zoom/--cell`) only process the beads near the view. cells.json and
+  lineage.json are only read when the image needs them (they can be large).
+* `video.py --jobs` is capped to the free RAM in the same way (about 2 GB per process at L = 2048).
 
 ## Known limitations
 

@@ -59,7 +59,13 @@ def main():
     ax.set_aspect("equal")
     ax.set_title(f"{os.path.basename(a.rundir)} step {s.step}: {len(r['cells'])} cells, summary {r['summary']}", fontsize=9)
     out = a.out or f"/tmp/debug_{s.step}.png"
-    fig.savefig(out, dpi=80, bbox_inches="tight")
+    tmp = ocio.tmp_path(out)
+    try:
+        fig.savefig(tmp, dpi=80, bbox_inches="tight", format=os.path.splitext(out)[1].lstrip(".") or "png")
+        ocio._commit(tmp, out)
+    except BaseException:
+        ocio._discard(tmp)
+        raise
     print(out)
 
 

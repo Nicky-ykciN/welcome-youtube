@@ -23,7 +23,7 @@
 
 
 # 1. oersoep_groot — de grote proef op de GPU.  Een willekeurige soep van 512 x 512 (786.000 deeltjes,
-#    26x de testdoos van L = 100), chemie aan, 50 miljoen stappen.  Duur: geschat 1-3 dagen (de
+#    26x de testdoos van L = 100), chemie aan, 50 miljoen stappen.  Duur: geschat een halve dag tot 3 dagen (de
 #    snelheid op de RTX 8000 is nog nooit gemeten; setup meet hem).  Elke 2 uur analyse + beelden in
 #    cel/beelden/oersoep_groot/.  Snapshot elke 10.000 stappen (~8 MB); longrun.py dunt oude snapshots
 #    uit (rond elke deling blijft alles) en houdt hooguit 50 GB aan snapshots.

@@ -184,8 +184,8 @@ cleanup() {
   [ "$(id -u)" -eq 0 ] && [ "$OWNER" != "root" ] && chown -R "$OWNER": "$LOGDIR" "$PC_DIR/_build" 2>/dev/null
 }
 trap cleanup EXIT
-# apt-get: wait up to 10 min for the dpkg lock instead of failing at once
-APT=(env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 -y -q)
+# apt-get: wait up to 10 min for the dpkg lock instead of failing at once; never a question (debconf, needrestart)
+APT=(env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -o DPkg::Lock::Timeout=600 -y -q)
 # run a command as root (or show it in dry-run / without root)
 priv() {
   if [ "$DRY" = 1 ]; then echo "  [droog] $*" >&2; return 0; fi

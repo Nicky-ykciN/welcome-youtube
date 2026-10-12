@@ -213,3 +213,68 @@ Voortgang:
   Snelheid hier: L=100 chemie aan, 2 threads: 1,3 ms/stap. VOLGENDE: tests (pc/tests/test_start.sh) met nep-HOME,
   nep-claude/curl/nvidia-smi, echte tmux op eigen socket (-L), nep-setup (OERCEL_SETUP_CMD), OERCEL_RUNS in scratch.
 - [04:58] tests/test_start.sh geschreven (14 secties); eerste run gestart -> _test/start.log
+- [05:00] eerste testrun: 13 secties PASS; 1 FAIL = testfout (wait_for evalueerde $(..) maar één keer) -> wait_for
+  eval't nu een string. Wrapper herstart Claude wel echt (claude_rc.log). Daarna gewijzigd: plan.py draait scripts
+  vanuit de repo-root (hints 'python3 cel/pc/...'); setup wordt na 3 mislukte pogingen op rij niet meer
+  automatisch herhaald (behalve als nvidia-smi nu werkt en het log 'nvidia-smi werkt niet' had, of als CPU-engine/
+  python ontbreken); --setup forceert. STARTEN.md (root) en README.md (§0 start.sh, tabel, tests, niet-getest) klaar.
+  VOLGENDE: test sectie 8 uitbreiden (3x mislukt -> niet meer; --setup; gpu-uitzondering), test opnieuw draaien.
+- [05:10] testrun 2: 74 PASS, 0 FAIL (incl. sectie 8 met herhaal-limiet). Leftover-processen: zie volgende regel
+- [05:15] start.sh --help/stop.sh --help netjes (alleen kopcommentaar). leven_scan: 108 jobs, 0 onbekende sleutels
+  (CPU- en GPU-engine), 3 jobs (eerste/midden/laatste) met alle waarden 200 stappen door engine/oercel: OK.
+  Terugvalregel oersoep_groot door engine_gpu/oercel_emu (L=24, 50 stappen): OK. plan.py start --droog op het
+  echte plan: juiste commando's (absolute paden). Testdata opgeruimd (transcripts blijven in _test/start/).
+  Laatste volledige testrun loopt (_test/start.log). Daarna: eindrapport.
+- [05:22] laatste volledige testrun: 74 PASS, 0 FAIL (_test/start.log). Geen achtergebleven processen. KLAAR -> rapport.
+
+## REVIEW START-TAAK (independent reviewer #2, 2026-10-12) — simulate the user tomorrow following STARTEN.md
+Scope: fix only in cel/pc/ and STARTEN.md. Tests: fake HOME/PATH stand-ins, tiny CPU runs, 1-2 threads,
+test dirs under cel/pc/_test/review2/. setup_wsl.sh NEVER for real here (root; see Incident).
+- [stap 0] read CLAUDE.md, STARTEN.md, start.sh, stop.sh, claude_rc.sh, plan.txt, plan.py, setup_wsl.sh, NOTES.
+- [stap 1] simulations harness: pc/_test/review2/sim/ (env.sh = stand-ins incl. fake 'sudo password' prompt in the fake
+  setup, fake claude with Trust [y/N] + Enable (y/n) + --continue; scenA.sh/scenB.sh ...).
+  A (fresh user, literally STARTEN): PASS end to end.
+  B (user presses Ctrl+b d before answering Trust, runs start.sh again): BUG CONFIRMED — start.sh says
+  "draait al" and never shows the waiting prompt -> Claude never reaches the app. Root cause 1: the
+  "peek for prompts" used `tmux capture-pane -t =SES`, which tmux 3.4 rejects ("can't find pane") -> the
+  later-start prompt detection NEVER worked (the author's test only checked the negative case).
+  Root cause 2: no prompt check at all in the 'draait'/'herstart' case. FIX NEXT in start.sh.
+  Other findings so far (to fix): lock held while the user sits attached in tmux (blocks Claude's
+  start.sh --alleen-plan); STARTEN 'claude auth login' fails in the same window (PATH); setup's "Volgende
+  stap: start Claude Code" text inside start.sh misleads; lifeB_src engine has new keys (feed_duty,
+  feed_period, stir_duty, stir_mode, stir_period) unknown to engine/ and engine_gpu/ -> if production.ini
+  uses them, the 'als' line of oersoep_groot fails with FOUT every start (report, outside pc/).
+- [stap 2] FIXED in start.sh: rc_asks() (capture-pane -t "=SES:", only lines after the last claude.ai/code link,
+  last 8 lines) used after a new session AND when Claude 'draait al'; offer_attach() shared; lock released
+  before attaching; after detach: warning if a question is still open; "Volgende stap" note after setup;
+  PATH hint in summary; login fallback says "kies je Claude-abonnement". STARTEN.md rewritten (see report).
+  Scenarios A, B (now PASS: second start brings the user back to the waiting question), C (two terminals:
+  second says 'draait al', setup 1x; Claude's start.sh --alleen-plan works while user is attached),
+  D (reboot: resume + --continue + re-asked Trust shown; no attach without a question; --continue failure
+  -> wrapper retries without) ALL PASS. NEXT: fix test_start.sh section 12 (its negative check matched an
+  old text), BLAS env for tool processes, plan/production.ini checks, disk/thread numbers.
+- [stap 3] measured: analyze.py on a 121-snapshot L=100 run: 132 MB max RSS, 9 s (54 at once ~7 GB: ok).
+  Fallback chemistry L=48 30k steps: snapshot 10.6 B/bead (L=512: 8.3 MB), ckpt 58 B/bead (L=512: 45 MB),
+  events.csv 1.6e-8 B/bead/step (L=512, 50M steps: ~0.6 GB). oersoep_groot disk is bounded by
+  --max-snap-gb 50 (+~1 GB) -> fine. Added pclib.tool_env() (OMP/OPENBLAS/MKL threads=1) for analysis/render
+  subprocesses in longrun.py + sweep.py (pip numpy of the venv fallback would start a 128-thread pool per process).
+  production.ini with unknown keys (scenP.sh): 'als' line FOUT every start, fallback not used, GPU idle ->
+  message now says so + stale "runs/memB_src" hint in longrun replaced. lifeB_src engine HAS such keys.
+- [stap 4] claude_rc.sh: after 5 quick failures it used to `exec bash -i` = Claude gone for good after a network
+  outage > ~12 min (10 min server timeout + 5 x 30 s) until someone runs start.sh. Now: message stays, retry every
+  10 min (OERCEL_RC_BACKOFF_S), marker _build/claude_rc.wacht; start.sh in that state restarts at once.
+  scenN.sh (fake offline): ALL PASS. NEEDRESTART_MODE=a added to apt (setup_wsl.sh APT, start.sh apt_install).
+  test_start.sh: section 12's negative check updated to the new text; new section 15 (question left open,
+  lock free during attach). First full run: 1 FAIL = my own test quoting bug (pgrep matched its bash -c
+  parent) -> fixed. README §0/tests/untested updated. NEXT: full test_start.sh again, then report.
+- [stap 5] full tests/test_start.sh with all fixes: 83 PASS, 0 FAIL (pc/_test/review2/start_full.log).
+  STARTEN.md: password step says "meteen daarna" + sudo gives up after minutes. status.py "clone"->"kloon".
+  Running now: test_thinning + test_sweep_kill (tool_env change) -> pc/_test/review2/{thin,sweepkill}.log;
+  then re-run sim scenarios A, B, CD, N, P on the final code; then report.
+- [stap 6] regression: test_thinning PASS; test_sweep_kill 1st run 1 FAIL = timing flake (the engine had already
+  finished its 6-s chunk when the test killed it: "kill: No such process"), 2nd run ALL PASS. Final re-run of
+  sim scenarios A, B, CD, N, P on the final code: ALL PASS (pc/_test/review2/scen*.final.log). bash -n on all
+  .sh, py_compile on all .py, setup --test-functies 0 errors. Test run data deleted (logs kept). REVIEW DONE.
+  Not fixable in pc/ (for the main session): permission prompts in the app (user decision: allowlist in
+  .claude/settings.json or --permission-mode), git push credentials on the workstation, merge the lifeB engine
+  keys into engine/ + engine_gpu/ before production.ini uses them.

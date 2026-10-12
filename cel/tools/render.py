@@ -14,6 +14,11 @@ usage:
 time, unlike per-snapshot cell indices.  --step picks the nearest snapshot (default: the last;
 for goodsell without --step: the most constricted frame before the first division, if any).
 Default output: cel/beelden/<run>_<kind>_<...>.png
+
+--width defaults to 2000 px; a whole-dish micrograph of a box larger than L = 1024 gets
+2000 * L / 1024 px (at most 4000) so membranes stay about 2 px per unit length.  Images are
+written to a temporary file and renamed, so a killed render never leaves a half PNG.
+The analysis (cells.json, lineage.json) is only read when the image needs it.
 """
 import argparse
 import json
@@ -30,6 +35,8 @@ BEELDEN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 
 def load_analysis(rundir):
+    """(cells.json, lineage.json) or (None, None).  Can be large for big runs: only call it when
+    the image needs cell or track information."""
     cj = os.path.join(rundir, "cells.json"); lj = os.path.join(rundir, "lineage.json")
     if os.path.exists(cj) and os.path.exists(lj):
         with open(cj) as f:
@@ -107,7 +114,8 @@ def main():
     ap.add_argument("--step", type=int, default=None)
     ap.add_argument("--cell", type=int, default=None, help="track id (spoor) from lineage.json")
     ap.add_argument("--out", default=None)
-    ap.add_argument("--width", type=int, default=2000)
+    ap.add_argument("--width", type=int, default=None,
+                    help="image width in px (default 2000; whole-dish micro of L > 1024: up to 4000)")
     ap.add_argument("--panels", type=int, default=5)
     ap.add_argument("--zoom", type=float, default=None, help="field of view in sim units (micro/goodsell)")
     ap.add_argument("--at", type=float, nargs=2, default=None, metavar=("X", "Y"),
@@ -117,8 +125,12 @@ def main():
     a = ap.parse_args()
     style.RC_NM = a.rc_nm
     rundir = a.rundir.rstrip("/")
-    cells_json, lin = load_analysis(rundir)
+    need_analysis = a.cell is not None or a.kind == "timelapse" or (a.kind == "goodsell" and a.step is None)
+    cells_json, lin = load_analysis(rundir) if need_analysis else (None, None)
     params = ocio.read_params(rundir)
+    width_given = a.width is not None
+    if not width_given:
+        a.width = 2000
     synth = bool(params.get("synthetic", 0))
 
     if a.kind == "micro":
@@ -142,9 +154,11 @@ def main():
                 view = rm.cell_view(snap.L, cx, cy, min(a.zoom or 40.0, snap.L))
         if synth:
             title = (title + " · " if title else "") + "SYNTHETISCHE TESTDATA"
+        if view is None and not width_given and snap.L > 1024:
+            a.width = min(4000, int(round(2000 * snap.L / 1024)))   # keep ~2 px per unit length
         img, info = rm.render(snap, view, a.width, ss=2, legend=not a.no_legend, title=title)
         out = a.out or default_out(rundir, "micro", f"{snap.step:010d}" + (f"_spoor{a.cell}" if a.cell is not None else ""))
-        img.save(out, optimize=True)
+        ocio.save_image_atomic(img, out, optimize=True)
         print(f"[render] {out}  ({img.size[0]}x{img.size[1]}, stap {snap.step}, norm {info['norm']})")
 
     elif a.kind == "goodsell":
@@ -189,7 +203,7 @@ def main():
         img = rg.render(snap, (c["x"], c["y"]), size, width=a.width, label_grid=lab, label_h=h, title=title,
                         subtitle=sub, legend=not a.no_legend)
         out = a.out or default_out(rundir, "goodsell", f"{snap.step:010d}" + (f"_spoor{track}" if track is not None else ""))
-        img.save(out, optimize=True)
+        ocio.save_image_atomic(img, out, optimize=True)
         print(f"[render] {out}  ({img.size[0]}x{img.size[1]}, stap {snap.step}, centrum ({c['x']:.1f}, {c['y']:.1f}))")
 
     else:
@@ -208,7 +222,7 @@ def main():
         panel = max(320, int(a.width / a.panels))
         img, panels = rt.render(rundir, cells_json, lin, e, panel_px=panel, n_panels=a.panels)
         out = a.out or default_out(rundir, "timelapse", f"spoor{e['parents'][0]}")
-        img.save(out, optimize=True)
+        ocio.save_image_atomic(img, out, optimize=True)
         print(f"[render] {out}  ({img.size[0]}x{img.size[1]})  panelen: " +
               ", ".join(f"{p['label']}@{p['step']}" for p in panels))
 

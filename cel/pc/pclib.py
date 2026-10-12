@@ -67,6 +67,17 @@ def beelden_dir(arg=None):
     return os.path.abspath(arg or os.environ.get("OERCEL_BEELDEN") or os.path.join(CEL, "beelden"))
 
 
+def tool_env():
+    """Environment for tools/*.py subprocesses (analysis, images): one BLAS/OpenMP thread each.  A pip-installed
+    numpy (the venv fallback of setup_wsl.sh) otherwise starts a thread pool per process sized to all CPUs, and
+    up to 54 sweep analyses + 8 long-run analysis workers run at once on the 128-thread workstation.  The tools
+    parallelise with their own --jobs processes (and scipy.fft workers=), not through BLAS."""
+    env = dict(os.environ)
+    for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        env.setdefault(k, "1")
+    return env
+
+
 def tools_python():
     """Python used for tools/*.py: the venv made by setup_wsl.sh if it exists, else this one."""
     if os.path.isfile(VENV_PY) and os.access(VENV_PY, os.X_OK):

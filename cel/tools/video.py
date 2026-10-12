@@ -9,6 +9,10 @@ yuv420p, crf 18).  One fixed normalisation ('exposure') is used for the whole fi
 on a few sample snapshots, so brightness does not flicker.  Camera noise is re-drawn per frame
 (like a real detector) but each molecule keeps its dye brightness.  --interp k inserts k
 cross-faded frames between snapshots (smoother when snapshots are sparse).
+
+The film is written to a temporary file next to --out and renamed when ffmpeg has finished, so
+an interrupted run never leaves a truncated MP4.  --jobs is capped to the free RAM (a frame of
+an L = 2048 box needs ~2 GB per process).
 """
 import argparse
 import os
@@ -56,6 +60,11 @@ def calibrate(paths, width, n=6):
     return out
 
 
+def frame_mem_estimate(n_beads, width):
+    """Peak memory of one frame-rendering process (bytes): bead arrays + channel grids + image."""
+    return int(1.3 * (100e6 + 110 * n_beads + 60 * width * width))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("rundir")
@@ -82,17 +91,46 @@ def main():
         raise SystemExit("geen snapshots")
     paths = [p for _, p in snaps]
     synth = bool(ocio.read_params(a.rundir).get("synthetic", 0))
+    hdr = ocio.read_header(paths[-1])
+    jobs = ocio.cap_jobs(max(1, a.jobs), frame_mem_estimate(hdr["N"], width), "frames", tool="video")
     norm = calibrate(paths, width)
     print(f"[video] {len(paths)} snapshots, {width}x{width}, fps {a.fps}, norm {norm}", flush=True)
+    out_dir = os.path.dirname(os.path.abspath(a.out))
+    os.makedirs(out_dir, exist_ok=True)
+    ocio.cleanup_stale_tmp(out_dir, (os.path.splitext(os.path.basename(a.out))[0] + ".",))
+    tmp = ocio.tmp_path(a.out)
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
            "-s", f"{width}x{width}", "-r", str(a.fps), "-i", "-",
            "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p",
-           "-movflags", "+faststart", a.out]
+           "-movflags", "+faststart", tmp]
     ff = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    try:
+        nframes = encode(a, ff, paths, norm, width, synth, jobs)
+    except BaseException:
+        ff.kill()
+        ff.wait()
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    rc = ff.wait()
+    if rc != 0:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise SystemExit(f"ffmpeg faalde (code {rc})")
+    ocio._commit(tmp, a.out)          # fsync + rename (same as the other tool outputs)
+    print(f"[video] {a.out}: {nframes} frames, {nframes / a.fps:.1f} s")
+
+
+def encode(a, ff, paths, norm, width, synth, jobs):
+    """Render the frames in parallel and pipe them into ffmpeg; returns the number of frames."""
     t0 = time.time()
     prev = None
     nframes = 0
-    with get_context("fork").Pool(max(1, a.jobs), initializer=_init, initargs=(norm, width, synth, len(paths))) as pool:
+    with get_context("fork").Pool(jobs, initializer=_init, initargs=(norm, width, synth, len(paths))) as pool:
         for i, fr in enumerate(pool.imap(_frame, list(enumerate(paths)), chunksize=1)):
             if prev is not None and a.interp > 0:
                 for j in range(1, a.interp + 1):
@@ -106,10 +144,8 @@ def main():
     for _ in range(int(round(a.hold * a.fps))):
         ff.stdin.write(prev.tobytes()); nframes += 1
     ff.stdin.close()
-    rc = ff.wait()
-    if rc != 0:
-        raise SystemExit(f"ffmpeg faalde (code {rc})")
-    print(f"[video] {a.out}: {nframes} frames, {nframes / a.fps:.1f} s ({time.time() - t0:.0f} s rekentijd)")
+    print(f"[video] {nframes} frames gerenderd ({time.time() - t0:.0f} s rekentijd)", flush=True)
+    return nframes
 
 
 if __name__ == "__main__":

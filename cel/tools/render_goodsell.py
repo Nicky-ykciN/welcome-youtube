@@ -72,13 +72,18 @@ def protein_lobes(c, r0, ident):
     return lobes
 
 
-def _molecules(snap, idx_set):
-    """Lipid chains (head first) for molecules with at least one bead in idx_set."""
+def _molecules(snap, idx_set, near=None):
+    """Lipid chains (head first) for molecules with at least one bead in idx_set.
+    near (optional bool per bead): beads around the view; only bonds between near beads are
+    considered (every molecule that touches idx_set lies entirely in near), which keeps this
+    fast for boxes with millions of beads.  Same chains as without it."""
     t = snap.type
     b = snap.bonds
-    lip = (t == H) | (t == T)
     if len(b) == 0:
         return []
+    if near is not None:
+        b = b[near[b[:, 0]] & near[b[:, 1]]]
+    lip = (t == H) | (t == T)
     b = b[lip[b[:, 0]] & lip[b[:, 1]]]
     adj = {}
     for i, j in b.tolist():
@@ -172,6 +177,8 @@ def render(snap, center, size, width=2000, ss=3, label_grid=None, label_h=None, 
     d = pos - np.array([cx, cy]); d -= L * np.round(d / L)
     margin = 2.0
     inview = (np.abs(d[:, 0]) < size / 2 + margin) & (np.abs(d[:, 1]) < size / 2 + margin)
+    # beads close enough to belong to a molecule that reaches into the view (a lipid is < 3 units long)
+    near = (np.abs(d[:, 0]) < size / 2 + margin + 8.0) & (np.abs(d[:, 1]) < size / 2 + margin + 8.0)
     t = snap.type
 
     def P(i):
@@ -204,7 +211,7 @@ def render(snap, center, size, width=2000, ss=3, label_grid=None, label_h=None, 
 
     # lipids
     idx = np.nonzero(inview & ((t == H) | (t == T)))[0]
-    chains = _molecules(snap, set(idx.tolist()))
+    chains = _molecules(snap, set(idx.tolist()), near)
     chains = [c for c in chains if all(visible(i, SIZES["head_r"]) for i in c)]
     tw = SIZES["tail_w"] * S
     # pass 1: tail band, union outline (all outlines, then all fills)
@@ -248,7 +255,8 @@ def render(snap, center, size, width=2000, ss=3, label_grid=None, label_h=None, 
     zi = np.nonzero(inview & (t == Z))[0]
     if len(zi):
         zs = set(zi.tolist())
-        for i, j in snap.bonds.tolist():
+        bz = snap.bonds[near[snap.bonds[:, 0]] & near[snap.bonds[:, 1]]] if len(snap.bonds) else snap.bonds
+        for i, j in bz.tolist():
             if i in zs and j in zs:
                 draw.line([P(i), P(j)], fill=_c(PAL["z_ink"]), width=int(0.5 * S))
         for i in zi:

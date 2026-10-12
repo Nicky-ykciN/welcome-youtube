@@ -293,7 +293,7 @@ class Sweep:
         cmd = [P.tools_python(), os.path.join(P.TOOLS, "analyze.py"), d, "--jobs", "1", "--quiet"]
         with open(logp, "a") as f:
             f.write(f"[{P.stamp()}] {' '.join(cmd)}\n")
-        p = P.popen_child(cmd, logp, cwd=P.CEL, stdout_too=True)
+        p = P.popen_child(cmd, logp, cwd=P.CEL, stdout_too=True, env=P.tool_env())
         s["status"] = "analyse"
         self.slots.append(dict(kind="analyse", job=j, proc=p, t0=time.time()))
 

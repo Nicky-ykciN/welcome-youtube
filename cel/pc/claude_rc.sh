@@ -3,8 +3,9 @@
 #
 # Draait `claude remote-control --name "Oercel werkstation"` in de repo-map en start het vanzelf
 # opnieuw als het stopt (de server stopt bijvoorbeeld na ~10 minuten zonder netwerk); bij een herstart
-# met --continue, zodat het gesprek verdergaat.  Stopt na 5 snelle mislukkingen achter elkaar (dan
-# blijft de melding in beeld staan).  Ctrl+C stopt Claude en deze lus.
+# met --continue, zodat het gesprek verdergaat.  Na 5 snelle mislukkingen achter elkaar blijft de melding
+# in beeld staan en probeert het elke 10 minuten opnieuw (een netwerkstoring van een uur mag Claude niet
+# voorgoed stoppen); bash cel/pc/start.sh probeert het dan meteen opnieuw.  Ctrl+C stopt Claude en deze lus.
 # Log: cel/pc/_build/claude_rc.log.   Stoppen van buitenaf: bash cel/pc/stop.sh --alles
 set -u
 # start.sh passes its environment through a file (HOME, PATH, CLAUDE_BIN, OERCEL_*)
@@ -15,6 +16,8 @@ REPO=$(dirname "$CEL")
 STATE=${OERCEL_START_STATE:-$PC_DIR/_build}
 mkdir -p "$STATE" 2>/dev/null
 LOG=$STATE/claude_rc.log
+WAIT_MARK=$STATE/claude_rc.wacht      # exists while waiting after 5 quick failures (start.sh then restarts at once)
+rm -f "$WAIT_MARK"
 NAME=${OERCEL_CLAUDE_NAME:-Oercel werkstation}
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
 CLAUDE_BIN=${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}
@@ -41,13 +44,17 @@ while :; do
     cont=1            # na een echte sessie: bij herstart het gesprek hervatten
   fi
   if [ "$quick" -ge 5 ]; then
+    wait_s=${OERCEL_RC_BACKOFF_S:-600}
     echo
-    echo "Claude Remote Control stopte 5 keer snel achter elkaar (laatste code $rc); ik probeer het niet meer."
-    echo "Mogelijke oorzaken: niet ingelogd (typ: claude auth login), geen internet, of een abonnement"
-    echo "zonder Remote Control.  Log: $LOG"
-    echo "Opnieuw proberen: bash cel/pc/start.sh   (dit venster sluiten: exit)"
-    printf '[%s] gestopt na 5 snelle mislukkingen\n' "$(date '+%F %T')" >> "$LOG"
-    exec bash -i
+    echo "Claude Remote Control stopte $quick keer snel achter elkaar (laatste code $rc)."
+    echo "Mogelijke oorzaken: geen internet, niet ingelogd (typ in Ubuntu: ~/.local/bin/claude auth login),"
+    echo "of een abonnement zonder Remote Control.  Log: $LOG"
+    echo "Ik probeer het over $((wait_s / 60)) minuten opnieuw; meteen: bash cel/pc/start.sh  (stoppen: Ctrl+C)"
+    printf '[%s] %s snelle mislukkingen; volgende poging over %s s\n' "$(date '+%F %T')" "$quick" "$wait_s" >> "$LOG"
+    : > "$WAIT_MARK"
+    sleep "$wait_s"
+    rm -f "$WAIT_MARK"
+    continue
   fi
   echo
   echo "Claude Remote Control is gestopt (code $rc). Over ${OERCEL_RC_RESTART_S:-30} seconden start ik hem opnieuw (Ctrl+C = niet doen)."

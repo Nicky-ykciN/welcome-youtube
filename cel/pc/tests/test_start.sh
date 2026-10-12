@@ -19,6 +19,7 @@
 #  12. stop.sh --alles -> tmux weg; start.sh -> Claude opnieuw (met --continue), geen vraag dus geen attach
 #  13. Claude stopt in tmux -> de wrapper start hem opnieuw; tmux-sessie zonder Claude -> vervangen
 #  14. klaar + het plan wil meer stappen -> hervat tot het nieuwe doel
+#  15. vraag in tmux niet beantwoord (te vroeg Ctrl+b d) -> start.sh brengt je terug; het slot is vrij tijdens attach
 # usage: bash cel/pc/tests/test_start.sh [outdir]      (default cel/pc/_test/start; ~5-10 minuten, 1 thread)
 set -u
 CEL=$(cd "$(dirname "$0")/../.." && pwd)
@@ -82,6 +83,7 @@ cat > "$T/bin/fake_setup.sh" <<'EOF'
 d=$OERCEL_SETUP_LOGDIR; mkdir -p "$d"; LOG=$d/setup_$(date +%Y%m%d_%H%M%S)_$$.log
 echo "$(date +%T) tty=$([ -t 0 ] && echo ja || echo nee) resultaat=${FAKE_SETUP_RESULT:-ok}" >> "$HOME/fake_setup_calls.log"
 { echo "Oercel setup (NEP) — log: $LOG"; echo; echo "=== SAMENVATTING ==="
+  [ "${FAKE_SETUP_RESULT:-ok}" = gpu ] && echo "  FOUT          GPU              nvidia-smi werkt niet in WSL2. Installeer/actualiseer de NVIDIA-driver in WINDOWS"
   if [ "${FAKE_SETUP_RESULT:-ok}" = ok ]; then echo "Klaar. Volgende stap: start Claude Code in de repo"; else echo "1 onderdeel/onderdelen met FOUT (zie boven en $LOG)."; fi
 } | tee "$LOG"
 [ "${FAKE_SETUP_RESULT:-ok}" = ok ]
@@ -308,8 +310,19 @@ FAKE_SETUP_RESULT=fout S --geen-claude > "$T/s8b.txt"
 check "tweede start: eerst hervatten, dan setup, dan plan nog eens" python3 -c "
 t=open('$T/s8b.txt').read(); a=t.find('Experimenten hervatten (vóór de nieuwe installatiepoging)'); b=t.find('1. Installatie'); c=t.find('plan nog eens')
 assert 0 <= a < b < c, (a, b, c)"
-n0=$(nsetup); S --geen-claude > "$T/s8c.txt"; n1=$(nsetup); S --geen-claude > "$T/s8d.txt"; n2=$(nsetup)
-check "na een geslaagde setup niet meer ($n0 -> $n1 -> $n2)" test $((n1 - n0)) = 1 -a $((n2 - n1)) = 0
+FAKE_SETUP_RESULT=fout S --geen-claude > "$T/s8c.txt"
+n0=$(nsetup); FAKE_SETUP_RESULT=fout S --geen-claude > "$T/s8d.txt"; n1=$(nsetup)
+check "na 3x mislukt op rij niet meer automatisch ($n0 -> $n1)" test "$n1" = "$n0"
+check "  ... met uitleg en het commando --setup" grep -q "3x achter elkaar mislukt.*" "$T/s8d.txt"
+FAKE_SETUP_RESULT=gpu S --setup --geen-claude > "$T/s8e.txt"
+check "--setup forceert een poging" test "$(nsetup)" = $((n1 + 1))
+n0=$(nsetup); S --geen-claude > "$T/s8f.txt"; n1=$(nsetup)
+check "log zei 'nvidia-smi werkt niet' en nu werkt de GPU: toch opnieuw ($n0 -> $n1)" test "$n1" = $((n0 + 1))
+check "  ... met melding" grep -q "De GPU werkt nu wel" "$T/s8f.txt"
+S --geen-claude > "$T/s8g.txt"; n2=$(nsetup)
+check "na een geslaagde setup niet meer ($n1 -> $n2)" test "$n2" = "$n1"
+S --setup --geen-claude > "$T/s8h.txt"
+check "--setup na een geslaagde setup: opnieuw, met passende melding" grep -q "Installatie opnieuw (--setup)" "$T/s8h.txt"
 export OERCEL_SETUP_LOGDIR=$T/setup_logs
 
 # ------------------------------------------------------------------------------ 9. runs outside the plan
@@ -363,7 +376,7 @@ check "geen Claude meer" wait_for 10 'test "$(nrc)" = 0'
 S > "$T/s12b.txt"
 check "Claude opnieuw gestart in tmux" grep -q "tmux-sessie 'oercel-claude' gestart" "$T/s12b.txt"
 check "  ... met --continue (vorige sessie bestond)" wait_for 10 'grep -q "remote-control --name Oercel werkstation --continue" "$HOME/fake_claude.log"'
-check "  ... geen vraag in beeld, dus geen attach-melding" bash -c "! grep -q 'beantwoord die in een terminal' '$T/s12b.txt'"
+check "  ... geen vraag in beeld, dus geen attach-melding" bash -c "! grep -q 'wacht in tmux op een antwoord' '$T/s12b.txt'"
 check "experimenten hervat (stop.sh-merktekens)" grep -qE "groot \(lange run\): (HERVAT|klaar)" "$T/s12b.txt"
 
 # ------------------------------------------------------------------------------ 13. wrapper restarts claude
@@ -392,6 +405,34 @@ scan_done() { python3 -c "
 import json; d=json.load(open('$T/runs/scan/pc_sweep.json')); s=[v['status'] for v in d['state'].values()]
 assert len(s)==2 and all(x=='geanalyseerd' for x in s), s" 2>/dev/null; }
 check "sweep scan klaar en geanalyseerd" wait_for 120 scan_done
+
+# ------------------------------------------------------------------------------ 15. question left open
+echo "== 15. vraag niet beantwoord (te vroeg Ctrl+b d) -> start.sh brengt je terug; slot vrij tijdens attach =="
+bash "$PC/stop.sh" --alles > /dev/null 2>&1
+rm -f "$HOME/.claude/nep_rc_aan"          # Claude asks 'Enable Remote Control?' again
+PTY_LOG=$T/s15a.pty PTY_TIMEOUT=120 PTY_STEPS='[["naar Claude te gaan", "\r"], ["Remote Control? (y/n)", "\u0002\u0001d"]]' \
+  python3 "$T/pty_drive.py" bash "$PC/start.sh" --geen-setup > "$T/s15a.json"
+check "later start: vraag in tmux gezien (tmux capture-pane werkt), naar Claude geschakeld" \
+  python3 -c "import json; d=json.load(open('$T/s15a.json')); assert d['rc']==0 and not d['missing'], d"
+check "  ... na Ctrl+b d zonder antwoord: waarschuwing" grep -q "Claude wacht nog op een antwoord" "$T/s15a.pty"
+S --geen-setup > "$T/s15b.txt"
+check "  ... start.sh zonder terminal: hint 'tmux attach'" grep -q "Claude wacht in tmux op een antwoord" "$T/s15b.txt"
+check "  ... en geen tweede Claude" test "$(nrc)" = 1
+( PTY_LOG=$T/s15c.pty PTY_TIMEOUT=120 PTY_STEPS='[["naar Claude te gaan", "\r"], ["session_fake", "\u0002\u0001d"]]' \
+    python3 "$T/pty_drive.py" bash "$PC/start.sh" --geen-setup > "$T/s15c.json" ) &
+p15=$!
+wait_for 60 'tmux -L $SOCK capture-pane -p -t =oercel-claude: 2>/dev/null | grep -q "Remote Control? (y/n)" && grep -qs "naar Claude te gaan" "$T/s15c.pty"' > /dev/null
+sleep 2
+S --alleen-plan > "$T/s15d.txt"
+check "start.sh --alleen-plan werkt terwijl de gebruiker in het Claude-venster zit (slot vrijgegeven)" \
+  bash -c "! grep -q 'start.sh draait al' '$T/s15d.txt' && grep -q 'Experimentplan' '$T/s15d.txt'"
+tmux -L "$SOCK" send-keys -t =oercel-claude: y Enter
+wait $p15
+check "draait al + open vraag -> opnieuw naar Claude geschakeld, beantwoord, terug" \
+  python3 -c "import json; d=json.load(open('$T/s15c.json')); assert d['rc']==0 and not d['missing'], d"
+check "  ... 'Claude wacht daar nog op een antwoord' gemeld" grep -q "Claude wacht daar nog op een antwoord" "$T/s15c.pty"
+check "  ... geen valse waarschuwing na het beantwoorden" bash -c "! grep -q 'Claude wacht nog op een antwoord' '$T/s15c.pty'"
+check "  ... nog steeds precies één Claude" test "$(nrc)" = 1
 
 echo "== $fails fout(en) =="
 exit $fails

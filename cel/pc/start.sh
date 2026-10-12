@@ -29,7 +29,7 @@ TMUXC=(tmux)
 [ -n "${OERCEL_TMUX_SOCKET:-}" ] && TMUXC=(tmux -L "$OERCEL_TMUX_SOCKET")
 
 DO_SETUP=auto; DO_CLAUDE=1; DO_PLAN=1
-usage() { sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; }
 for arg in "$@"; do
   case "$arg" in
     --geen-setup) DO_SETUP=0 ;;
@@ -71,7 +71,7 @@ case "$REPO/" in
       say "In je Linux-thuismap staat al een kopie: $dest — ik ga daar verder."
     elif [ -e "$dest" ]; then
       say "Ik wilde een kopie maken in $dest, maar die map bestaat al (en is geen Oercel-repo)."
-      say "Hernoem die map, of clone de repo zelf:  git clone https://github.com/Nicky-ykciN/welcome-youtube ~/welcome-youtube"
+      say "Hernoem die map, of kloon de repo zelf:  git clone https://github.com/Nicky-ykciN/welcome-youtube ~/welcome-youtube"
       exit 1
     else
       if ! have git; then say "git ontbreekt: sudo apt-get install -y git, en start dit script opnieuw."; exit 1; fi
@@ -143,6 +143,8 @@ run_setup() {
     say "Eerste keer: dit duurt 20-50 minuten (CUDA-toolkit van enkele GB downloaden, engines bouwen, tests)."
     say "sudo vraagt zo één keer je Linux-wachtwoord (je ziet niets als je typt; daarna Enter)."
     say "Daarna mag je weglopen; aan het eind vraag ik je nog om bij Claude in te loggen."
+  elif [ "$1" = ok ]; then
+    say "Installatie opnieuw (--setup); wat al klaar is gaat snel."
   else
     say "Een eerdere installatie is niet helemaal gelukt; ik probeer het opnieuw (wat al klaar is gaat snel)."
   fi
@@ -155,6 +157,7 @@ run_setup() {
   rc=$?
   if [ "$rc" = 0 ]; then
     goed "installatie gelukt"; noteer "installatie" "gelukt"
+    say "  (\"Volgende stap\" hierboven doet start.sh nu zelf: je hoeft niets te typen.)"
   else
     fout "de installatie meldde fouten (zie de SAMENVATTING hierboven; log in cel/runs/_setup/)."
     say "  Ik ga door met wat wel werkt. Claude kan het log lezen en helpen; start.sh probeert de"
@@ -198,7 +201,7 @@ if [ "$WANT_SETUP" = 1 ]; then
   fi
   run_setup "$SST"
 elif [ "$DO_SETUP" = auto ] && [ "$SST" = ok ]; then
-  goed "installatie: al eerder gelukt ($(ls -t "$SETUP_LOGDIR"/setup_*.log 2>/dev/null | head -n1 | xargs -r basename))"
+  goed "installatie: al eerder gelukt ($(setup_logs | head -n1 | xargs -r basename))"
   noteer "installatie" "al eerder gelukt"
 fi
 
@@ -213,9 +216,9 @@ apt_install() {
     return 1
   fi
   say "  installeren: ${pk[*]} (sudo vraagt misschien je wachtwoord)"
-  $S env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 -y -q install "${pk[@]}" 9>&- ||
+  $S env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -o DPkg::Lock::Timeout=600 -y -q install "${pk[@]}" 9>&- ||
     { $S apt-get -o DPkg::Lock::Timeout=600 -q update 9>&- && \
-      $S env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 -y -q install "${pk[@]}" 9>&-; }
+      $S env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -o DPkg::Lock::Timeout=600 -y -q install "${pk[@]}" 9>&-; }
 }
 
 # ------------------------------------------------------------------------------------ 2. Claude Code
@@ -225,8 +228,9 @@ find_claude() {
   if [ -z "$CLAUDE_BIN" ] && [ -x "$HOME/.local/bin/claude" ]; then CLAUDE_BIN=$HOME/.local/bin/claude; fi
   [ -n "$CLAUDE_BIN" ]
 }
+PATH_ADDED=0    # 1 = this terminal (the parent shell) does not have ~/.local/bin in PATH yet
 fix_path() {
-  case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
+  case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH"; PATH_ADDED=1 ;; esac
   # new terminals: ~/.local/bin in PATH via ~/.bashrc (official advice when 'claude' is not found)
   if [ "$CLAUDE_BIN" = "$HOME/.local/bin/claude" ] && ! grep -qs '\.local/bin' "$HOME/.bashrc"; then
     cat >> "$HOME/.bashrc" <<'EOF'
@@ -280,7 +284,8 @@ login_claude() {
   "$CLAUDE_BIN" auth login 9>&-
   logged_in && { goed "ingelogd"; return 0; }
   say ""
-  say "Dat lukte zo niet. Ik start Claude zelf: log daar in, en typ daarna /exit om hier verder te gaan."
+  say "Dat lukte zo niet. Ik start Claude zelf: log daar in (kies je Claude-abonnement, niet een API-sleutel)"
+  say "en typ daarna /exit om hier verder te gaan."
   "$CLAUDE_BIN" 9>&-
   logged_in && { goed "ingelogd"; return 0; }
   fout "nog steeds niet ingelogd"
@@ -298,8 +303,44 @@ rc_state() {
   fi
 }
 attach_rc() {
+  # attaching can last as long as the user stays in the Claude window: release the start.sh lock first,
+  # so Claude itself (bash cel/pc/start.sh --alleen-plan) and other windows are not blocked meanwhile
+  if have flock; then flock -u 9 2>/dev/null; exec 9>&-; fi
   if [ -n "${TMUX:-}" ] && [ -z "${OERCEL_TMUX_SOCKET:-}" ]; then tm switch-client -t "=$SES"
   else TMUX='' tm attach -t "=$SES"; fi
+}
+# does Claude in the tmux window wait for an answer (trust, enable, login, Enter)?  Only what comes after
+# the last session link (claude.ai/code/...) counts, and of that the last lines: questions answered before
+# the link stay on screen.  (capture-pane needs "=SES:" — tmux 3.4 rejects a bare "=SES".)
+rc_asks() {
+  tm capture-pane -p -t "=$SES:" 2>/dev/null |
+    awk 'NF == 0 { next } /claude\.ai\/code/ { n = 0; next } { l[++n] = $0 } END { for (i = (n > 8 ? n - 7 : 1); i <= n; i++) print l[i] }' |
+    grep -qiE '\(y/n\)|\[y/n\]|trust|enable remote|not logged in|log ?in (to|with|first)|auth login|/login|press enter|enter to (confirm|continue)|paste|choose'
+}
+offer_attach() {    # $1 = why; shows the instructions, then switches to the Claude window (terminal only)
+  if ! interactive; then
+    let_op "Claude wacht in tmux op een antwoord; beantwoord dat in een terminal:  tmux attach -t $SES"
+    noteer "Remote Control" "wacht op een antwoord (tmux attach -t $SES)"
+    return 0
+  fi
+  say ""
+  say "${B}${1:+$1 }Zo schakel ik naar het Claude-venster.${N} Beantwoord daar de vragen met ${B}y${N} en Enter:"
+  say "    Enable Remote Control? (y/n)            ->  y"
+  say "    Trust ... ? / vertrouw je deze map?     ->  y"
+  say "    andere vraag (kleuren, 'Press Enter')   ->  Enter"
+  say "  Zie je de sessie-link (claude.ai/code/...), dan is het klaar."
+  say "  ${B}Terug naar hier: Ctrl+b indrukken, loslaten, dan d.${N}  Claude blijft dan gewoon draaien."
+  read -r -t "${OERCEL_ATTACH_WAIT:-30}" -p "  Druk op Enter om naar Claude te gaan ... " _ || true
+  : > "$STATE/claude_rc_eerder_gestart"
+  attach_rc
+  say ""
+  say "Terug uit het Claude-venster."
+  sleep 1
+  if [ "$(rc_state)" = geen ]; then
+    let_op "het Claude-venster is gesloten; Claude draait niet. Opnieuw: bash cel/pc/start.sh"
+  elif rc_asks; then
+    let_op "Claude wacht nog op een antwoord. Later beantwoorden: tmux attach -t $SES   (of start.sh opnieuw)"
+  fi
 }
 start_rc() {
   kop "5. Claude Remote Control"
@@ -313,13 +354,21 @@ start_rc() {
   case "$st" in
     draait)
       goed "Claude Remote Control draait al in tmux-sessie '$SES' (geen tweede gestart)."
-      say "  Bekijken: tmux attach -t $SES   (terug: Ctrl+b loslaten, dan d)"
       noteer "Remote Control" "draait al (tmux '$SES')"
+      # e.g. the first time the window was left (Ctrl+b d) before the questions were answered
+      if rc_asks; then offer_attach "Claude wacht daar nog op een antwoord."
+      else say "  Bekijken: tmux attach -t $SES   (terug: Ctrl+b, loslaten, dan d)"; fi
       return 0 ;;
     herstart)
-      goed "Claude Remote Control in tmux-sessie '$SES' wordt zo vanzelf herstart (geen tweede gestart)."
-      noteer "Remote Control" "herstart vanzelf (tmux '$SES')"
-      return 0 ;;
+      if [ -f "$STATE/claude_rc.wacht" ]; then
+        # the wrapper waits 10 minutes after repeated quick failures (network? login?): try again now
+        let_op "Claude Remote Control mislukte een paar keer snel achter elkaar (log: ${STATE#"$REPO"/}/claude_rc.log); ik probeer het nu opnieuw"
+        tm kill-session -t "=$SES" 2>/dev/null
+      else
+        goed "Claude Remote Control in tmux-sessie '$SES' wordt zo vanzelf herstart (geen tweede gestart)."
+        noteer "Remote Control" "herstart vanzelf (tmux '$SES')"
+        return 0
+      fi ;;
     dood)
       say "  tmux-sessie '$SES' bestaat maar Claude draait er niet meer in: opnieuw starten"
       tm kill-session -t "=$SES" 2>/dev/null ;;
@@ -342,6 +391,7 @@ start_rc() {
   { printf 'export HOME=%q PATH=%q CLAUDE_BIN=%q\n' "$HOME" "$PATH" "$CLAUDE_BIN"
     printf 'export OERCEL_START_STATE=%q OERCEL_CLAUDE_NAME=%q OERCEL_CLAUDE_CONTINUE=%q\n' "$STATE" "$RC_NAME" "$cont"
     [ -n "${OERCEL_RC_RESTART_S:-}" ] && printf 'export OERCEL_RC_RESTART_S=%q\n' "$OERCEL_RC_RESTART_S"
+    [ -n "${OERCEL_RC_BACKOFF_S:-}" ] && printf 'export OERCEL_RC_BACKOFF_S=%q\n' "$OERCEL_RC_BACKOFF_S"
   } > "$STATE/claude_rc.env"
   if ! tm new-session -d -s "$SES" -c "$REPO" -x 160 -y 48 "exec bash '$PC_DIR/claude_rc.sh' '$STATE/claude_rc.env'"; then
     fout "tmux-sessie '$SES' starten mislukt"; noteer "Remote Control" "FOUT: tmux"; return 1
@@ -352,26 +402,16 @@ start_rc() {
   if [ "$need" = 0 ]; then
     # not the first time: only show the window when Claude asks something (login, trust, enable)
     sleep "${OERCEL_RC_PEEK_S:-6}"
-    if tm capture-pane -p -t "=$SES" 2>/dev/null | grep -qiE '\(y/n\)|\[y/n\]|trust|enable remote|log ?in|press enter|paste'; then need=1; fi
+    rc_asks && need=1
   fi
-  if ! interactive; then
-    [ "$need" = 1 ] && let_op "Claude stelt in tmux een vraag; beantwoord die in een terminal:  tmux attach -t $SES"
+  if [ "$need" = 1 ] && interactive; then
+    : > "$STATE/claude_rc_eerder_gestart"
+    offer_attach ""
     return 0
   fi
-  if [ "$need" = 1 ]; then
-    say ""
-    say "${B}Zo schakel ik naar het Claude-venster.${N} Beantwoord daar de vragen met ${B}y${N} en Enter:"
-    say "    Enable Remote Control? (y/n)            ->  y"
-    say "    Trust ... ? / vertrouw je deze map?     ->  y"
-    say "  Zie je de sessie-link (claude.ai/code/...), dan is het klaar."
-    say "  ${B}Terug naar hier: Ctrl+b indrukken, loslaten, dan d.${N}  Claude blijft dan gewoon draaien."
-    read -r -t "${OERCEL_ATTACH_WAIT:-30}" -p "  Druk op Enter om naar Claude te gaan ... " _ || true
-    attach_rc
-    : > "$STATE/claude_rc_eerder_gestart"
-    say ""
-    say "Terug uit het Claude-venster."
-  fi
-  : > "$STATE/claude_rc_eerder_gestart"
+  [ "$need" = 1 ] && offer_attach ""     # no terminal: only the hint
+  # without a terminal the first-time questions are still unanswered: keep 'first' for the next start
+  if [ "$first" = 0 ] || interactive; then : > "$STATE/claude_rc_eerder_gestart"; fi
 }
 
 # ------------------------------------------------------------------------------------ uitvoeren
@@ -392,6 +432,7 @@ if [ "$DO_CLAUDE" = 1 ] && [ "$(rc_state)" != geen ]; then
   say "  Even kijken in dit venster: tmux attach -t $SES     terug: Ctrl+b, dan d"
 fi
 say "Status:   python3 cel/pc/status.py          Stoppen: bash cel/pc/stop.sh   (alles, ook Claude: --alles)"
+[ "$PATH_ADDED" = 1 ] && say "Zelf 'claude' typen kan in een nieuw Ubuntu-venster (in dit venster eerst: source ~/.bashrc)."
 case "$REPO" in "$HOME"/*) RSHOW="~/${REPO#"$HOME"/}" ;; *) RSHOW=$REPO ;; esac
 say "Na een herstart van de pc: open Ubuntu en typ weer   cd $RSHOW && bash cel/pc/start.sh"
 say "Laat dit Ubuntu-venster open (minimaliseren mag): als alle Ubuntu-vensters dicht zijn kan Windows WSL stoppen."
