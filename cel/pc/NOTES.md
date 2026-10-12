@@ -358,3 +358,11 @@ Bevindingen en wat eraan gedaan is:
 - Nieuwe testhooks: start.sh OERCEL_GITHUB_PROBE; setup_wsl.sh OERCEL_TEST_GH_VERSION, OERCEL_TEST_GH_REPO_FAIL,
   OERCEL_TEST_NO_FFMPEG. Nieuwe controles in tests/test_start.sh (s1 vraagvolgorde, s16d BROWSER, s16k-m offline/
   ongeldig token, token-lek-check, s18e-g gh-bron, s18h ffmpeg).
+- Tests: volledige tests/test_start.sh 2x: 136 PASS / 0 FAIL (pc/_test/start_review3.log), daarna met de ffmpeg-
+  controles 138 PASS / 0 FAIL (pc/_test/start_review4.log). bash -n op alle .sh, py_compile, setup_wsl.sh
+  --test-functies 0 fouten. Testdata gewist, geen testprocessen over. Andere suites (alle_tests.sh) niet opnieuw
+  gedraaid (alleen start.sh/setup_wsl.sh/test_start.sh veranderd in deze review).
+- NIET getest (kon hier niet): alles met de échte gh (login, Y/n-vraag, Ctrl+C daarin in ruwe modus, setup-git,
+  push), de échte apt-installatie uit cli.github.com (hier 403; alleen droog, plus de controle "ziet apt
+  cli.github.com" alleen beredeneerd), de echte curl-proef naar api.github.com (alleen nep-curl), explorer.exe/
+  wslview in WSL2, gh 2.4.0 in het echt, setup_wsl.sh zonder ffmpeg in het echt (alleen nep-selftest + hook).
