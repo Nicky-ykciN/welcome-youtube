@@ -105,15 +105,32 @@ fi
 # ------------------------------------------------------------------------------------ 1. installatie
 # setup_wsl.sh writes runs/_setup/setup_<time>.log and ends it with "Klaar. Volgende stap" when nothing
 # failed.  The newest log that is not a dry run tells whether the setup has succeeded.
-setup_state() {
+setup_logs() {     # real (not dry-run) setup logs, newest first
   local f
   while IFS= read -r f; do
-    [ -f "$f" ] || continue
-    grep -qE '^(DROOG:|TESTMODUS)' "$f" && continue
-    if grep -q '^Klaar\. Volgende stap' "$f"; then echo ok; else echo mislukt; fi
-    return
+    [ -f "$f" ] && ! grep -qE '^(DROOG:|TESTMODUS)' "$f" && echo "$f"
   done < <(ls -t "$SETUP_LOGDIR"/setup_*.log 2>/dev/null)
-  echo nooit
+}
+setup_state() {
+  local f
+  f=$(setup_logs | head -n1)
+  if [ -z "$f" ]; then echo nooit
+  elif grep -q '^Klaar\. Volgende stap' "$f"; then echo ok
+  else echo mislukt; fi
+}
+setup_fails_in_row() {
+  local f n=0
+  while IFS= read -r f; do
+    grep -q '^Klaar\. Volgende stap' "$f" && break
+    n=$((n + 1))
+  done < <(setup_logs)
+  echo "$n"
+}
+gpu_now_ok() {
+  local smi
+  smi=$(command -v nvidia-smi 2>/dev/null || true)
+  [ -z "$smi" ] && [ -x /usr/lib/wsl/lib/nvidia-smi ] && smi=/usr/lib/wsl/lib/nvidia-smi
+  [ -n "$smi" ] && "$smi" >/dev/null 2>&1
 }
 tools_python() { if [ -x "$PC_DIR/.venv/bin/python" ]; then echo "$PC_DIR/.venv/bin/python"; else echo python3; fi; }
 essentials_ok() {
@@ -156,14 +173,31 @@ run_plan() {
 
 PLAN_DONE=0
 SST=$(setup_state)
-if [ "$DO_SETUP" = 1 ] || { [ "$DO_SETUP" = auto ] && { [ "$SST" != ok ] || [ ! -x "$CEL/engine/oercel" ]; }; }; then
+WANT_SETUP=0
+if [ "$DO_SETUP" = 1 ]; then WANT_SETUP=1
+elif [ "$DO_SETUP" = auto ]; then
+  if [ "$SST" = nooit ] || ! essentials_ok; then WANT_SETUP=1
+  elif [ "$SST" = mislukt ]; then
+    NFAIL=$(setup_fails_in_row)
+    if [ "$NFAIL" -lt 3 ]; then WANT_SETUP=1
+    elif grep -q "nvidia-smi werkt niet" "$(setup_logs | head -n1)" && gpu_now_ok; then
+      WANT_SETUP=1; say "De GPU werkt nu wel (nvidia-smi); de installatie wordt opnieuw geprobeerd."
+    else
+      kop "1. Installatie"
+      let_op "de installatie is ${NFAIL}x achter elkaar mislukt; ik probeer het niet elke keer automatisch opnieuw."
+      say "  Wat er mis is staat in cel/runs/_setup/ (Claude kan het lezen). Opnieuw proberen: bash cel/pc/start.sh --setup"
+      noteer "installatie" "${NFAIL}x mislukt; opnieuw: start.sh --setup"
+    fi
+  fi
+fi
+if [ "$WANT_SETUP" = 1 ]; then
   # a failed earlier attempt must not keep running experiments waiting (e.g. after a reboot): resume first
   if [ "$SST" = mislukt ] && [ "$DO_PLAN" = 1 ] && essentials_ok; then
     run_plan "Experimenten hervatten (vóór de nieuwe installatiepoging)"
     PLAN_DONE=1
   fi
   run_setup "$SST"
-elif [ "$DO_SETUP" = auto ]; then
+elif [ "$DO_SETUP" = auto ] && [ "$SST" = ok ]; then
   goed "installatie: al eerder gelukt ($(ls -t "$SETUP_LOGDIR"/setup_*.log 2>/dev/null | head -n1 | xargs -r basename))"
   noteer "installatie" "al eerder gelukt"
 fi

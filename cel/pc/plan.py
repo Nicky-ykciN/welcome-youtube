@@ -325,12 +325,13 @@ def clear_mark(d):
 
 # ----------------------------------------------------------------------------- running pc scripts
 def run_script(script, args, dry=False, timeout=900):
-    """Run pc/<script> args (from cel/); returns (rc, output)."""
+    """Run pc/<script> args from the repository root (so its hints read 'python3 cel/pc/...', as typed
+    there; every path this module passes is absolute); returns (rc, output)."""
     cmd = [sys.executable, os.path.join(P.PC, script)] + list(args)
     if dry:
         return 0, "[droog] " + " ".join(shlex.quote(c) for c in cmd[1:])
     try:
-        p = subprocess.run(cmd, cwd=P.CEL, capture_output=True, text=True, timeout=timeout,
+        p = subprocess.run(cmd, cwd=P.REPO, capture_output=True, text=True, timeout=timeout,
                            stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return 124, f"{script} reageerde niet binnen {timeout} s"
@@ -694,7 +695,7 @@ def cmd_stop():
                 pass
         args = [name, "--stop"] if kind == "longrun" else ["--stop", name]
         cmd = [sys.executable, os.path.join(P.PC, f"{kind}.py")] + args
-        p = subprocess.Popen(cmd, cwd=P.CEL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        p = subprocess.Popen(cmd, cwd=P.REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                              stdin=subprocess.DEVNULL)
         procs.append((name, kind, p))
         print(f"  {name} ({'lange run' if kind == 'longrun' else 'sweep'}): stopsignaal gegeven")

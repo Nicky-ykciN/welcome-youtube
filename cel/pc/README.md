@@ -5,8 +5,21 @@ zonder handwerk. De scripts starten, bewaken en hervatten alleen de engine; ze v
 aan de natuurwetten van de simulatie (SPEC §0). Analyse-uitkomsten worden alleen gebruikt om te
 beslissen welke *bestanden* bewaard blijven, nooit om de simulatie bij te sturen.
 
+**Starten = één commando** (in een Ubuntu/WSL-terminal, vanuit de repo; stap voor stap voor de gebruiker:
+`STARTEN.md` in de root):
+
+```bash
+bash cel/pc/start.sh      # installatie (eenmalig) + Claude Code + experimenten uit plan.txt + status + Remote Control
+bash cel/pc/stop.sh       # alle experimenten netjes stoppen (Claude blijft draaien; --alles: ook Claude)
+```
+
 | bestand | wat |
 |---|---|
+| `start.sh` | het enige commando voor de gebruiker; veilig om altijd opnieuw te draaien (zie §0) |
+| `stop.sh` | alle runs en sweeps netjes stoppen; `start.sh` hervat precies die weer |
+| `plan.txt` | het experimentplan: één `longrun.py`- of `sweep.py`-regel per experiment (Claude past dit aan) |
+| `plan.py` | voert `plan.txt` uit: `start`, `lijst`, `proef` (controleren zonder starten), `stop` |
+| `claude_rc.sh` | draait `claude remote-control` in tmux-sessie `oercel-claude`, met herstart na netwerkverlies |
 | `setup_wsl.sh` | installatie in WSL2: pakketten, Python, CUDA-toolkit, engines bouwen, tests |
 | `sweep.py` | veel kleine runs tegelijk (parametervarianten × seeds) over alle kernen, hervatbaar, met ranglijst |
 | `longrun.py` | één lange productierun (GPU, anders CPU) met checkpoints, analyse, beelden en begrensd schijfgebruik |
@@ -16,7 +29,44 @@ beslissen welke *bestanden* bewaard blijven, nooit om de simulatie bij te sturen
 | `tests/` | de tests waarmee deze scripts zijn gecontroleerd (zie onderaan) |
 | `pclib.py`, `cuda_check.cu` | gedeelde hulpfuncties; kleine CUDA-test voor setup |
 
-## 1. Eenmalig: installeren
+## 0. `start.sh` — wat het doet
+
+`bash cel/pc/start.sh` doet in deze volgorde, en slaat over wat al gedaan is:
+
+1. **Installatie**: `setup_wsl.sh` als die nog nooit gelukt is (de nieuwste niet-droge
+   `runs/_setup/setup_*.log` eindigt dan niet met "Klaar. Volgende stap"). Hier vraagt sudo één keer het
+   wachtwoord. Mislukte een eerdere poging (bijv. de GPU-zelftest) en werken CPU-engine en Python wel,
+   dan worden eerst de experimenten hervat en daarna de installatie opnieuw geprobeerd (een herstart van
+   de pc laat zo nooit experimenten wachten). `--setup` forceert, `--geen-setup` slaat over.
+2. **Claude Code**: als `claude` ontbreekt, met de officiële installer zonder sudo
+   (`curl -fsSL https://claude.ai/install.sh | bash`); `~/.local/bin` komt in `PATH` (ook in `~/.bashrc`).
+3. **Experimenten**: `python3 cel/pc/plan.py start` voert `plan.txt` uit, per regel:
+   bestaat nog niet → starten; draait → niets; klaar → niets (tenzij het plan meer stappen of nieuwe
+   sweep-jobs wil); onderbroken (herstart, stroomstoring, crash, `stop.sh`) → hervatten vanaf het
+   laatste checkpoint met de opgeslagen instellingen; bewust gestopt met `--stop` → blijft staan; lange
+   GPU-run terwijl de GPU niet werkt → wacht. `als PAD bestaat: ...` / `anders: ...` kiest tussen regels
+   (zo gebruikt `oersoep_groot` `engine/params/production.ini` zodra die er is). Daarna worden ook
+   runs/sweeps búíten het plan hervat die onderbroken zijn of door `stop.sh` gestopt (zoals
+   `status.py --hervat`). Een bestaande run verandert nooit van parameters; past het plan er niet meer
+   bij, dan meldt `start.sh` dat (nieuwe naam = nieuwe run).
+4. **Status**: `status.py --kort`.
+5. **Remote Control**: eerst inloggen als `~/.claude/.credentials.json` ontbreekt (`claude auth login`,
+   in de voorgrond), dan `claude remote-control --name "Oercel werkstation"` in tmux-sessie
+   `oercel-claude` (in de repo-root, via `claude_rc.sh`: herstart na een stop, dan met `--continue`).
+   De eerste keer schakelt `start.sh` naar dat venster voor de vragen "Enable Remote Control?" en
+   "Trust?"; terug met Ctrl+b, d. Draait Claude al in die sessie, dan zegt het dat alleen.
+
+Alleen het plan toepassen (bijv. door Claude na een wijziging van `plan.txt`):
+`bash cel/pc/start.sh --alleen-plan`, of `python3 cel/pc/plan.py start`. Controleren zonder te starten:
+`python3 cel/pc/plan.py proef` (ini's, parameters tegen `engine --params`, een proefje van de
+CPU-engine met precies die waarden, `sweep.py --proef`). Stand per regel: `python3 cel/pc/plan.py lijst`.
+
+**Het eerste plan** (`plan.txt`): `oersoep_groot` (GPU, L = 512, 50 M stappen, `--engine gpu`: wacht als
+de GPU niet werkt) en `leven_scan` (`voorbeelden/leven_scan.txt`: 54 varianten × 2 seeds, L = 100,
+2 M stappen, `--threads 2 --reserve 20` = 54 jobs tegelijk op 128 threads). Samen ~118 van de 128
+threads: geen overboeking, ruimte voor de GPU-aansturing, analyses en Claude.
+
+## 1. Eenmalig: installeren (doet `start.sh`)
 
 In Windows hoeft alleen de gewone **NVIDIA-driver voor Windows** geïnstalleerd te zijn (Quadro RTX
 8000). In Ubuntu (WSL2) komt **nooit** een NVIDIA-driver; de Windows-driver levert de GPU.
@@ -24,11 +74,11 @@ In Windows hoeft alleen de gewone **NVIDIA-driver voor Windows** geïnstalleerd 
 In een Ubuntu-terminal (WSL2):
 
 ```bash
-cd ~                                   # NIET onder /mnt/c: daar is alles ~10x trager
-git clone -b <branch> <github-url>     # de repo
-bash ~/<repo>/cel/pc/setup_wsl.sh      # vraagt één keer je wachtwoord (sudo); 20-50 min*
-cd ~/<repo> && claude remote-control
+git clone https://github.com/Nicky-ykciN/welcome-youtube ~/welcome-youtube   # NIET onder /mnt/c (~10x trager)
+cd ~/welcome-youtube && bash cel/pc/start.sh    # draait o.a. setup_wsl.sh; vraagt één keer je wachtwoord; 20-50 min*
 ```
+
+Los kan ook: `bash cel/pc/setup_wsl.sh`.
 
 \* De CUDA-toolkit is een download van enkele GB en de volledige GPU-zelftest duurt 10-20 minuten;
 met `--snel` wordt dat `selftest_gpu.sh --quick` en vervalt validate.sh.
@@ -228,7 +278,8 @@ python3 cel/pc/longrun.py prod1 --analyseer-nu        # nu analyse + beelden i.p
 
 ### 2c. Na een herstart van Windows / WSL
 
-Processen in WSL overleven een herstart niet. Daarna (in Claude Code):
+Processen in WSL overleven een herstart niet. De gebruiker typt dan `bash cel/pc/start.sh` (hervat alles en
+start Claude weer). Vanuit Claude Code kan het ook:
 
 ```bash
 python3 cel/pc/status.py            # toont ONDERBROKEN runs met hun hervat-commando
@@ -258,6 +309,7 @@ met `bash cel/pc/tests/alle_tests.sh` (~30 min; op de pc ook met de echte GPU-en
 | `tests/test_gpu_fallback.sh` | GPU-engine die niet draait → CPU; `--engine gpu` dan geweigerd; zelftest gefaald → CPU; GPU die midden in een run wegvalt → géén checkpoint als kapot gemarkeerd, na terugkeer verder vanaf het nieuwste checkpoint, bit-gelijk |
 | `tests/test_stop_hervat.sh` | SIGTERM van buiten (afsluiten) → `--hervat` start opnieuw; bewuste `--stop` → `--hervat` laat het staan (run én sweep); `--steps` op een draaiende run → `NIET TOEGEPAST`; bestandssysteem zonder `flock` (gesimuleerd) → vergrendeling via `/tmp`; sweep met volle schijf → jobs pauzeren met checkpoint, geen crash geteld, daarna bit-gelijk klaar |
 | `tests/test_kill_stress.sh` | `kill -9` van engine / supervisor / beide **tijdens het schrijven van een checkpoint** (gericht), tijdens een snapshot, en willekeurig; `kill -9` van de supervisor tijdens `analyze.py`/`render.py` en het uitdunnen; sweep-supervisor willekeurig gedood → alles bit-gelijk, geldige JSON, geen halve bestanden of beelden |
+| `tests/test_start.sh` | `start.sh`/`stop.sh`/`plan.py` met nep-HOME, nep-`claude` (+ installer via nep-`curl`), nep-`nvidia-smi`/GPU-engine, nep-setup en de echte tmux op een eigen socket: eerste start in een pseudo-terminal (wachtwoordloze nep-setup, installatie, PATH in `~/.bashrc`, inloggen met code plakken, plan met terugvalregel, status, tmux + "Enable Remote Control? (y/n)" + Ctrl+b d); opnieuw = niets dubbel; `kill -9` van alles → hervat; `stop.sh` → `start.sh` hervat, bewuste `--stop` blijft staan; production.ini verschijnt later → melding, run houdt eigen instellingen; production.ini bij een nieuwe run → `als`-regel; GPU weg → wacht; mislukte setup → eerst hervatten, dan opnieuw; runs buiten het plan; repo op de "Windows-schijf"; planfouten; `stop.sh --alles` → Claude met `--continue` terug; wrapper herstart Claude; meer stappen in het plan → hervat |
 | `setup_wsl.sh --test-functies` | versiekeuze van de toolkit (ook Ubuntu 20.04 → max. 12.x, terugvalvolgorde), parsen van `nvidia-smi`, WSL1/WSL2-herkenning |
 | `setup_wsl.sh --droog` als root op een kopie van de repo van een andere gebruiker | de mappen die setup maakt (`runs/`, `runs/_setup`, `pc/_build`) zijn van de eigenaar; proefrun lukt (zo draait `wsl -u root`) |
 | `setup_wsl.sh --droog` in een kopie van de repo | met nep-WSL2-kernel en nep-`nvidia-smi`: alle stappen, bouwen (ook `engine_gpu/oercel_gpu` met nvcc 12.0 + g++-12), validate.sh (29 PASS), proefrun; CUDA-testprogramma compileert voor sm_75 |
@@ -280,3 +332,10 @@ met `bash cel/pc/tests/alle_tests.sh` (~30 min; op de pc ook met de echte GPU-en
   niet, dan vergrendelen de scripts via `/tmp`, getest met een gesimuleerde fout);
 - prestaties en de standaardinstellingen op 64 kernen (jobs × threads) — dat moet op de pc zelf
   blijken; pas zo nodig `--jobs/--threads` aan.
+- `start.sh` met de échte Claude Code: de officiële installer, `claude auth login` in WSL2 (browser/code),
+  de exacte tekst van de vragen van `claude remote-control` (de herkenning "staat er een vraag in beeld?"
+  bij latere starts is een gok op `(y/n)`, `trust`, `log in` …; de eerste keer schakelt `start.sh` altijd
+  naar het venster), `--continue` samen met `--name`, en of de server na netwerkverlies echt stopt
+  (getest met een nep-`claude`). Ook niet: of tmux-processen blijven lopen als alle Ubuntu-vensters dicht
+  zijn (daarom: venster open laten), en het kopiëren van een repo onder `/mnt/c` met `git clone` (alleen
+  "kopie bestaat al" en "map bestaat al" zijn getest; hier mocht geen git gebruikt worden).

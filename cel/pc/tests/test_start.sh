@@ -184,7 +184,7 @@ sw() { python3 -c "import json,sys; d=json.load(open('$T/runs/$1/pc_sweep.json')
 holder() { python3 -c "import sys; sys.path.insert(0,'$PC'); import pclib as P; print(P.lock_holder('$T/runs/$1') or '')"; }
 nsetup() { wc -l < "$HOME/fake_setup_calls.log" 2>/dev/null || echo 0; }
 nrc() { pgrep -f "$HOME/.local/bin/claude remote-control" | wc -l; }
-wait_for() { local n=$1; shift; local t=0; while ! "$@" && [ $t -lt $((n * 2)) ]; do sleep 0.5; t=$((t + 1)); done; "$@"; }
+wait_for() { local n=$1; shift; local t=0; while ! eval "$*" && [ $t -lt $((n * 2)) ]; do sleep 0.5; t=$((t + 1)); done; eval "$*"; }   # re-evaluates its argument string
 kill_run() {   # kill -9 supervisor + engine of runs/$1 (power cut)
   local h; h=$(holder "$1")
   local eng; eng=$(python3 -c "import sys; sys.path.insert(0,'$PC'); import pclib as P; print(' '.join(map(str, P.engine_pids_for('$T/runs/$1'))))")
@@ -236,13 +236,13 @@ check "nog steeds precies één Claude" test "$(nrc)" = 1
 
 # ------------------------------------------------------------------------------ 3. power cut
 echo "== 3. kill -9 van alles (stroomstoring) -> start.sh hervat =="
-wait_for 60 test -n "$(holder groot)" >/dev/null
+wait_for 60 'test -n "$(holder groot)"' >/dev/null
 kill_run groot; kill_run scan
 sleep 1
 S --geen-claude > "$T/s3.txt"
 check "groot hervat" grep -q "groot (lange run): HERVAT" "$T/s3.txt"
 grep -qE "scan \(sweep\): (HERVAT|klaar)" "$T/s3.txt" && pass "scan: $(grep -oE 'scan \(sweep\): [A-Za-z]+' "$T/s3.txt")" || fail "scan niet hervat: $(grep scan "$T/s3.txt")"
-check "groot draait weer" wait_for 20 test -n "$(holder groot)"
+check "groot draait weer" wait_for 20 'test -n "$(holder groot)"'
 
 # ------------------------------------------------------------------------------ 4. stop.sh
 echo "== 4. stop.sh en weer start.sh; bewuste --stop blijft staan =="
@@ -255,7 +255,7 @@ check "status na stop.sh getoond" grep -q "LANGE RUNS" "$T/s4a.txt"
 S --geen-claude > "$T/s4b.txt"
 check "start.sh hervat wat stop.sh stopte" grep -q "groot (lange run): HERVAT" "$T/s4b.txt"
 check "merkteken weg na hervatten" test ! -e "$T/runs/groot/pc_gestopt_door_stop_sh"
-wait_for 20 test -n "$(holder groot)"
+wait_for 20 'test -n "$(holder groot)"'
 python3 "$PC/longrun.py" groot --stop > /dev/null 2>&1
 S --geen-claude > "$T/s4c.txt"
 check "bewuste --stop: blijft staan" grep -q "groot (lange run): bewust gestopt met --stop; blijft staan" "$T/s4c.txt"
@@ -292,7 +292,7 @@ EOF
 PATH=$BASEPATH OERCEL_PLAN=$T/plan7.txt S --alleen-plan > "$T/s7a.txt"
 check "nieuwe GPU-regel wacht op de GPU" grep -q "groot7 (lange run): WACHT OP GPU" "$T/s7a.txt"
 check "  ... er is niets aangemaakt" test ! -e "$T/runs/groot7/pc_longrun.json"
-wait_for 20 test -n "$(holder groot)" > /dev/null
+wait_for 20 'test -n "$(holder groot)"' > /dev/null
 kill_run groot; sleep 0.5
 PATH=$BASEPATH S --alleen-plan > "$T/s7b.txt"
 check "onderbroken GPU-run niet hervat zonder GPU" grep -q "groot (lange run): WACHT OP GPU — niet hervat" "$T/s7b.txt"
@@ -316,7 +316,7 @@ export OERCEL_SETUP_LOGDIR=$T/setup_logs
 echo "== 9. runs buiten het plan =="
 python3 "$PC/longrun.py" los --ini engine/params/membranes.ini --set $OV steps=150000 $LR --engine cpu --achtergrond > /dev/null 2>&1
 python3 "$PC/longrun.py" los2 --ini engine/params/membranes.ini --set $OV steps=150000 $LR --engine cpu --achtergrond > /dev/null 2>&1
-wait_for 30 test -n "$(holder los)" > /dev/null; wait_for 30 test -n "$(holder los2)" > /dev/null
+wait_for 30 'test -n "$(holder los)"' > /dev/null; wait_for 30 'test -n "$(holder los2)"' > /dev/null
 sleep 4; kill_run los; python3 "$PC/longrun.py" los2 --stop > /dev/null 2>&1
 S --alleen-plan > "$T/s9.txt"
 check "onderbroken run buiten het plan: hervat" grep -q "los: HERVAT" "$T/s9.txt"
@@ -359,10 +359,10 @@ check "regel na een vervolgregel goed geteld" grep -q "regel 5   y2 (lange run):
 echo "== 12. stop.sh --alles, daarna start.sh =="
 bash "$PC/stop.sh" --alles > "$T/s12a.txt" 2>&1
 check "tmux-sessie weg" bash -c "! tmux -L $SOCK has-session -t =oercel-claude 2>/dev/null"
-check "geen Claude meer" wait_for 10 test "$(nrc)" = 0
+check "geen Claude meer" wait_for 10 'test "$(nrc)" = 0'
 S > "$T/s12b.txt"
 check "Claude opnieuw gestart in tmux" grep -q "tmux-sessie 'oercel-claude' gestart" "$T/s12b.txt"
-check "  ... met --continue (vorige sessie bestond)" wait_for 10 grep -q "remote-control --name Oercel werkstation --continue" "$HOME/fake_claude.log"
+check "  ... met --continue (vorige sessie bestond)" wait_for 10 'grep -q "remote-control --name Oercel werkstation --continue" "$HOME/fake_claude.log"'
 check "  ... geen vraag in beeld, dus geen attach-melding" bash -c "! grep -q 'beantwoord die in een terminal' '$T/s12b.txt'"
 check "experimenten hervat (stop.sh-merktekens)" grep -qE "groot \(lange run\): (HERVAT|klaar)" "$T/s12b.txt"
 
@@ -370,27 +370,28 @@ check "experimenten hervat (stop.sh-merktekens)" grep -qE "groot \(lange run\): 
 echo "== 13. Claude stopt in tmux / sessie zonder Claude =="
 n0=$(grep -c "start: claude" "$T/state/claude_rc.log")
 touch "$HOME/.claude/nep_rc_stop"
-check "wrapper start Claude opnieuw" wait_for 20 test "$(grep -c 'start: claude' "$T/state/claude_rc.log")" -gt "$n0"
-check "  ... en hij draait weer (1x)" wait_for 10 test "$(nrc)" = 1
+check "wrapper start Claude opnieuw" wait_for 20 'test "$(grep -c "start: claude" "$T/state/claude_rc.log")" -gt "$n0"'
+check "  ... en hij draait weer (1x)" wait_for 10 'test "$(nrc)" = 1'
 tmux -L "$SOCK" kill-server; sleep 0.5
 tmux -L "$SOCK" new-session -d -s oercel-claude "bash --norc"
 S > "$T/s13.txt"
 check "sessie zonder Claude wordt vervangen" grep -q "Claude draait er niet meer in: opnieuw starten" "$T/s13.txt"
-check "  ... en Claude draait" wait_for 10 test "$(nrc)" = 1
+check "  ... en Claude draait" wait_for 10 'test "$(nrc)" = 1'
 
 # ------------------------------------------------------------------------------ 14. more steps
 echo "== 14. klaar, en het plan wil meer stappen =="
-check "groot wordt klaar ($GSTEPS stappen)" wait_for 300 test "$(st groot status)" = klaar
+check "groot wordt klaar ($GSTEPS stappen)" wait_for 300 'test "$(st groot status)" = klaar'
 S --alleen-plan > "$T/s14a.txt"
 check "klaar -> overgeslagen" grep -q "groot (lange run): klaar" "$T/s14a.txt"
 sed -i "s/steps=$GSTEPS/steps=$((GSTEPS + 20000))/" "$T/plan.txt"
 S --alleen-plan > "$T/s14b.txt"
 check "meer stappen in het plan -> hervat" grep -q "groot (lange run): HERVAT" "$T/s14b.txt"
 check "  ... nieuw doel $((GSTEPS + 20000)) opgeslagen" test "$(st groot steps)" = $((GSTEPS + 20000))
-check "  ... en gehaald" wait_for 120 test "$(st groot status)" = klaar
-check "sweep scan klaar en geanalyseerd" wait_for 120 python3 -c "
+check "  ... en gehaald" wait_for 120 'test "$(st groot status)" = klaar'
+scan_done() { python3 -c "
 import json; d=json.load(open('$T/runs/scan/pc_sweep.json')); s=[v['status'] for v in d['state'].values()]
-assert len(s)==2 and all(x=='geanalyseerd' for x in s), s"
+assert len(s)==2 and all(x=='geanalyseerd' for x in s), s" 2>/dev/null; }
+check "sweep scan klaar en geanalyseerd" wait_for 120 scan_done
 
 echo "== $fails fout(en) =="
 exit $fails
