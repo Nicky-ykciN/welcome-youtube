@@ -1,0 +1,894 @@
+diff --git a/cel/pc/NOTES.md b/cel/pc/NOTES.md
+index 83ff5a8..3be4df5 100644
+--- a/cel/pc/NOTES.md
++++ b/cel/pc/NOTES.md
+@@ -366,3 +366,43 @@ Bevindingen en wat eraan gedaan is:
+   push), de échte apt-installatie uit cli.github.com (hier 403; alleen droog, plus de controle "ziet apt
+   cli.github.com" alleen beredeneerd), de echte curl-proef naar api.github.com (alleen nep-curl), explorer.exe/
+   wslview in WSL2, gh 2.4.0 in het echt, setup_wsl.sh zonder ffmpeg in het echt (alleen nep-selftest + hook).
++
++## PROEFRIT-BEVINDINGEN (verse-kloon-test) — 2026-10-12, workflow-agent
++Opdracht (7 punten): 1 herstart-bestendig (Windows-taak bij aanmelden -> verborgen wsl.exe -> start.sh --automatisch,
++houdt de distro wakker); 2 race in test_sweep_kill.sh; 3 test_thinning.sh zelfstandig + SKIP apart in alle_tests.sh;
++4 voorbeelden/ (memB-kop, gebruiksregels `python3 cel/pc/sweep.py cel/pc/voorbeelden/<f> --achtergrond`);
++5 longrun.py GPU->CPU-checkpoint omzetten (engine_gpu/ckpt_to_cpu.py) of weigeren + test; 6 tests uitvoerbaar /
++`bash ...`, opruimen in /tmp (mkdtemp, tmux-sockets, locks, selftest_gpu.sh-kopie via EXIT-trap); 7 README.md (root).
++Regels: geen git (alleen lezen), lichte tests (1-2 threads), runs/life*_src NIET aanraken, alleen cel/pc/**, README.md,
++STARTEN.md (herstartsectie), selftest_gpu.sh (alleen de zelfkopie-opruiming). Hier: 4 kernen, geen GPU, geen WSL.
++- [stap 0] gelezen: CLAUDE.md, STARTEN.md, start.sh, stop.sh, claude_rc.sh, longrun.py (main/run), pclib (engine,
++  locks), ckpt_to_cpu.py, selftest_gpu.sh, tests/alle_tests.sh, test_sweep_kill.sh, test_thinning.sh, voorbeelden/.
++- [stap 1] WSL-onderzoek (learn.microsoft.com geblokkeerd; wel GitHub): MicrosoftDocs/WSL wsl-config.md (ms.date
++  04/15/2026) + broncode microsoft/WSL (HEAD, sparse clone in scratchpad):
++  * [general] instanceIdleTimeout (standaard 15000 ms; -1 = nooit): "milliseconds that a distro is idle, before it is
++    shut down". [wsl2] vmIdleTimeout (standaard 60000 ms): VM stopt als er geen distro meer draait. Docs: "~8 s na het
++    sluiten van ALLE vensters".
++  * "idle" = geen Windows-CLIENTPROCES meer: LxssUserSession.cpp registreert per CreateInstance het aanroepende
++    Windows-proces (wsl.exe/wslg.exe) bij de LifetimeManager (Lifetime.cpp: wacht op het einde van die processen,
++    dan timer van instanceIdleTimeout -> s_TerminateInstance -> init: InitTerminateInstance -> met systemd
++    `systemctl poweroff`, na BootInitTimeout (10 s) reboot(RB_POWER_OFF)). Linux-processen (tmux, nohup, setsid,
++    onze supervisors) tellen NIET mee; alleen een bezet Plan9-bestand kan het uitstellen. -> zonder venster stopt
++    alles ~15 s later (supervisors krijgen SIGTERM: checkpoint, stopped_by=signaal).
++  * wslg.exe (src/windows/wslg: zelfde WslClient, maar Windows-subsysteem = GEEN consolevenster) staat in
++    %ProgramFiles%\WSL (msipackage/package.wix.in), opties -d, -u, --cd, --shell-type, `--`; LaunchProcess wacht
++    tot het Linux-proces stopt en is een gewone client -> houdt de distro wakker zolang ons script loopt.
++  Ontwerp: start.sh (gewone start, niet --alleen-plan) registreert via schtasks.exe /Create /XML een taak per distro
++  (aanmeldtrigger van DEZE gebruiker + 30 s vertraging + herhaling elke 10 min, IgnoreNew, ExecutionTimeLimit PT0S
++  (standaard van schtasks = 72 uur!), niet stoppen op accu, InteractiveToken/LeastPrivilege = geen admin nodig)
++  met actie wslg.exe -d DISTRO -u USER --cd REPO -- /bin/bash cel/pc/autostart.sh wakker (terugval zonder
++  wslg.exe: conhost.exe --headless wsl.exe ... --exec). autostart.sh wakker: start.sh --automatisch, daarna slapen
++  (= het wsl-clientproces blijft bestaan). Daarna meteen schtasks /Run (ook nu, met gesloten vensters, wakker).
++  Afgewezen: .wslconfig instanceIdleTimeout=-1 (geldt voor alle distro's, helpt niet na een herstart, pas na
++  wsl --shutdown actief); "Run whether user is logged on or not" (wachtwoord of S4U nodig; gebruiker logt toch in).
++- [stap 2] cel/pc/autostart.sh geschreven (aan | uit | status | wakker; XML-taak, UTF-16, idempotent via controlegetal,
++  schtasks /Run meteen, keep-alive met flock + pidfile). BLOKKADE: het automatisch registreren van de Windows-taak
++  vanuit start.sh werd door de toestemmingscontrole van deze omgeving geweigerd ("Unauthorized Persistence"). Dat
++  omzeil ik niet. Gekozen (veiliger): de taak komt er ALLEEN als de gebruiker zelf `bash cel/pc/autostart.sh aan`
++  typt (of Claude dat in de app na expliciete toestemming doet); start.sh registreert niets, maar toont een
++  Nederlandse tip zolang het uit staat. De beslissing "automatisch registreren bij de eerste start" ligt bij de
++  gebruiker/hoofdsessie (zie eindrapport). Rest van start.sh: --automatisch, claude_rc_ok, wachten op slot.
+diff --git a/cel/pc/plan.py b/cel/pc/plan.py
+index ff9e0dc..e79a5a0 100755
+--- a/cel/pc/plan.py
++++ b/cel/pc/plan.py
+@@ -6,7 +6,9 @@
+   python3 cel/pc/plan.py lijst        per planregel: wat het is en hoe het ervoor staat (verandert niets)
+   python3 cel/pc/plan.py proef        planregels controleren (ini's, parameters, jobbestanden) zonder te starten
+   python3 cel/pc/plan.py stop         alle draaiende runs en sweeps netjes stoppen (checkpoint); voor stop.sh
+-  opties: --plan PAD (ander planbestand), --droog (bij start: alleen tonen wat er zou gebeuren)
++  opties: --plan PAD (ander planbestand), --droog (bij start: alleen tonen wat er zou gebeuren),
++          --automatisch (bij start, voor start.sh --automatisch na het aanmelden bij Windows: wat stop.sh
++          stopte blijft gestopt, en na stop.sh start het ook geen nieuwe regels)
+ 
+ Planbestand (tekst, één actie per regel, '#' = commentaar, '\\' aan het eind = regel gaat door):
+ 
+@@ -23,7 +25,8 @@ Wat 'start' per regel doet:
+   * klaar                                 -> niets (een sweep krijgt wel nieuwe jobs als het jobbestand er
+                                              meer heeft; een lange run gaat verder als het plan meer stappen wil);
+   * onderbroken (herstart van de pc, stroomstoring, crash, stop.sh) -> hervatten vanaf het laatste checkpoint
+-    met de opgeslagen instellingen (pc/longrun.py NAAM / pc/sweep.py --hervat NAAM);
++    met de opgeslagen instellingen (cel/pc/longrun.py NAAM / cel/pc/sweep.py --hervat NAAM); met --automatisch
++    niet wat stop.sh stopte (dat was een keuze; een start.sh in een venster hervat het wel);
+   * bewust gestopt met --stop (niet via stop.sh) -> blijft staan (dat was een keuze van iemand);
+   * lange run op de GPU terwijl de GPU (nog) niet werkt -> wacht (wordt bij een volgende start opnieuw geprobeerd).
+ Een bestaande run verandert nooit van parameters: past het plan niet meer bij een run, dan zegt 'start' dat.
+@@ -43,6 +46,13 @@ import pclib as P  # noqa: E402
+ 
+ PLAN_DEFAULT = os.environ.get("OERCEL_PLAN") or os.path.join(P.PC, "plan.txt")
+ STOP_MARK = "pc_gestopt_door_stop_sh"      # written by `plan.py stop` (stop.sh): start.sh resumes these
++HOLD_NAME = ".pc_gestopt_door_stop_sh"    # in runs/: stop.sh was the last word; removed by a (non-automatic) start
++AUTO = False                               # start --automatisch: stop.sh's choices stand (no resume, no new lines)
++AUTO_HOLD = False                          # ... and stop.sh was used since the last start: nothing new either
++
++
++def hold_file():
++    return os.path.join(P.runs_dir(), HOLD_NAME)
+ SCRIPTS = {"longrun.py": "longrun", "sweep.py": "sweep"}
+ LONGRUN_VALUE_OPTS = ["--ini", "--steps", "--engine", "--van-ckpt", "--threads", "--chunk-min", "--analyse-uur",
+                       "--analyse-jobs", "--keep-recent", "--max-stride", "--max-snap-gb", "--keep-ckpt",
+@@ -281,7 +291,7 @@ def longrun_state(rd, plan_steps=None):
+     raw = st.get("status")
+     if raw == "klaar" and not (plan_steps and plan_steps > int(st.get("steps", 0))):
+         return "klaar", st
+-    if raw == "gestopt" and st.get("stopped_by") == "gebruiker" and not os.path.exists(os.path.join(rd, STOP_MARK)):
++    if raw == "gestopt" and st.get("stopped_by") == "gebruiker" and (AUTO or not os.path.exists(os.path.join(rd, STOP_MARK))):
+         return "bewust", st
+     return "onderbroken", st
+ 
+@@ -302,7 +312,7 @@ def sweep_state(sd, jobnames=None):
+     if not unfinished:
+         return "klaar", st
+     user_stop = st.get("supervisor_state") == "gestopt" and st.get("stopped_by") == "gebruiker"
+-    if user_stop and not os.path.exists(os.path.join(sd, STOP_MARK)):
++    if user_stop and (AUTO or not os.path.exists(os.path.join(sd, STOP_MARK))):
+         return "bewust", st
+     return "onderbroken", st
+ 
+@@ -394,8 +404,12 @@ def do_longrun(e, dry):
+         clear_mark(rd)
+         return f"{head}: klaar ({P.fmt_int(st.get('steps'))} stappen; zie {P.shown_path(os.path.join(rd, 'STATUS.md'))})", "klaar"
+     if state == "bewust":
++        if AUTO and os.path.exists(os.path.join(rd, STOP_MARK)):
++            return f"{head}: gestopt met stop.sh; wordt niet automatisch hervat (verder: bash cel/pc/start.sh)", "bewust"
+         return (f"{head}: bewust gestopt met --stop; blijft staan. Toch verder: "
+                 f"{P.shown_cmd('longrun.py', name + ' --achtergrond')}"), "bewust"
++    if AUTO_HOLD and (state == "nieuw" or (st or {}).get("status") == "klaar"):
++        return f"{head}: niet gestart — de experimenten zijn met stop.sh gestopt (verder: bash cel/pc/start.sh)", "bewust"
+     if state == "nieuw":
+         if a.ini and not os.path.exists(resolve(a.ini)):
+             return f"{head}: FOUT — ini niet gevonden: {a.ini}", "fout"
+@@ -456,8 +470,12 @@ def do_sweep(e, dry):
+         clear_mark(sd)
+         return f"{head}: klaar ({sweep_counts(st)}; ranglijst {P.shown_path(os.path.join(sd, 'SAMENVATTING.md'))})", "klaar"
+     if state == "bewust":
++        if AUTO and os.path.exists(os.path.join(sd, STOP_MARK)):
++            return f"{head}: gestopt met stop.sh; wordt niet automatisch hervat (verder: bash cel/pc/start.sh)", "bewust"
+         return (f"{head}: bewust gestopt met --stop; blijft staan. Toch verder: "
+                 f"{P.shown_cmd('sweep.py', '--hervat ' + name + ' --achtergrond')}"), "bewust"
++    if AUTO_HOLD and state in ("nieuw", "uitbreiden"):
++        return f"{head}: niet {'gestart' if state == 'nieuw' else 'uitgebreid'} — de experimenten zijn met stop.sh gestopt (verder: bash cel/pc/start.sh)", "bewust"
+     if state in ("nieuw", "uitbreiden"):
+         args = with_abs_paths(e["args"], SWEEP_VALUE_OPTS, new_positional=e["jobfile"])
+         if not a.achtergrond:
+@@ -508,8 +526,9 @@ def resume_others(names, dry):
+             if mark:
+                 clear_mark(d)
+             continue
+-        if not (auto or mark):
+-            out.append(f"  {name}: bewust gestopt; blijft staan (verder: {P.shown_cmd(resume[0], resume[1])})")
++        if not (auto or (mark and not AUTO)):
++            why = "gestopt met stop.sh; wordt niet automatisch hervat" if mark else "bewust gestopt; blijft staan"
++            out.append(f"  {name}: {why} (verder: {P.shown_cmd(resume[0], resume[1])})")
+             continue
+         if kind == "longrun":
+             ok, why = gpu_ok_for(st)
+@@ -527,8 +546,19 @@ def resume_others(names, dry):
+ 
+ 
+ # ----------------------------------------------------------------------------- commands
+-def cmd_start(plan, dry):
+-    print(f"Experimentplan: {P.shown_path(plan)}")
++def cmd_start(plan, dry, auto=False):
++    global AUTO, AUTO_HOLD
++    AUTO = auto
++    AUTO_HOLD = auto and os.path.exists(hold_file())
++    print(f"Experimentplan: {P.shown_path(plan)}" + ("   (automatische start)" if auto else ""))
++    if AUTO_HOLD:
++        print("  De experimenten zijn met stop.sh gestopt: de automatische start hervat die niet en start niets nieuws\n"
++              "  (wel wat door een herstart of stroomstoring onderbroken is). Weer alles: bash cel/pc/start.sh")
++    elif not auto and not dry:
++        try:
++            os.unlink(hold_file())
++        except OSError:
++            pass
+     try:
+         entries = read_plan(plan)
+     except PlanError as e:
+@@ -676,8 +706,15 @@ def cmd_proef(plan):
+ 
+ def cmd_stop():
+     """Stop every running long run and sweep cleanly (their own --stop), in parallel.  Each gets the
+-    marker STOP_MARK, so the next start.sh resumes it (a plain --stop stays stopped)."""
++    marker STOP_MARK, so the next start.sh resumes it (a plain --stop stays stopped).  runs/HOLD_NAME says that
++    stop.sh was the last word: the automatic start after logging in to Windows then resumes nothing of it."""
+     runs = P.runs_dir()
++    try:
++        os.makedirs(runs, exist_ok=True)
++        with open(hold_file(), "w") as f:
++            f.write(f"{P.stamp()} stop.sh: experimenten gestopt (een start.sh in een venster hervat ze)\n")
++    except OSError:
++        pass
+     procs = []
+     for d in sorted(glob.glob(os.path.join(runs, "*"))):
+         name = os.path.basename(d)
+@@ -724,6 +761,8 @@ def main():
+     ap.add_argument("actie", choices=["start", "lijst", "proef", "stop"])
+     ap.add_argument("--plan", default=PLAN_DEFAULT)
+     ap.add_argument("--droog", action="store_true", help="bij start: niets starten, alleen tonen")
++    ap.add_argument("--automatisch", action="store_true",
++                    help="bij start (start.sh --automatisch): wat stop.sh stopte blijft gestopt")
+     a = ap.parse_args()
+     if a.actie == "stop":
+         return cmd_stop()
+@@ -731,7 +770,7 @@ def main():
+         print(f"geen planbestand: {a.plan}")
+         return 1 if a.actie != "start" else 0
+     if a.actie == "start":
+-        return cmd_start(a.plan, a.droog)
++        return cmd_start(a.plan, a.droog, a.automatisch)
+     try:
+         return cmd_lijst(a.plan) if a.actie == "lijst" else cmd_proef(a.plan)
+     except PlanError as e:
+diff --git a/cel/pc/start.sh b/cel/pc/start.sh
+index 23e6b08..3ca2512 100755
+--- a/cel/pc/start.sh
++++ b/cel/pc/start.sh
+@@ -12,9 +12,14 @@
+ #      daarna staat de sessie 'Oercel werkstation' in de Claude-app onder Code
+ #   6. één keer inloggen bij GitHub (gh auth login; meteen na het inloggen bij Claude), zodat Claude resultaten
+ #      kan pushen; git krijgt een naam en e-mail voor commits (alleen in deze repo) als die nog ontbreken
++#   (vanzelf verder na een herstart van Windows: alleen als je dat zelf aanzet met  bash cel/pc/autostart.sh aan
++#    — een taak in de Windows-Taakplanner die bij het aanmelden start.sh --automatisch draait en Ubuntu wakker houdt;
++#    start.sh zelf maakt die taak nooit, het toont alleen een tip zolang hij uit staat)
+ # Opties:
+ #   --geen-setup     installatie overslaan        --setup          installatie opnieuw, ook als hij al gelukt is
+ #   --geen-claude    stap 2, 5 en 6 overslaan     --alleen-plan    alleen stap 3 en 4 (handig voor Claude)
++#   --automatisch    wat die Windows-taak start: nooit vragen, nooit sudo, nooit wachten; geen installatie;
++#                    Claude alleen als die al ingelogd is en Remote Control al eens bevestigd is
+ # Stoppen: bash cel/pc/stop.sh (experimenten; Claude blijft draaien)  ·  bash cel/pc/stop.sh --alles
+ set -u -o pipefail
+ 
+@@ -32,14 +37,15 @@ RC_NAME=${OERCEL_CLAUDE_NAME:-Oercel werkstation}
+ TMUXC=(tmux)
+ [ -n "${OERCEL_TMUX_SOCKET:-}" ] && TMUXC=(tmux -L "$OERCEL_TMUX_SOCKET")
+ 
+-DO_SETUP=auto; DO_CLAUDE=1; DO_PLAN=1
++DO_SETUP=auto; DO_CLAUDE=1; DO_PLAN=1; AUTO=0; ALLEEN_PLAN=0
+ usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; }
+ for arg in "$@"; do
+   case "$arg" in
+     --geen-setup) DO_SETUP=0 ;;
+     --setup) DO_SETUP=1 ;;
+     --geen-claude) DO_CLAUDE=0 ;;
+-    --alleen-plan) DO_SETUP=0; DO_CLAUDE=0 ;;
++    --alleen-plan) DO_SETUP=0; DO_CLAUDE=0; ALLEEN_PLAN=1 ;;
++    --automatisch) AUTO=1; DO_SETUP=0 ;;
+     -h|--help) usage; exit 0 ;;
+     *) echo "onbekende optie: $arg"; usage; exit 2 ;;
+   esac
+@@ -53,7 +59,7 @@ goed() { printf '  %sOK%s  %s\n' "$G" "$N" "$*"; }
+ let_op() { printf '  %sLET OP%s  %s\n' "$Y" "$N" "$*"; }
+ fout() { printf '  %sFOUT%s  %s\n' "$R" "$N" "$*"; }
+ have() { command -v "$1" >/dev/null 2>&1; }
+-interactive() { [ -t 0 ] && [ -t 1 ]; }
++interactive() { [ "$AUTO" = 0 ] && [ -t 0 ] && [ -t 1 ]; }
+ tm() { "${TMUXC[@]}" "$@" 9>&-; }
+ RESULT=()     # one line per step for the summary at the end
+ noteer() { RESULT+=("$(printf '%-22s %s' "$1" "$2")"); }
+@@ -66,8 +72,9 @@ if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != root ]
+ fi
+ 
+ # the repository on the Windows drive (/mnt/c/...): ~10x slower and file locking may not work.
+-# Make a copy in the Linux home directory and continue there.
+-case "$REPO/" in
++# Make a copy in the Linux home directory and continue there.  (--automatisch: the Windows task already
++# points at the copy, because start.sh registered it from there.)
++[ "$AUTO" = 1 ] || case "$REPO/" in
+   /mnt/[a-zA-Z]/*|"${OERCEL_TEST_WINDRIVE:-/nonexistent-oercel}"/*)
+     dest=$HOME/$(basename "$REPO")
+     say "De repo staat op de Windows-schijf ($REPO). Daar is alles ~10x trager."
+@@ -92,16 +99,27 @@ case "$REPO/" in
+ esac
+ 
+ mkdir -p "$STATE" || { say "kan $STATE niet maken"; exit 1; }
+-# only one start.sh at a time (a second window would start everything twice)
++# only one start.sh at a time (a second window would start everything twice).  start.lock.wie says who holds
++# it: the automatic start after logging in to Windows is short and never waits, so a window waits for it.
+ if have flock; then
+   exec 9>"$STATE/start.lock"
+   if ! flock -n 9; then
+-    say "start.sh draait al (in een ander venster). Kijk daar, of wacht tot het klaar is."
+-    exit 0
++    if [ "$AUTO" = 1 ]; then
++      say "start.sh draait al (in een Ubuntu-venster); de automatische start doet nu niets"
++      exit 0
++    fi
++    if grep -qs '^automatisch' "$STATE/start.lock.wie"; then
++      say "start.sh draait nu automatisch (na het aanmelden bij Windows); even wachten tot dat klaar is ..."
++      flock -w "${OERCEL_LOCK_WAIT:-300}" 9 || { say "dat duurt te lang; probeer het over een paar minuten opnieuw."; exit 0; }
++    else
++      say "start.sh draait al (in een ander venster). Kijk daar, of wacht tot het klaar is."
++      exit 0
++    fi
+   fi
++  { [ "$AUTO" = 1 ] && echo "automatisch $$" || echo "venster $$"; } > "$STATE/start.lock.wie"
+ fi
+ 
+-say "${B}Oercel starten${N} — $(date '+%Y-%m-%d %H:%M')   (repo: $REPO)"
++say "${B}Oercel starten${N}$([ "$AUTO" = 1 ] && echo " (automatisch, na het aanmelden bij Windows)") — $(date '+%Y-%m-%d %H:%M')   (repo: $REPO)"
+ if ! grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
+   say "(dit is geen WSL; ik ga door als gewone Linux)"
+ fi
+@@ -172,7 +190,9 @@ run_setup() {
+ }
+ run_plan() {
+   kop "$1"
+-  python3 "$PC_DIR/plan.py" start 9>&-
++  local extra=()
++  [ "$AUTO" = 1 ] && extra=(--automatisch)      # leaves alone what stop.sh stopped
++  python3 "$PC_DIR/plan.py" start "${extra[@]}" 9>&-
+   local rc=$?
+   [ "$rc" = 0 ] && noteer "experimenten" "plan toegepast (cel/pc/plan.txt)" || noteer "experimenten" "plan toegepast, met meldingen (zie boven)"
+   return 0
+@@ -207,11 +227,16 @@ if [ "$WANT_SETUP" = 1 ]; then
+ elif [ "$DO_SETUP" = auto ] && [ "$SST" = ok ]; then
+   goed "installatie: al eerder gelukt ($(setup_logs | head -n1 | xargs -r basename))"
+   noteer "installatie" "al eerder gelukt"
++elif [ "$AUTO" = 1 ] && { [ "$SST" != ok ] || ! essentials_ok; }; then
++  # never here: the setup needs sudo (a password) and someone at the keyboard
++  let_op "de installatie is nog niet (helemaal) gelukt; dat kan alleen in een Ubuntu-venster: bash cel/pc/start.sh"
++  noteer "installatie" "nog niet gelukt: open Ubuntu en typ  bash cel/pc/start.sh"
+ fi
+ 
+ # packages start.sh itself needs (setup_wsl.sh installs them too; this is for an older setup)
+ apt_install() {
+   local pk=("$@")
++  if [ "$AUTO" = 1 ]; then say "  ${pk[*]} ontbreekt; installeren kan alleen in een Ubuntu-venster (bash cel/pc/start.sh)"; return 1; fi
+   if [ "${OERCEL_TEST_NO_APT:-0}" = 1 ]; then say "  [test] zou installeren: apt-get install ${pk[*]}"; return 1; fi
+   local S=""
+   [ "$(id -u)" -ne 0 ] && S=sudo
+@@ -321,6 +346,24 @@ rc_asks() {
+     awk 'NF == 0 { next } /claude\.ai\/code/ { n = 0; next } { l[++n] = $0 } END { for (i = (n > 8 ? n - 7 : 1); i <= n; i++) print l[i] }' |
+     grep -qiE '\(y/n\)|\[y/n\]|trust|enable remote|not logged in|log ?in (to|with|first)|auth login|/login|press enter|enter to (confirm|continue)|paste|choose'
+ }
++# Has Remote Control worked here (questions answered, session running)?  Then STATE/claude_rc_ok: only with it does
++# start.sh --automatisch start Claude (nobody is there to answer questions).  Evidence: the session link on screen
++# without a question after it, or a remote-control that has run for 2 minutes without a question.
++RC_OK=$STATE/claude_rc_ok
++rc_link_seen() { tm capture-pane -p -t "=$SES:" 2>/dev/null | grep -q 'claude\.ai/code'; }
++rc_age() {
++  local pid c a=""
++  pid=$(tm list-panes -t "=$SES" -F '#{pane_pid}' 2>/dev/null | head -n1)
++  [ -n "$pid" ] && c=$(pgrep -P "$pid" -f 'remote-control' 2>/dev/null | head -n1) && [ -n "$c" ] &&
++    a=$(ps -o etimes= -p "$c" 2>/dev/null | tr -d ' ')
++  echo "${a:-0}"
++}
++note_rc_ok() {
++  have tmux || return 0
++  { [ "$(rc_state)" = draait ] && ! rc_asks; } || return 0
++  if rc_link_seen || [ "$(rc_age)" -ge "${OERCEL_RC_OK_AGE:-120}" ]; then : > "$RC_OK"; fi
++  return 0
++}
+ offer_attach() {    # $1 = why; shows the instructions, then switches to the Claude window (terminal only)
+   if ! interactive; then
+     let_op "Claude wacht in tmux op een antwoord; beantwoord dat in een terminal:  tmux attach -t $SES"
+@@ -344,6 +387,8 @@ offer_attach() {    # $1 = why; shows the instructions, then switches to the Cla
+     let_op "het Claude-venster is gesloten; Claude draait niet. Opnieuw: bash cel/pc/start.sh"
+   elif rc_asks; then
+     let_op "Claude wacht nog op een antwoord. Later beantwoorden: tmux attach -t $SES   (of start.sh opnieuw)"
++  else
++    note_rc_ok
+   fi
+ }
+ start_rc() {
+@@ -377,8 +422,10 @@ start_rc() {
+       say "  tmux-sessie '$SES' bestaat maar Claude draait er niet meer in: opnieuw starten"
+       tm kill-session -t "=$SES" 2>/dev/null ;;
+   esac
+-  login_claude || let_op "zonder inloggen start Remote Control niet; in het tmux-venster zie je de melding"
+-  setup_github      # the user is at the keyboard now (the Claude login needed them): GitHub too, before tmux
++  if [ "$AUTO" = 0 ]; then
++    login_claude || let_op "zonder inloggen start Remote Control niet; in het tmux-venster zie je de melding"
++    setup_github      # the user is at the keyboard now (the Claude login needed them): GitHub too, before tmux
++  fi
+   kop "Claude Remote Control (vervolg)"
+   if ! have tmux; then apt_install tmux || true; fi
+   if ! have tmux; then
+@@ -420,6 +467,28 @@ start_rc() {
+   if [ "$first" = 0 ] || interactive; then : > "$STATE/claude_rc_eerder_gestart"; fi
+ }
+ 
++# --automatisch: nobody is at the keyboard.  Start Claude only when it is logged in and Remote Control worked here
++# before; otherwise one line for status.py, and the app stays silent until someone runs start.sh in a window.
++auto_rc() {
++  if ! find_claude; then
++    kop "5. Claude Remote Control"
++    let_op "Claude Code is nog niet geïnstalleerd; dat gebeurt bij  bash cel/pc/start.sh  in een Ubuntu-venster"
++    noteer "Remote Control" "niet gestart: Claude Code ontbreekt (open Ubuntu: bash cel/pc/start.sh)"; return 0
++  fi
++  fix_path
++  if ! logged_in; then
++    kop "5. Claude Remote Control"
++    let_op "nog niet ingelogd bij Claude; dat kan alleen in een Ubuntu-venster: bash cel/pc/start.sh"
++    noteer "Remote Control" "niet gestart: nog niet ingelogd (open Ubuntu: bash cel/pc/start.sh)"; return 0
++  fi
++  if [ ! -f "$RC_OK" ] && [ "$(rc_state)" = geen ]; then
++    kop "5. Claude Remote Control"
++    let_op "Remote Control is hier nog nooit bevestigd ('Enable Remote Control?', 'Trust'); dat kan alleen in een Ubuntu-venster: bash cel/pc/start.sh"
++    noteer "Remote Control" "niet gestart: nog nooit bevestigd (open Ubuntu: bash cel/pc/start.sh)"; return 0
++  fi
++  start_rc
++}
++
+ # ------------------------------------------------------------------------------------ 6. GitHub
+ # The clone is anonymous (https): without credentials Claude cannot push its results.  Once: 'gh auth login'
+ # with a one-time code in the browser, then 'gh auth setup-git' (git asks gh for the token of github.com).
+@@ -566,14 +635,21 @@ setup_github() {
+ }
+ 
+ # ------------------------------------------------------------------------------------ uitvoeren
+-if [ "$DO_CLAUDE" = 1 ]; then install_claude; fi
++if [ "$DO_CLAUDE" = 1 ] && [ "$AUTO" = 0 ]; then install_claude; fi
+ if [ "$DO_PLAN" = 1 ]; then
+-  if [ "$PLAN_DONE" = 1 ]; then run_plan "3. Experimenten (plan nog eens, na de installatie)"
++  if [ "$AUTO" = 1 ] && ! essentials_ok; then
++    kop "3. Experimenten"
++    let_op "de CPU-engine of de Python-pakketten ontbreken: eerst de installatie (bash cel/pc/start.sh in een venster)"
++    noteer "experimenten" "niet gestart: installatie nodig"
++  elif [ "$PLAN_DONE" = 1 ]; then run_plan "3. Experimenten (plan nog eens, na de installatie)"
+   else run_plan "3. Experimenten (cel/pc/plan.txt)"; fi
+ fi
+ kop "4. Status"
+ python3 "$PC_DIR/status.py" --kort 9>&- || true
+-if [ "$DO_CLAUDE" = 1 ]; then start_rc; setup_github; fi
++if [ "$DO_CLAUDE" = 1 ]; then
++  if [ "$AUTO" = 1 ]; then auto_rc; else start_rc; setup_github; fi
++fi
++note_rc_ok
+ 
+ kop "Samenvatting"
+ for l in "${RESULT[@]}"; do say "  $l"; done
+@@ -583,8 +659,19 @@ if [ "$DO_CLAUDE" = 1 ] && [ "$(rc_state)" != geen ]; then
+   say "  Even kijken in dit venster: tmux attach -t $SES     terug: Ctrl+b, dan d"
+ fi
+ say "Status:   python3 cel/pc/status.py          Stoppen: bash cel/pc/stop.sh   (alles, ook Claude: --alles)"
++[ "$AUTO" = 1 ] && exit 0
+ [ "$PATH_ADDED" = 1 ] && say "Zelf 'claude' typen kan in een nieuw Ubuntu-venster (in dit venster eerst: source ~/.bashrc)."
+ case "$REPO" in "$HOME"/*) RSHOW="~/${REPO#"$HOME"/}" ;; *) RSHOW=$REPO ;; esac
+-say "Na een herstart van de pc: open Ubuntu en typ weer   cd $RSHOW && bash cel/pc/start.sh"
+-say "Laat dit Ubuntu-venster open (minimaliseren mag): als alle Ubuntu-vensters dicht zijn kan Windows WSL stoppen."
++# vanzelf verder na een herstart: only when the user turned it on (bash cel/pc/autostart.sh aan); start.sh never does
++if [ -s "$STATE/autostart_taak.txt" ]; then
++  say "Automatisch starten staat aan: na een herstart alleen aanmelden bij Windows; alles gaat vanzelf verder."
++  say "Je mag dit Ubuntu-venster sluiten (Ubuntu blijft wakker). Uitzetten: bash cel/pc/autostart.sh uit"
++elif [ "$ALLEEN_PLAN" = 0 ]; then
++  say "Na een herstart van de pc: open Ubuntu en typ weer   cd $RSHOW && bash cel/pc/start.sh"
++  say "Laat dit Ubuntu-venster open (minimaliseren mag): als alle Ubuntu-vensters dicht zijn kan Windows WSL stoppen."
++  if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
++    say "Tip: moet alles na een herstart van Windows vanzelf verdergaan (en mogen de vensters dicht)? Dat kan als je"
++    say "     het zelf aanzet: bash cel/pc/autostart.sh aan   (een taak in de Windows-Taakplanner; uit: ... autostart.sh uit)"
++  fi
++fi
+ exit 0
+diff --git a/cel/pc/status.py b/cel/pc/status.py
+index 73b1069..9d26453 100644
+--- a/cel/pc/status.py
++++ b/cel/pc/status.py
+@@ -48,6 +48,55 @@ def machine_line(runs):
+     return " · ".join(parts)
+ 
+ 
++def autostart_lines(kort=False):
++    """Automatic start after a Windows reboot (cel/pc/autostart.sh, only when the user turned it on):
++    is the Windows task there, is Ubuntu kept awake, and what did the last automatic start do."""
++    state = os.environ.get("OERCEL_START_STATE") or P.BUILD_DIR
++    info = {}
++    try:
++        with open(os.path.join(state, "autostart_taak.txt")) as f:
++            info = dict(l.rstrip("\n").split("=", 1) for l in f if "=" in l)
++    except OSError:
++        pass
++    pid = None
++    try:
++        with open(os.path.join(state, "autostart.pid")) as f:
++            p = int(f.read().strip() or 0)
++        if p and "autostart.sh" in " ".join(P.proc_cmdline(p)):
++            pid = p
++    except (OSError, ValueError):
++        pass
++    wsl = P.is_wsl() or bool(os.environ.get("WSL_DISTRO_NAME"))
++    if not info and pid is None and not wsl:
++        return []
++    if info:
++        head = f"automatisch starten na een herstart: AAN (Windows-taak '{info.get('taak', '?')}')"
++    else:
++        head = "automatisch starten na een herstart: uit (aanzetten: bash cel/pc/autostart.sh aan)"
++    if pid is not None:
++        try:
++            since = P.stamp(os.path.getmtime(os.path.join(state, "autostart.pid")))
++        except OSError:
++            since = "?"
++        head += f"; Ubuntu wordt wakker gehouden (sinds {since})"
++    elif info:
++        head += "; Ubuntu wordt NU NIET wakker gehouden (de taak start binnen 10 minuten opnieuw)"
++    out = ["  " + head]
++    if kort:
++        return out
++    # the last automatic start: from its "aangemeld bij Windows" line to the end of the log
++    try:
++        with open(os.path.join(state, "autostart.log")) as f:
++            lines = f.read().splitlines()[-200:]
++    except OSError:
++        lines = []
++    start = max((i for i, l in enumerate(lines) if "aangemeld bij Windows" in l), default=None)
++    if start is not None:
++        out.append("    laatste automatische start:")
++        out += ["      " + l.strip() for l in lines[start:start + 14]]
++    return out
++
++
+ LR_LABEL = {"loopt": "loopt", "klaar": "klaar", "fout": "FOUT", "gestopt": "gestopt", "nieuw": "nieuw",
+             "wacht_op_schijf": "GEPAUZEERD"}
+ 
+@@ -158,7 +207,12 @@ def main():
+           f"(CPU-engine: {'ok' if os.path.exists(P.ENGINE_CPU) else 'ONTBREEKT'}, "
+           f"GPU-engine: {'gebouwd' if os.path.exists(P.ENGINE_GPU) else 'niet gebouwd'})")
+     if P.on_windows_drive(P.CEL):
+-        print("  LET OP: de repo staat op de Windows-schijf (/mnt/...): veel trager; kloon hem in ~ (zie pc/README.md)")
++        print("  LET OP: de repo staat op de Windows-schijf (/mnt/...): veel trager; kloon hem in ~ (zie cel/pc/README.md)")
++    try:
++        for line in autostart_lines(a.kort):
++            print(line)
++    except Exception as e:      # a display problem must never break the overview
++        print(f"  automatisch starten: status niet leesbaar ({e!r})")
+     lr, sw = [], []
+     for d in sorted(glob.glob(os.path.join(runs, "*"))):
+         if a.namen and os.path.basename(d) not in a.namen:
+diff --git a/cel/pc/stop.sh b/cel/pc/stop.sh
+index a0c108d..2010743 100755
+--- a/cel/pc/stop.sh
++++ b/cel/pc/stop.sh
+@@ -2,12 +2,15 @@
+ # Oercel — alle experimenten netjes stoppen.  In een Ubuntu-terminal (WSL), vanuit de repo:
+ #
+ #     bash cel/pc/stop.sh            alle lange runs en sweeps stoppen; Claude Remote Control blijft draaien
+-#     bash cel/pc/stop.sh --alles    ook Claude Remote Control stoppen (tmux-sessie 'oercel-claude')
++#     bash cel/pc/stop.sh --alles    ook Claude Remote Control stoppen (tmux-sessie 'oercel-claude') en, als je
++#                                    automatisch starten had aangezet, dat uitzetten (bash cel/pc/autostart.sh uit)
+ #
+ # Elke engine schrijft eerst een checkpoint (dat duurt hooguit een paar minuten).  Er gaat niets
+ # verloren: bash cel/pc/start.sh hervat later precies wat hier gestopt is, vanaf dat checkpoint.
++# De automatische start na een herstart van Windows (als die aan staat) hervat wat hier gestopt is NIET.
+ set -u -o pipefail
+ PC_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
++STATE=${OERCEL_START_STATE:-$PC_DIR/_build}
+ SES=${OERCEL_TMUX_SESSION:-oercel-claude}
+ TMUXC=(tmux)
+ [ -n "${OERCEL_TMUX_SOCKET:-}" ] && TMUXC=(tmux -L "$OERCEL_TMUX_SOCKET")
+@@ -32,8 +35,15 @@ if [ "$ALLES" = 1 ]; then
+   else
+     echo "Claude Remote Control draaide niet (geen tmux-sessie '$SES')."
+   fi
++  # automatic start after a Windows reboot (only exists when the user turned it on)
++  if [ -s "$STATE/autostart_taak.txt" ] || [ -s "$STATE/autostart.pid" ]; then
++    echo "Automatisch starten uitzetten:"
++    bash "$PC_DIR/autostart.sh" uit || rc=1
++  fi
+ else
+   echo "Claude Remote Control blijft draaien (ook stoppen: bash cel/pc/stop.sh --alles)."
++  [ -s "$STATE/autostart_taak.txt" ] &&
++    echo "Na een herstart van Windows blijven de experimenten gestopt; Claude start dan wel vanzelf."
+ fi
+ echo "Weer starten: bash cel/pc/start.sh  (hervat alles wat hier gestopt is)"
+ exit "$rc"
+diff --git a/cel/pc/tests/test_start.sh b/cel/pc/tests/test_start.sh
+index 180fd12..67da47d 100755
+--- a/cel/pc/tests/test_start.sh
++++ b/cel/pc/tests/test_start.sh
+@@ -32,6 +32,16 @@
+ #  18. setup_wsl.sh (droog, in een kopie): gh uit GitHubs officiële repository (ook als Ubuntu een oud pakket heeft;
+ #      onbereikbaar -> Ubuntu-pakket; oude gh bijwerken, nieuwe laten staan), tools/selftest.py PASS/FAIL in de
+ #      samenvatting (zonder ffmpeg alleen video-fout -> waarschuwing), overgeslagen met --snel/--geen-tests
++#  19. automatisch starten na een herstart van Windows (cel/pc/autostart.sh), met nep-schtasks.exe/cmd.exe/whoami.exe/
++#      wslpath en een nep-Windows-schijf: start.sh maakt zelf GEEN taak (alleen een tip); 'autostart.sh aan' maakt de
++#      taak (UTF-16-XML: aanmelden van deze gebruiker, herhaling, geen tijdslimiet, wslg.exe -d/-u/--cd, terugval
++#      conhost --headless), idempotent, start hem meteen; de taak (nagebootst zoals wslg.exe) -> start.sh --automatisch
++#      -> plan hervat, Claude gestart (--continue), geen setup/sudo/gh/vragen; "herstart" (alles kill -9) -> alles
++#      terug; na stop.sh blijft gestopt wat stop.sh stopte (en niets nieuws), wel wat een stroomstoring onderbrak;
++#      niet ingelogd / nooit bevestigd -> geen Claude, één regel; slot: venster wacht op de automatische start, de
++#      automatische start wacht nooit; status.py; stop.sh --alles -> taak weg, wakker houden gestopt; geen WSL /
++#      geen Windows-programma's / schtasks faalt -> nette melding
++# Opruimen: eigen tmux-socketmap (TMUX_TMPDIR) en alle tijdelijke bestanden onder de testmap; niets blijft in /tmp.
+ # usage: bash cel/pc/tests/test_start.sh [outdir]      (default cel/pc/_test/start; ~5-15 minuten, 1-2 threads)
+ set -u
+ CEL=$(cd "$(dirname "$0")/../.." && pwd)
+@@ -40,6 +50,9 @@ T=${1:-$PC/_test/start}
+ SOCK=oercel_test_$$
+ rm -rf "$T"; mkdir -p "$T/bin" "$T/home" "$T/runs" "$T/beelden" "$T/state" "$T/setup_logs"
+ T=$(cd "$T" && pwd)
++# tmux sockets in a private directory (a short path: sockets have a length limit), removed at the end
++TX=$(mktemp -d "${TMPDIR:-/tmp}/oercel_tx.XXXXXX")
++export TMUX_TMPDIR=$TX
+ fails=0
+ pass() { echo "PASS  $*"; }
+ fail() { echo "FAIL  $*"; fails=$((fails + 1)); }
+@@ -233,11 +246,17 @@ unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_HOST
+ unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL EMAIL
+ touch "$HOME/.bashrc"
+ cleanup() {
++  local w
++  w=$(cat "$T/state/autostart.pid" 2>/dev/null)     # section 19: the keep-alive started by the fake task
++  if [ -n "$w" ] && tr '\0' ' ' < "/proc/$w/cmdline" 2>/dev/null | grep -q 'autostart.sh wakker'; then
++    pkill -P "$w" 2>/dev/null; kill "$w" 2>/dev/null
++  fi
+   tmux -L "$SOCK" kill-server 2>/dev/null
+   for d in "$T"/runs/*; do
+     [ -f "$d/pc_longrun.json" ] && python3 "$PC/longrun.py" "$(basename "$d")" --stop >/dev/null 2>&1
+     [ -f "$d/pc_sweep.json" ] && python3 "$PC/sweep.py" --stop "$(basename "$d")" >/dev/null 2>&1
+   done
++  rm -rf "${TX:?}"
+ }
+ trap cleanup EXIT
+ 
+@@ -308,6 +327,7 @@ check "status --kort getoond" grep -q "LANGE RUNS" "$T/s1.txt"
+ check "Remote Control in tmux, met --name 'Oercel werkstation' en zonder --continue" \
+   grep -q "remote-control --name Oercel werkstation$" "$HOME/fake_claude.log"
+ check "tmux-sessie oercel-claude bestaat en Claude draait erin" test "$(nrc)" = 1
++check "Remote Control bevestigd en sessie-link gezien -> merkteken claude_rc_ok (voor de automatische start)" test -f "$T/state/claude_rc_ok"
+ check "uitleg Ctrl+b d getoond, en samenvatting na het terugkomen" grep -q "Ctrl+b indrukken, loslaten, dan d" "$T/s1.txt"
+ grep -q "Terug uit het Claude-venster" "$T/s1.txt" && grep -q "== Samenvatting ==" "$T/s1.txt" && pass "teruggekeerd uit tmux, samenvatting" || fail "geen samenvatting na detach"
+ ngl() { grep -c "auth login --hostname" "$HOME/fake_gh.log" 2>/dev/null || echo 0; }
+@@ -623,7 +643,7 @@ check "de echte repo is niet aangepast (.git/config)" test "$(cksum < "$CEL/../.
+ 
+ # ------------------------------------------------------------------------------ 17. image width
+ echo "== 17. longrun.py: beeldbreedte automatisch, tenzij gezet =="
+-python3 - "$PC" > "$T/s17a.txt" 2>&1 <<'EOF2'
++python3 - "$PC" "$T" > "$T/s17a.txt" 2>&1 <<'EOF2'
+ import os, sys, tempfile
+ sys.path.insert(0, sys.argv[1])
+ import longrun as L
+@@ -634,7 +654,7 @@ def fake_render_one(self, args, out, what):
+     return False
+ L.Supervisor.render_one = fake_render_one
+ P.interesting_track = lambda rd: (7, 1000)
+-d = tempfile.mkdtemp()
++d = tempfile.mkdtemp(dir=sys.argv[2])      # inside the test directory (not left behind in /tmp)
+ def args_for(width):
+     calls.clear()
+     st = dict(settings=dict(L.SETTINGS_DEFAULTS), beelden_dir=d, last_analysis_step=1000)
+@@ -746,5 +766,266 @@ su18 --geen-apt > "$T/s18i.txt"; rc18i=$?
+ check "  ... met ffmpeg is diezelfde video-fout wél een FOUT (code $rc18i)" bash -c "grep -qE '^  FOUT +tools-zelftest' '$T/s18i.txt' && test $rc18i = 1"
+ rm -rf "$M"
+ 
++# ------------------------------------------------------------------------------ 19. automatic start (Windows)
++echo "== 19. automatisch starten na een herstart van Windows (nep-Taakplanner) =="
++# nep-Windows: programma's in $T/winbin (zoals WSL de Windows-PATH toevoegt), schijf C: = $T/win/c
++export FAKE_WIN=$T/win
++mkdir -p "$T/winbin" "$FAKE_WIN/c/Program Files/WSL" "$FAKE_WIN/c/Windows/System32" "$FAKE_WIN/c/Users/nicky/AppData/Local/Temp"
++: > "$FAKE_WIN/c/Program Files/WSL/wslg.exe"; : > "$FAKE_WIN/c/Windows/System32/conhost.exe"; : > "$FAKE_WIN/c/Windows/System32/wsl.exe"
++cat > "$T/winbin/wslpath" <<'EOF2'
++#!/bin/bash
++# nep-wslpath: C:\a\b <-> $FAKE_WIN/c/a/b ; -w /linux/pad -> \\wsl.localhost\NepUbuntu\linux\pad
++case "$1" in
++  -u) p=$2; case "$p" in [A-Za-z]:*) ;; *) exit 1 ;; esac
++      d=$(printf '%s' "${p:0:1}" | tr 'A-Z' 'a-z'); r=${p:2}; printf '%s/%s%s\n' "$FAKE_WIN" "$d" "${r//\\//}" ;;
++  -w) p=$2; case "$p" in
++        "$FAKE_WIN"/?/*) r=${p#"$FAKE_WIN"/}; d=${r%%/*}; r=/${r#*/}; printf '%s:%s\n' "$(printf '%s' "$d" | tr 'a-z' 'A-Z')" "${r//\//\\}" ;;
++        *) printf '\\\\wsl.localhost\\NepUbuntu%s\n' "${p//\//\\}" ;;
++      esac ;;
++  *) exit 1 ;;
++esac
++EOF2
++cat > "$T/winbin/cmd.exe" <<'EOF2'
++#!/bin/bash
++# nep-cmd.exe: alleen  /d /c "echo %VAR%"  (met \r\n zoals Windows)
++echo "$(date +%T) cmd.exe $*" >> "$HOME/fake_win.log"
++v=""; for a in "$@"; do case "$a" in "echo %"*"%") v=${a#echo %}; v=${v%\%} ;; esac; done
++case "$v" in
++  USERPROFILE) o='C:\Users\nicky' ;; ProgramFiles) o='C:\Program Files' ;; SystemRoot) o='C:\Windows' ;;
++  TEMP) o='C:\Users\nicky\AppData\Local\Temp' ;; USERDOMAIN) o='NEP-PC' ;; USERNAME) o='nicky' ;; *) o="%$v%" ;;
++esac
++printf '%s\r\n' "$o"
++EOF2
++printf '#!/bin/bash\nprintf "nep-pc\\\\nicky\\r\\n"\n' > "$T/winbin/whoami.exe"
++cat > "$T/winbin/schtasks.exe" <<'EOF2'
++#!/bin/bash
++# nep-schtasks.exe: /Create /TN n /XML f /F | /Query /TN n | /Delete /TN n /F | /Run /TN n (bootst de actie na)
++echo "$(date +%T) $*" >> "$HOME/fake_schtasks.log"
++d=$FAKE_WIN/taken; mkdir -p "$d"
++op=$1; shift; tn=""; xml=""
++while [ $# -gt 0 ]; do case "$1" in /TN) tn=$2; shift ;; /XML) xml=$2; shift ;; esac; shift; done
++case "$op" in
++  /Create) [ -n "${FAKE_SCHTASKS_FAIL:-}" ] && { echo "FOUT: Toegang geweigerd. (nep)"; exit 1; }
++           f=$(wslpath -u "$xml") && [ -f "$f" ] || { echo "FOUT: het systeem kan het bestand niet vinden (nep)"; exit 1; }
++           cp "$f" "$d/$tn.xml" && echo "SUCCES: De geplande taak $tn is gemaakt. (nep)" ;;
++  /Query) [ -f "$d/$tn.xml" ] ;;
++  /Delete) [ -f "${d:?}/${tn:?}.xml" ] && rm -f "${d:?}/${tn:?}.xml" ;;
++  /Run) [ -f "$d/$tn.xml" ] && python3 "$FAKE_WIN/run_task.py" "$d/$tn.xml" ;;
++  *) exit 1 ;;
++esac
++EOF2
++cat > "$FAKE_WIN/run_task.py" <<'EOF2'
++# nep-Taakplanner: voert de actie van een taak-XML uit zoals Windows (wslg.exe of conhost --headless wsl.exe),
++# los van alles (eigen sessie, geen in-/uitvoer), en noteert wat er gestart werd.
++import os, shlex, subprocess, sys, xml.etree.ElementTree as ET
++ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
++root = ET.fromstring(open(sys.argv[1], "rb").read().decode("utf-16"))
++cmd = root.find("t:Actions/t:Exec/t:Command", ns).text
++args = root.find("t:Actions/t:Exec/t:Arguments", ns).text
++def opts(tokens):
++    o = {}
++    i = 0
++    while i < len(tokens):
++        if tokens[i] in ("-d", "-u", "--cd"):
++            o[tokens[i]] = tokens[i + 1]; i += 2
++        else:
++            break
++    return o, tokens[i:]
++if cmd.lower().endswith("\\wslg.exe"):
++    head, rest = args.split(" -- ", 1)                  # wslg: the rest goes to the (login) shell as one string
++    o, _ = opts(shlex.split(head))
++    argv = ["bash", "-c", rest]
++elif cmd.lower().endswith("\\conhost.exe"):
++    t = shlex.split(args.replace("\\", "\\\\"))
++    assert t[0] == "--headless" and t[1].lower().endswith("\\wsl.exe"), t
++    o, rest = opts(t[2:])
++    assert rest[0] == "--exec", rest
++    argv = rest[1:]
++else:
++    sys.exit(f"onbekende actie {cmd}")
++env = dict(os.environ, WSL_DISTRO_NAME=o["-d"])
++with open(os.path.join(os.environ["HOME"], "fake_taak_starts.log"), "a") as f:
++    f.write(f"{cmd} | -d {o['-d']} -u {o['-u']} --cd {o['--cd']} | {argv}\n")
++subprocess.Popen(argv, cwd=o["--cd"], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
++                 stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
++EOF2
++chmod +x "$T/winbin/"*
++PATH19=$T/winbin:$T/gpubin:$BASEPATH
++export WSL_DISTRO_NAME=NepUbuntu
++AS() { PATH=$PATH19 bash "$PC/autostart.sh" "$@" < /dev/null 2>&1; }
++SW() { PATH=$PATH19 bash "$PC/start.sh" "$@" < /dev/null 2>&1; }
++TN=Oercel-autostart-NepUbuntu
++TX19=$FAKE_WIN/taken/$TN.xml
++wpid() { local p; p=$(cat "$T/state/autostart.pid" 2>/dev/null) && kill -0 "$p" 2>/dev/null && echo "$p"; }
++nklaar() { grep -c "start.sh --automatisch klaar" "$T/state/autostart.log" 2>/dev/null || echo 0; }
++nschtasks() { wc -l < "$HOME/fake_schtasks.log" 2>/dev/null || echo 0; }
++cat > "$T/plan19.txt" <<EOF2
++longrun.py auto1 --engine cpu --ini engine/params/membranes.ini --set $OV steps=3000000 $LR
++EOF2
++export OERCEL_PLAN=$T/plan19.txt
++bash "$PC/stop.sh" > /dev/null 2>&1            # what earlier sections left running
++
++SW --geen-setup > "$T/s19a.txt"
++check "WSL: start.sh maakt zelf GEEN Windows-taak (schtasks.exe niet aangeroepen)" test ! -e "$HOME/fake_schtasks.log"
++check "  ... maar toont de tip 'bash cel/pc/autostart.sh aan'" grep -q "bash cel/pc/autostart.sh aan" "$T/s19a.txt"
++check "  ... en hervat het plan gewoon (stop.sh-merkteken weg)" bash -c "grep -q 'auto1 (lange run): NIEUW GESTART' '$T/s19a.txt' && test ! -e '$T/runs/.pc_gestopt_door_stop_sh'"
++FAKE_SCHTASKS_FAIL=1 AS aan > "$T/s19b.txt"; rc=$?
++check "schtasks weigert (bv. geen rechten): code 1 en een Nederlandse melding, geen taak ($rc)" bash -c "
++  test $rc = 1 && grep -q 'aanmaken mislukte (schtasks code 1)' '$T/s19b.txt' && test ! -e '$TX19' && test ! -e '$T/state/autostart_taak.txt'"
++check "  ... het tijdelijke XML-bestand in Windows' TEMP is opgeruimd" test -z "$(ls "$FAKE_WIN/c/Users/nicky/AppData/Local/Temp")"
++AS aan > "$T/s19c.txt"; rc=$?
++cat "$T/s19c.txt"
++check "autostart.sh aan: code 0, taak '$TN' gemaakt" bash -c "test $rc = 0 && test -f '$TX19' && grep -q \"Windows-taak '$TN' aangemaakt\" '$T/s19c.txt'"
++check "  ... XML in UTF-16 met BOM (wat schtasks /XML verwacht)" test "$(head -c 2 "$TX19" | od -An -tx1 | tr -d ' ')" = fffe
++python3 - "$TX19" "$(cd "$CEL/.." && pwd)" "$(id -un)" > "$T/s19x.txt" 2>&1 <<'EOF2'
++import sys, xml.etree.ElementTree as ET
++ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
++r = ET.fromstring(open(sys.argv[1], "rb").read().decode("utf-16"))
++g = lambda p: r.find(p, ns).text
++repo, user = sys.argv[2], sys.argv[3]
++want = {
++  "t:Triggers/t:LogonTrigger/t:UserId": "nep-pc\\nicky", "t:Triggers/t:LogonTrigger/t:Delay": "PT30S",
++  "t:Triggers/t:LogonTrigger/t:Repetition/t:Interval": "PT10M",
++  "t:Triggers/t:LogonTrigger/t:Repetition/t:StopAtDurationEnd": "false",
++  "t:Principals/t:Principal/t:UserId": "nep-pc\\nicky", "t:Principals/t:Principal/t:LogonType": "InteractiveToken",
++  "t:Principals/t:Principal/t:RunLevel": "LeastPrivilege", "t:Settings/t:ExecutionTimeLimit": "PT0S",
++  "t:Settings/t:MultipleInstancesPolicy": "IgnoreNew", "t:Settings/t:DisallowStartIfOnBatteries": "false",
++  "t:Settings/t:StopIfGoingOnBatteries": "false", "t:Settings/t:Enabled": "true",
++  "t:Actions/t:Exec/t:Command": "C:\\Program Files\\WSL\\wslg.exe",
++  "t:Actions/t:Exec/t:Arguments": f"-d NepUbuntu -u {user} --cd \"{repo}\" -- /bin/bash '{repo}/cel/pc/autostart.sh' wakker",
++}
++bad = [(k, g(k), v) for k, v in want.items() if g(k) != v]
++print("\n".join(f"{k}: {a!r} != {b!r}" for k, a, b in bad) or "OK")
++EOF2
++check "  ... XML: aanmelden van deze gebruiker (+30 s), elke 10 min opnieuw, IgnoreNew, geen tijdslimiet (PT0S), ook op accu, InteractiveToken/LeastPrivilege, wslg.exe -d -u --cd -- autostart.sh wakker" grep -qx OK "$T/s19x.txt"
++check "  ... de taak meteen gestart: Ubuntu wordt nu al wakker gehouden" bash -c "grep -q 'Ubuntu blijft wakker, ook als je alle Ubuntu-vensters sluit' '$T/s19c.txt' && test -n \"\$(cat '$T/state/autostart.pid')\""
++check "  ... gestart zoals Windows het doet (wslg.exe, distro NepUbuntu, deze Linux-gebruiker, de repo)" \
++  grep -q "wslg.exe | -d NepUbuntu -u $(id -un) --cd $(cd "$CEL/.." && pwd)" "$HOME/fake_taak_starts.log"
++check "  ... start.sh --automatisch liep (slot vrij: niemand anders)" wait_for 60 'test "$(nklaar)" -ge 1'
++n0=$(nschtasks)
++AS aan > "$T/s19d.txt"
++check "nog eens 'aan': taak ongewijzigd, niet opnieuw aangemaakt, niet nog eens gestart" bash -c "
++  grep -q 'bestaat al (ongewijzigd)' '$T/s19d.txt' && grep -q 'wordt al wakker gehouden' '$T/s19d.txt' &&
++  ! tail -n +$((n0 + 1)) '$HOME/fake_schtasks.log' | grep -qE '/Create|/Run'"
++SW --geen-setup > "$T/s19e.txt"
++check "start.sh zegt nu: automatisch starten staat aan, venster mag dicht" grep -q "Automatisch starten staat aan" "$T/s19e.txt"
++python3 "$PC/status.py" > "$T/s19f.txt"
++check "status.py: AAN, Ubuntu wakker gehouden, laatste automatische start" bash -c "
++  grep -q \"automatisch starten na een herstart: AAN (Windows-taak '$TN')\" '$T/s19f.txt' && grep -q 'Ubuntu wordt wakker gehouden' '$T/s19f.txt' &&
++  grep -q 'laatste automatische start' '$T/s19f.txt'"
++
++# "herstart van Windows": alles weg zonder netjes stoppen, dan aanmelden (= de aanmeldtrigger start de taak)
++reboot19() {
++  local w n r
++  w=$(wpid); [ -n "$w" ] && { pkill -9 -P "$w"; kill -9 "$w"; }
++  tmux -L "$SOCK" kill-server 2>/dev/null
++  for r in "$T"/runs/*/; do [ -f "$r/pc_longrun.json" ] && kill_run "$(basename "$r")"; done
++  pkill -9 -f "$HOME/.local/bin/claude" 2>/dev/null
++  sleep 1
++  n=$(nklaar)
++  PATH=$PATH19 "$T/winbin/schtasks.exe" /Run /TN "$TN"
++  wait_for 90 "test \"\$(nklaar)\" -gt $n" > /dev/null
++}
++check "auto1 draait (voor de herstart)" wait_for 30 'test -n "$(holder auto1)"'
++ns0=$(nsetup); ng0=$(wc -l < "$HOME/fake_gh.log"); ni0=$(wc -l < "$HOME/fake_install.log"); nc0=$(grep -c "remote-control" "$HOME/fake_claude.log")
++reboot19
++cp "$T/state/autostart_start.log" "$T/s19g.txt"
++check "na de herstart: taak gestart -> start.sh --automatisch -> auto1 HERVAT" grep -q "auto1 (lange run): HERVAT" "$T/s19g.txt"
++check "  ... auto1 draait echt weer" wait_for 30 'test -n "$(holder auto1)"'
++check "  ... Claude Remote Control weer in tmux, met --continue" bash -c "
++  test \"\$(grep -c 'remote-control' '$HOME/fake_claude.log')\" -gt $nc0 && tail -n 1 '$HOME/fake_claude.log' | grep -q 'remote-control --name Oercel werkstation --continue'"
++check "  ... precies één Claude" wait_for 10 'test "$(nrc)" = 1'
++check "  ... zonder setup, installer, gh, sudo of vragen" bash -c "
++  test \"\$(nsetup)\" = $ns0 && test \"\$(wc -l < '$HOME/fake_gh.log')\" = $ng0 && test \"\$(wc -l < '$HOME/fake_install.log')\" = $ni0 &&
++  ! grep -qiE 'sudo|password|wachtwoord|Druk op Enter' '$T/s19g.txt'"
++check "  ... en Ubuntu blijft wakker (het 'wakker'-proces leeft na start.sh)" test -n "$(wpid)"
++check "  ... autostart.log: samenvatting met Remote Control gestart" bash -c "tail -n 15 '$T/state/autostart.log' | grep -q 'Remote Control .*gestart'"
++
++echo "-- stop.sh, daarna herstart: wat stop.sh stopte blijft gestopt"
++bash "$PC/stop.sh" > "$T/s19h.txt" 2>&1
++check "stop.sh meldt: na een herstart blijven de experimenten gestopt" grep -q "Na een herstart van Windows blijven de experimenten gestopt" "$T/s19h.txt"
++python3 "$PC/longrun.py" los19 --ini engine/params/membranes.ini --set $OV steps=3000000 $LR --engine cpu --achtergrond > /dev/null 2>&1
++wait_for 30 'test -n "$(holder los19)"' > /dev/null
++printf 'longrun.py auto2 --engine cpu --ini engine/params/membranes.ini --set %s steps=3000000 %s\n' "$OV" "$LR" >> "$T/plan19.txt"
++reboot19
++cp "$T/state/autostart_start.log" "$T/s19i.txt"
++check "auto1 (door stop.sh gestopt): niet automatisch hervat" bash -c "
++  grep -q 'auto1 (lange run): gestopt met stop.sh; wordt niet automatisch hervat' '$T/s19i.txt' &&
++  test -z \"\$(python3 -c \"import sys; sys.path.insert(0,'$PC'); import pclib as P; print(P.lock_holder('$T/runs/auto1') or '')\")\""
++check "  ... nieuwe planregel auto2: niet gestart (stop.sh was het laatste woord)" bash -c "
++  grep -q 'auto2 (lange run): niet gestart — de experimenten zijn met stop.sh gestopt' '$T/s19i.txt' && test ! -e '$T/runs/auto2'"
++check "  ... los19 (na stop.sh gestart, door de 'herstart' onderbroken): wel hervat" grep -q "los19: HERVAT" "$T/s19i.txt"
++check "  ... Claude wel weer gestart" wait_for 10 'test "$(nrc)" = 1'
++SW --alleen-plan > "$T/s19j.txt"
++check "start.sh in een venster (hier --alleen-plan): auto1 hervat, auto2 gestart, merkteken weg" bash -c "
++  grep -q 'auto1 (lange run): HERVAT' '$T/s19j.txt' && grep -q 'auto2 (lange run): NIEUW GESTART' '$T/s19j.txt' && test ! -e '$T/runs/.pc_gestopt_door_stop_sh'"
++
++echo "-- niet ingelogd / Remote Control nooit bevestigd: geen Claude, wel één regel"
++mv "$HOME/.claude/.credentials.json" "$HOME/.claude/cred.bak"
++reboot19
++check "niet ingelogd: geen Claude gestart, regel in autostart.log" bash -c "
++  test \"\$(pgrep -f '$HOME/.local/bin/claude remote-control' | wc -l)\" = 0 && tail -n 15 '$T/state/autostart.log' | grep -q 'Remote Control .*niet gestart: nog niet ingelogd'"
++check "  ... experimenten wel hervat" grep -q "auto1 (lange run): HERVAT" "$T/state/autostart_start.log"
++mv "$HOME/.claude/cred.bak" "$HOME/.claude/.credentials.json"; mv "$T/state/claude_rc_ok" "$T/state/rc_ok.bak"
++reboot19
++check "Remote Control nooit bevestigd: geen Claude (hij zou een vraag stellen die niemand ziet), regel in de log" bash -c "
++  test \"\$(pgrep -f '$HOME/.local/bin/claude remote-control' | wc -l)\" = 0 && tail -n 15 '$T/state/autostart.log' | grep -q 'niet gestart: nog nooit bevestigd'"
++check "  ... status.py toont die regel bij de laatste automatische start" bash -c "python3 '$PC/status.py' | grep -q 'nog nooit bevestigd'"
++mv "$T/state/rc_ok.bak" "$T/state/claude_rc_ok"
++
++echo "-- het slot: een venster wacht op de automatische start; de automatische start wacht nooit"
++( exec 9>"$T/state/start.lock"; flock 9; echo "automatisch 1" > "$T/state/start.lock.wie"; sleep 4 ) &
++sleep 0.5; t0=$(date +%s)
++SW --alleen-plan > "$T/s19l.txt"; dt=$(( $(date +%s) - t0 ))
++check "venster terwijl de automatische start bezig is: wacht even (${dt} s) en gaat dan door" bash -c "
++  grep -q 'start.sh draait nu automatisch' '$T/s19l.txt' && grep -q 'Experimentplan' '$T/s19l.txt' && test $dt -ge 2"
++wait
++( exec 9>"$T/state/start.lock"; flock 9; echo "venster 1" > "$T/state/start.lock.wie"; sleep 4 ) &
++sleep 0.5; t0=$(date +%s)
++SW --automatisch > "$T/s19m.txt"; rc=$?; dt=$(( $(date +%s) - t0 ))
++check "automatische start terwijl een venster bezig is: doet niets, wacht niet (${dt} s, code $rc)" bash -c "
++  grep -q 'de automatische start doet nu niets' '$T/s19m.txt' && test $rc = 0 && test $dt -le 2"
++wait
++
++echo "-- terugval zonder wslg.exe, en fouten"
++mv "$FAKE_WIN/c/Program Files/WSL/wslg.exe" "$FAKE_WIN/wslg.bak"
++AS aan > "$T/s19n.txt"
++python3 - "$TX19" > "$T/s19n2.txt" 2>&1 <<'EOF2'
++import sys, xml.etree.ElementTree as ET
++ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
++r = ET.fromstring(open(sys.argv[1], "rb").read().decode("utf-16"))
++c, a = r.find("t:Actions/t:Exec/t:Command", ns).text, r.find("t:Actions/t:Exec/t:Arguments", ns).text
++ok = c == "C:\\Windows\\System32\\conhost.exe" and a.startswith('--headless "C:\\Windows\\System32\\wsl.exe" -d NepUbuntu ') \
++     and " --exec /bin/bash " in a and a.endswith(" wakker")
++print("OK" if ok else f"{c!r} {a!r}")
++EOF2
++check "zonder wslg.exe: taak bijgewerkt met conhost.exe --headless wsl.exe ... --exec (geen venster)" bash -c "
++  grep -q \"Windows-taak '$TN' aangemaakt\" '$T/s19n.txt' && grep -qx OK '$T/s19n2.txt'"
++w=$(wpid); [ -n "$w" ] && { pkill -P "$w"; kill "$w"; }; sleep 1
++PATH=$PATH19 "$T/winbin/schtasks.exe" /Run /TN "$TN"
++check "  ... die actie werkt ook (nagebootst): Ubuntu weer wakker gehouden" wait_for 60 'test -n "$(wpid)"'
++mv "$FAKE_WIN/wslg.bak" "$FAKE_WIN/c/Program Files/WSL/wslg.exe"
++AS aan > /dev/null
++check "  ... wslg.exe terug: taak weer met wslg.exe" bash -c "iconv -f UTF-16 -t UTF-8 '$TX19' | grep -q 'WSL.wslg.exe</Command>'"
++PATH=$T/gpubin:$BASEPATH bash "$PC/autostart.sh" aan < /dev/null > "$T/s19o.txt" 2>&1; rc=$?
++check "geen Windows-programma's te vinden (interop uit): code 1, Nederlandse uitleg ($rc)" bash -c "
++  test $rc = 1 && grep -q 'niet gevonden' '$T/s19o.txt' && grep -q 'interop' '$T/s19o.txt'"
++env -u WSL_DISTRO_NAME PATH="$PATH19" bash "$PC/autostart.sh" aan < /dev/null > "$T/s19p.txt" 2>&1; rc=$?
++check "geen WSL: niets gedaan, code 3 ($rc)" bash -c "test $rc = 3 && grep -q 'geen WSL' '$T/s19p.txt'"
++AS status > "$T/s19q.txt"
++check "autostart.sh status: AAN, taak in de Taakplanner, wakker gehouden" bash -c "
++  grep -q 'automatisch starten: AAN' '$T/s19q.txt' && grep -q 'de taak staat in de Windows-Taakplanner' '$T/s19q.txt' && grep -q 'Ubuntu wordt wakker gehouden' '$T/s19q.txt'"
++
++echo "-- stop.sh --alles: ook automatisch starten uit"
++w=$(wpid)
++PATH=$PATH19 bash "$PC/stop.sh" --alles > "$T/s19r.txt" 2>&1
++check "stop.sh --alles: Claude weg, wakker houden gestopt, Windows-taak verwijderd" bash -c "
++  ! tmux -L $SOCK has-session -t =oercel-claude 2>/dev/null && ! kill -0 ${w:-999999} 2>/dev/null && test ! -e '$TX19' &&
++  test ! -e '$T/state/autostart_taak.txt' && grep -q \"Windows-taak '$TN' verwijderd\" '$T/s19r.txt'"
++python3 "$PC/status.py" --kort > "$T/s19s.txt"
++check "  ... status.py: automatisch starten uit (met het commando om het aan te zetten)" grep -q "automatisch starten na een herstart: uit (aanzetten: bash cel/pc/autostart.sh aan)" "$T/s19s.txt"
++check "  ... experimenten gestopt" bash -c "test -z \"\$(holder auto1)\" && test -z \"\$(holder auto2)\" && test -z \"\$(holder los19)\""
++unset WSL_DISTRO_NAME FAKE_WIN
++
+ echo "== $fails fout(en) =="
+ exit $fails

@@ -1,3 +1,17 @@
+# Membraanteam A (memA) — afstemlogboek
+
+> **Wat is dit?** Het logboek van membraanteam A: enkelstaartig lipide H-T-T-T plus de tweefasige
+> voedingsstof (N mengt niet met water). Eindversie van dit team. Momentopname uit de cloudsessie van
+> 12 okt 2026, gekopieerd uit `cel/runs/memA_src/TUNING.md` (niet in git). De jury koos later team B
+> (zie `judge_NOTES.md`); de definitieve fysica staat in `cel/engine/params/membranes.ini`, die van
+> team A in `teamA_membranes.ini`.
+> Paden als `runs/...` zijn relatief aan `cel/` en wijzen naar run-uitvoer op de ontwikkelmachine
+> (die map staat niet in git en bestaat niet op de werkplek-pc). Figuren die hier als bewijs worden
+> genoemd en kleiner zijn dan ~2 MB zijn meegekopieerd naar `figs/` naast dit bestand (de verwijzingen
+> hieronder zijn daarop aangepast); grotere figuren en losse kijkplaatjes niet.
+
+---
+
 # memA - spontaneous membranes from a random soup (tuning log)
 
 Strategy assigned to memA: keep the single-chain lipid (H-T-T-T or other tail lengths) and tune
@@ -39,7 +53,8 @@ Numbers with the final physics (100k steps, chem off): L=100 seeds 1/2/5: 9/8/6 
 (peak 9 each), first at 22-30k steps; L=128 seed 6: 11. 100% of the vesicles contain catalysts
 (8-70 each). Engine checks: T_kin 0.990 (min 0.974, max 1.019), longest bond 1.30.
 Verified by eye: quick looks, `tools/render.py` micro (whole dish + zoom) and goodsell
-(figs/F1_micro.png, F2_micro.png, F2_micro_cell3.png, F1_goodsell29.png, F2_goodsell28.png).
+(figs/F1_micro.png, F2_micro.png, F2_micro_cell3.png, F1_goodsell29.png, F2_goodsell28.png;
+all > 2 MB, in `runs/memA_src/figs/`, pad op de ontwikkelmachine; F2_micro.png is in git as `teamA_F2_micro.png`).
 
 Permeation (dense snapshots, `scan/cross2.py`): catalysts never crossed an intact bilayer in 7
 runs x 900 tau (80-200 catalysts inside); vesicle walls open transiently now and then (more with
@@ -387,7 +402,7 @@ softening the immiscibility does not produce mixed W/N lumens, the lumens stay N
 L=128 (memA_F2, seed 6, 2 threads, 2.04 ms/step): strict cells every 4000 steps
 `00000000056459675979967999` -> 11 closed vesicles at 100k, all 11 with catalysts, first at 30k;
 tools/analyze.py: 22 self-formed cells, 100% bilayer walls; T_kin 0.990 (min 0.977, max 1.015),
-longest bond 1.217. Fluorescence render (figs/F2_micro.png, viewed): ~11 closed magenta rings with
+longest bond 1.217. Fluorescence render (figs/F2_micro.png = `teamA_F2_micro.png` next to this file, viewed): ~11 closed magenta rings with
 GFP catalysts and nutrient lumens, plus a few open strips.
 L=100 replicate F1 (seed 5): 6 vesicles at 100k (peak 9), all with catalysts; T_kin 0.990, max bond 1.223.
 
@@ -398,7 +413,7 @@ Crossings on the final physics (branches of z25 at 100k, 30k steps, snapshot eve
 | z25d | equilibrium, chem off | 7.4 | 197 | **0** | **0** | 1674 / 154 | 10 | 11 | 117 / 115 |
 | z25g | feed only to feed_cap 0.12 | 6.6 | 198 | 1 | 35 (2 mass events) | 1722 / 478 | 7+32 | 344 | 112 / 161 |
 
-Both z25g catalyst events were checked by eye (figs/ev_z25g_exit.png, figs/ev_z25g_mass.png):
+Both z25g catalyst events were checked by eye (figs/teamA/ev_z25g_exit.png, figs/teamA/ev_z25g_mass.png):
 - the 1 'exit' (bead 6065, step 117300): the vesicle wall had a gap at 115800 with the catalyst
   sitting in it; the wall closed with the catalyst on the outside - a leak through a transient
   opening, not a crossing of an intact bilayer;
@@ -416,7 +431,7 @@ Branch of z25 at 100k: chem 1 with only nutrient decay N -> W (p_nd 1e-3 per che
 0, feed none), 40k steps (1200 tau). N 3000 -> 55.
 - strict cells (every 2000 steps) `965544235244634333244`: 9 -> 4 vesicles. The 4 survivors are
   water-filled (84-643 W, 0-8 N, 12-68 catalysts each); the others opened into C-shaped strips.
-- Quick look (figs/z25w.png): without N the water-shy catalysts (a_K_W 45) clump into tight
+- Quick look (figs/teamA/z25w.png): without N the water-shy catalysts (a_K_W 45) clump into tight
   catalyst clusters inside and outside the vesicles.
 => The N phase templates and supports the vesicles; once a vesicle has formed it can survive with a
    water lumen (about half did here), but smaller ones open. Catalysts then aggregate.

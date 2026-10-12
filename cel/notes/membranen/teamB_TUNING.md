@@ -1,14 +1,59 @@
+# Membraanteam B (memB) — afstemlogboek
+
+> **Wat is dit?** Het logboek van membraanteam B: de lipide-architectuur (het vastgebonden
+> dubbelstaartige "pi"-lipide H2T2) bovenop de tweefasige voedingsstof van team A. Deze fysica won
+> (zie `judge_NOTES.md`) en staat nu in `cel/engine/params/membranes.ini`. Eindversie van dit team;
+> vervangt de eerdere `teamB_TUNING_tussenstand.md`. Momentopname uit de cloudsessie van 12 okt 2026,
+> gekopieerd uit `cel/runs/memB_src/TUNING.md` (niet in git). `params/membranes.ini` hieronder = de
+> privékopie van het team; die is gelijk aan `cel/engine/params/membranes.ini` (fysica).
+> Paden als `runs/...` zijn relatief aan `cel/` en wijzen naar run-uitvoer op de ontwikkelmachine
+> (die map staat niet in git en bestaat niet op de werkplek-pc). Figuren die hier als bewijs worden
+> genoemd en kleiner zijn dan ~2 MB zijn meegekopieerd naar `figs/` naast dit bestand (de verwijzingen
+> hieronder zijn daarop aangepast); grotere figuren en losse kijkplaatjes niet.
+
+---
+
 # memB — spontaneous membranes: tuning notes
 
-Agent memB (strategy: lipid architecture + concentration). Private engine copy: this directory.
-Runs: /home/user/welcome-youtube/cel/runs/memB_*. Start state is ALWAYS init=soup (SPEC §0).
+Agent memB (strategy: lipid architecture + concentration). Private engine copy: this directory (`runs/memB_src`, pad op de ontwikkelmachine).
+Runs: runs/memB_*. Start state is ALWAYS init=soup (SPEC §0).
 
-## 0. Status / resume pointer (update after every batch)
+## 0. Status / resume pointer (read first)
 
-- Session 2 (this file was rewritten after a machine restart; the first session's notes were lost).
-- Engine copy builds (`make` gives a bitwise identical binary). Build/test: `make`; `tests/molforcetest`.
-- Session 1 ran 124 runs (all chemistry OFF, L=64 except L01-L04 at L=100). Reconstructed below (§2, §3).
-- NEXT: see §4 (plan) and §5 (session-2 log).
+RESULT (session 2): spontaneous closed bilayer vesicles with catalysts inside, from a random
+soup, with the memB lipid architecture + memA's aqueous-two-phase nutrient physics.
+Final parameters: params/membranes.ini (needs THIS engine copy: lip_arch/r0_head/lip_tie).
+Running it as-is reproduces runs/memB_F01_wt200_kb300 bit for bit (checked with cmp, threads 2
+vs 1): runs/memB_final_s1 (100k, then continued to 300k).
+
+Lipid: tied double-tailed H2T2 "pi1" lipid (H1-H2 bond 0.7, H-T bonds 0.5, tie T-T 0.7),
+k_bond 300; a_W_T 200, a_T_N 120, a_T_K 200; ATPS: a_W_N 45, a_H_N 22, a_W_K 45; f_lip 0.20,
+c_N 0.10, f_Ka 0.01.
+
+Numbers (chem off, tools/cells.detect "cells", scan/cellsum.py, 2nd-half mean per snapshot):
+- L=100, 100k steps: seed 1 13.4 (max 17), seed 2 13.6 (max 17), seed 3 11.7 (max 15);
+  >= 3 vesicles from 10-15k steps on; 95-100 % of the vesicles contain catalysts (median 10-12).
+- L=128, 100k steps, seed 6: 20.0 (max 26).
+- Same metric on memA's final run memA_z25 (linear H-T-T-T): 6.4 (max 9) -> about 2x more
+  vesicles with the tied H2T2 lipid (they are smaller: median lumen area 26-38 vs 74).
+- Without the two-phase nutrient (pure water), NO architecture of ~200 tested gives more than
+  ~1-3 closed vesicles at a time at L=100 (sessions 1 and 2, §3, §5).
+- Long run (300k = 9000 tau): slow coarsening, 13 -> ~9 cells (2nd half 8.8), median area 26 -> 54.
+- Catalyst crossings: 0 exits from living vesicles in 900 tau of snapshots every 100 steps;
+  all catalyst 'entries' are wall rearrangements (inspected by eye). N permeates slowly
+  (exits 9.5e-6 per inside bead per tau, entries 1.05e-3 per unit membrane length per tau).
+- Synthesis (chem on, slow rates, 1042 syn events): correct molecules, longest bond 1.27.
+- Engine checks: T_kin 0.985 (k_bond 300 costs ~1.5 %; within +-3 %), longest bond after the
+  warm-up 1.04-1.06, tests/molforcetest PASS incl. the final lipid.
+
+Open problems: lumens are the N phase (when N becomes water, 12-13 -> 2-3 vesicles stay
+closed, as memA found); loose membrane strips coexist with the vesicles (excess lipid); slow
+coarsening; tools/cells.detect misses vesicles that touch strips (by eye ~18 vs 14 detected).
+Images (viewed): runs/memB_final_s1/figs/micro_100k.png, micro_300k.png,
+goodsell_track49_100k.png; tools/analyze.py on memB_final_s1: criterion 1 'ja' (78 cells,
+first at step 10000). Its 'groei'/'dood' ja are passive coarsening without chemistry, not life.
+
+Scratch helpers (not needed to reproduce): /tmp/memB/scripts/zoomseq.py, beadzoom.py (pad op de ontwikkelmachine).
 
 ## 1. Engine changes made in this private copy (session 1, verified by diff against orig/oercel.c)
 
@@ -29,6 +74,8 @@ Runs: /home/user/welcome-youtube/cel/runs/memB_*. Start state is ALWAYS init=sou
 - tests/molforcetest.c: bonded forces of every template vs finite differences of an
   independently written energy.
 - MAXMLEN 8 -> 12.
+- (session 2) tests/molforcetest.c: added the final lipid (pi, nT=1, tie=1, r0_head=0.7): PASS.
+- (session 2) no other engine code change; everything else is parameters.
 
 ## 2. Scan tooling (scan/)
 
@@ -40,6 +87,13 @@ Runs: /home/user/welcome-youtube/cel/runs/memB_*. Start state is ALWAYS init=sou
 - summarize.py: Markdown table of all runs (parameters changed vs tune_base + ring stats).
 - persist.py / stiffness.py: membrane persistence length / kappa estimates (noisy).
 - metrics.py: per-snapshot detection time series.
+- (session 2) topo.py: Reeb-skeleton topology of membranes (ends, junctions, loops; its 'rings'
+  count is unreliable for floppy membranes - use ringstat/cellsum for vesicles).
+- (session 2) cellsum.py: uncapped per-run summary from the ringstat cache (cells, with K, iso,
+  first step with >= 3 cells, median lumen area / catalysts).
+- (session 2) lipcheck.py NH NT NBONDS SNAP...: every lipid molecule matches the template.
+- (session 2) cross2_memA.py: memA's crossing analysis, copied unchanged (dense snapshots).
+- (session 2) params/tune100.ini (pure water, L=100), params/atps_base.ini (memA two-phase physics).
 - Base parameters: params/tune_base.ini (L=64, chem=0, f_lip=0.10, f_Ka=0.005, c_N=0.12,
   a_W_H=20, a_W_T=80, a_H_T=50, a_N_T=40, a_K_H=30, a_K_T=120, dt=0.03, warmup 1000).
 
@@ -78,7 +132,7 @@ Series (L=64 unless noted, steps 60k-300k, chemistry off):
   0.44, one vesicle tracked for 27 snapshots, always with K inside); stronger stirring 1e-3 destroys.
 - L01-L04 (L=100, 100k-300k steps): at most 1 isolated vesicle at a time.
 
-Physical picture (from looking at images, /tmp/memB/q_*.png in session 2):
+Physical picture (from looking at images, /tmp/memB/q_*.png in session 2; pad op de ontwikkelmachine, not copied):
 - Double-tailed lipids reliably make bilayer strips within t ~ 300 (10k steps).
 - Strips then grow by end-to-end and end-to-side fusion. End-to-side fusion makes T/Y
   junctions -> branched networks; at L=64 and f_lip=0.2 the network spans the box.
@@ -187,6 +241,113 @@ Learned: a_H_H is a clean knob for the end/junction balance (monolayer spontaneo
 ~1-3 closed vesicles at a time at L=100 (dynamic ring-chain equilibrium). Stiffer membranes
 (pi2 tie) are in an irreversible regime but stiff strips never self-close (they span the box).
 Stirring/temperature cycles do not help. N with a_T_N <= 60 lowers the end energy (bad).
+
+### Batch X (session 2): lipid architecture x memA's aqueous-two-phase (ATPS) physics
+Context: memA (other agent, linear H-T-T-T) found that making N immiscible with water
+(a_W_N 45, a_N_H 22, a_N_T 65, a_K_W 45) nucleates vesicles on N droplets: 6-9 vesicles at L=100.
+memB tests whether lipid architecture improves that route. Base: params/atps_base.ini
+(memA physics: f_lip 0.20, c_N 0.10, f_Ka 0.01, k_angle 15, L=100, 100k steps, chem 0).
+
+| run | lipid | iso mean (2nd half) / max | tools cells per snapshot (last 10) | with K | max bond / T |
+|---|---|---|---|---|---|
+| X01 | pi2 (no tie) | 1.67 (2.45) / 5 | 6-10 | 35/35 | 1.14 / 0.990 |
+| X02 | pi2 tie1 | 2.48 (3.73) / 7 | 3-7 | 52/52 | 1.18 / 0.989 |
+| X03 | pi2 tie1, a_W_T 100, a_N_T 80 | 1.86 (1.73) / 4 | 4-6 | 39/39 | 1.17 / 0.991 |
+| X04 | pi1 tie1 r0_head 0.7, a_W_T 300, a_N_T 200 | 5.14 (5.82) / 10 | 7-15 | 108/108 | 1.26 / 0.991 |
+
+X04 = best by far: ~10 closed vesicles at L=100 (areas 20-100, 4-43 catalysts each, N lumens).
+NEXT: replicate seeds, vary a_W_N / a_N_T (water in lumen, permeation), test survival when the
+N lumen turns into water (p_nd decay only), measure N permeation and K crossings.
+
+### Batch X replicates and variants (session 2), ATPS base, L=100, 100k steps, chem 0
+scan/cellsum.py: "cells" = tools/cells.detect cells per snapshot (uncapped), 2nd-half mean.
+
+| run | changes vs X04 | cells 2nd half (with K) | iso | max / last | first >= 3 cells | median lumen area / K per cell |
+|---|---|---|---|---|---|---|
+| X01 | pi2 no tie (a_W_T 80) | 9.7 (9.7) | 2.5 | 11 / 10 | 25k | 46 / 17 |
+| X02 | pi2 tie1 (a_W_T 80) | 4.1 (4.1) | 3.7 | 7 / 4 | 30k | 77 / 23 |
+| X03 | pi2 tie1, a_W_T 100, a_N_T 80 | 4.8 (4.7) | 1.7 | 6 / 4 | 20k | 87 / 26 |
+| X04 | pi1 tie1 r0_head 0.7, a_W_T 300, a_N_T 200 | 12.5 (12.5) | 5.8 | 15 / 7 | 20k | 44 / 14 |
+| X04s2 | seed 2 | 11.2 (10.8) | 6.5 | 15 / 10 | 15k | 48 / 12 |
+| X04s3 | seed 3 | 12.3 (11.6) | 7.8 | 16 / 12 | 15k | 37 / 11 |
+| X05 | a_N_T 120 | 12.7 (12.7) | 7.6 | 16 / 12 | 10k | 34 / 13 |
+| X06 | a_W_N 40 (softer two-phase) | 6.3 (6.2) | 2.7 | 9 / 5 | 25k | 56 / 14 |
+For comparison (pure water, no ATPS): D01 0.45, G04 2.1, K01 2.5, session-1 S01 2.3, s22 1.6.
+memA (linear H-T-T-T, ATPS, its final physics): 6-9 at the last snapshot.
+By eye (debug_cells X05 step 100k): ~17 closed vesicles with catalysts; the detector found 12
+(it misses vesicles that touch other membranes); a few small empty water rings also exist.
+Lumens are the N phase (N-rich, little W), as in memA.
+
+### Decay test, Y batch, long runs, crossings, synthesis checks (session 2)
+
+N -> W decay test (restart at 100k, chem on with ONLY p_nd = 2e-3 per check, feed none; all N
+gone by 140k): X04s3: cells 12 -> 2; X05: 13 -> 3. As in memA, vesicles need the N phase in
+the lumen: once the lumen is plain water most of them open (pure-water regime, ~1-3 rings).
+
+| run | changes vs X05 (pi1 tie1 r0_head 0.7, a_W_T 300, a_N_T 120) | cells 2nd half (with K) | iso | max / last | area med / K med |
+|---|---|---|---|---|---|
+| Y01 | a_K_T 300 | 10.3 (10.1) | 5.0 | 14 / 10 | 31 / 11 |
+| Y02 | a_K_T 300, r0_head 0.5 | 10.1 (9.9) | 7.6 | 13 / 9 | 43 / 13 |
+| Y03 | a_K_T 300, r0_head 0.9 | 12.4 (11.6) | 2.6 | 15 / 13 | 44 / 15 |
+| Y04 | a_K_T 300, f_lip 0.15 | 11.6 (11.6) | 8.7 | 13 / 9 | 59 / 17 |
+| Y01 to 300k | | 10.0 (9.3) | 5.9 | 14 / 11 | 42 / 12 |
+| Y04 to 300k | | 7.5 (7.4) | 5.7 | 13 / 6 | 63 / 21 | slow coarsening |
+| Z01 | a_W_T 120, a_N_T 80, a_K_T 120 (f 0.20) | 2.9 (2.9) | 2.7 | 7 / 1 | |
+| Z02 | a_W_T 160, a_N_T 100, a_K_T 160 | 9.4 (9.3) | 7.1 | 11 / 11 | 31 / 12 |
+| Z03 | a_W_T 200, a_N_T 120, a_K_T 200 | 10.4 (9.8) | 6.4 | 14 / 11 | 36 / 12 |
+| Z04 | Y01 + k_bond 300 | 9.6 (9.2) | 2.7 | 14 / 8 | 39 / 16 | max bond 1.04, T 0.985 |
+
+Crossings (dense snapshots every 100 steps, 300k -> 330k = 900 tau, scan/cross2_memA.py =
+memA's cross2.py copied unchanged): Y01: 9.3 cells mean, Ka exits 0, Ka entries/transfers only
+in groups of 12-68 beads at single snapshots (vesicle fusion / re-detection), N exits 13 (1.0e-5
+per inside bead per tau), N entries 391 (1.7e-3 per unit membrane length per tau), W entries 815.
+Y04: 4.7 cells mean, Ka exits 0 (1 detector flicker), Ka entries 16 = one group event; N exits 7,
+entries 115 (8e-4 per length per tau). -> catalysts never left an existing vesicle; N permeates
+slowly in both directions.
+
+Synthesis check (restart at 300k/100k, chem on, p_syn_a 2e-3, p_rep 1e-4, uniform feed 1e-4 cap
+0.11, 20k steps, ~800 syn events): every molecule is a correct tied pi1 lipid (2 H, 2 T, 4 bonds;
+scan/lipcheck.py), BUT new lipids are created inside the N/K lumen, which is hostile to tails,
+and get stretched: max bond 2.12 (Y01, k_bond 100), 1.52 (Z02), 1.69 (Z03); syn_relax 100 /
+syn_tries 16 does not help (1.68). With k_bond 300 (Z04): max bond 1.447 in 20k steps, 0 rows
+> 1.5. -> use k_bond 300.
+
+### Final replicates
+- memB_final_s3 (membranes.ini, seed 3, 100k): 11.7 cells per snapshot (2nd half, 11.1 with K),
+  max 15, last 11, first >= 3 at 15k, median area 38, max bond 1.04, T 0.985.
+- memB_final_L128 (membranes.ini, L=128, seed 6, 100k, threads 2, 3.5 min): 20.0 cells (19.6
+  with K), max 26, last 17, first >= 3 at 10k, max bond 1.06, T 0.986.
+- memA_z25 measured with the same scripts (on a copy in /tmp): 6.4 cells, max 9, area 74.
+
+### Batch F (final candidates, session 2): ATPS base + k_bond 300, L=100, 100k steps, chem 0
+
+| run | changes (all pi1 tie1 r0_head 0.7, a_N_T 120, k_bond 300) | cells 2nd half (with K) | iso | max / last | first >= 3 | area med / K med | max bond / T |
+|---|---|---|---|---|---|---|---|
+| F01 | a_W_T 200, a_K_T 200, f_lip 0.20 | 13.4 (13.4) | 8.4 | 17 / 14 | 10k | 26 / 10 | 1.04 / 0.986 |
+| F02 | F01 seed 2 | 13.6 (13.4) | 8.3 | 17 / 10 | 10k | 33 / 10 | 1.04 / 0.985 |
+| F03 | F01, f_lip 0.15 | 10.0 (10.0) | 6.9 | 12 / 10 | 20k | 42 / 15 | 1.02 / 0.987 |
+| F04 | a_W_T 300, a_K_T 300, f_lip 0.15 | 10.0 (9.3) | 3.4 | 14 / 9 | 15k | 61 / 18 | 1.04 / 0.986 |
+
+F01 chosen -> params/membranes.ini. `oercel params/membranes.ini memB_final_s1` (threads 2)
+reproduces F01 (threads 1) bit for bit (snapshots 50k, 100k and stats.csv identical; cmp).
+Debug image + micrograph at 100k (figs/teamB/dbg_F01.png; micro_F01.png not copied: 4.6 MB, /tmp/memB/ = pad op de ontwikkelmachine; viewed): 14 detected,
+~18 closed vesicles by eye, all with catalysts; loose membrane strips in between.
+
+Synthesis check on the final physics (memB_final_s1_syn: restart at 100k, chem on, p_syn_a 2e-3,
+p_rep 1e-4, uniform feed 1e-4 cap 0.11, 30k steps): 1042 syn + 57 rep events, every molecule a
+correct tied pi1 lipid (2530 molecules, 0 bad), longest bond over the run 1.27 (0 rows > 1.4),
+T_kin 0.982-0.984 (lipids grow to 34 % of beads).
+
+Crossings on the final physics (memB_final_s1_dense: 100k -> 130k, snapshot every 100 steps,
+900 tau, cross2_memA.py): 14.3 detected cells mean, 53 tracks.
+- Ka: 0 exits from a living vesicle. Entries: 2 groups (22 and 6 beads at one snapshot: lobes
+  of a vesicle reconnecting / re-detection) and 5 single-bead entries. The single ones were
+  inspected by eye (figs/teamB/bz_6204.png, figs/teamB/bz_6259.png): bead 6204 sat in the open gap of a
+  membrane that sealed around it (engulfment while the wall closed); bead 6259 moved between two
+  lobes of one N lumen while the lobes reconnected. None crossed an intact bilayer.
+- N: 12 exits (9.5e-6 per inside bead per tau), 283 entries (1.05e-3 per unit membrane length
+  per tau, i.e. ~0.3 N per tau into all vesicles together): slow but non-zero permeation.
+- W: 145 exits, 342 entries.
 
 ## 6. Appendix: all session-1 runs (generated by scan/summarize.py from memB_ringcache.json)
 

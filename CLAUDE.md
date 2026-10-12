@@ -22,6 +22,39 @@ De ladder:
    moleculaire wereld; daarop een wereld waarin elk deeltje één cel is met een evoluerend
    regelnetwerk. **De gebruiker moet akkoord geven voor deze stap** (het is grofkorrelen).
 
+## Stand van zaken (overdracht vanuit de cloudsessie, 12 okt 2026)
+- **Membranen**: opgelost. `cel/engine/params/membranes.ini` (gebonden twee-staart 'pi'-lipide +
+  voedsel/water twee-fasensysteem) geeft vanuit soep 9–14 gesloten cellen met enzymen per L=100.
+- **Deling**: voor het eerst vanzelf gezien (levensteam B), maar zeldzaam (~1 nette deling per
+  100k stappen per bak), nog geen tweede generatie, en `tools/analyze.py` registreert ze niet
+  (de cel verdwijnt uit de detectie tijdens de halsfase). Beelden: `cel/beelden/`, notities en
+  bewijs: `cel/notes/leven/` (lees `teamB_TUNING.md` en `teamA_TUNING.md` eerst).
+- De delingen komen uit de omgevingswet **convectiecellen** (`stir_mode=cells`, plus
+  `stir_period/stir_duty`, `feed_period/feed_duty`). Die zit **alleen** in
+  `cel/notes/leven/engine_teamB/oercel.c`, nog niet in `cel/engine/` en niet in `cel/engine_gpu/`.
+  De beste parameters: `cel/notes/leven/params_teamB/life.ini` (run V1, vanuit soep, seed 3).
+
+## Open punten (in deze volgorde)
+1. **Engine bijwerken**: de stir/feed-features uit `notes/leven/engine_teamB/oercel.c` netjes in
+   `cel/engine/oercel.c` zetten (diff t.o.v. de huidige engine; `tests/validate.sh` moet slagen),
+   en dezelfde features in `cel/engine_gpu/oercel_gpu.cu` (pariteit; `selftest_gpu.sh`).
+   Dan `life.ini` naar `cel/engine/params/production.ini` (plan.txt gebruikt die automatisch voor
+   een nieuwe run) en een convectiecel-variant toevoegen aan `cel/pc/voorbeelden/leven_scan.txt`.
+2. **Tracker**: `tools/analyze.py` moet delingen in stromend water herkennen (cel volgen via zijn
+   enzym-ID's door de halsfase heen; team B heeft hiervoor `scan/kfollow.py`/`khist.py`-ideeën,
+   zie de TUNING-notities).
+3. **Herstart-bestendig maken** (Windows-taakplanner bij inloggen, `start.sh --automatisch`,
+   WSL wakker houden): half af, nog niet getest. Het halve werk staat als patch in
+   `cel/notes/onaf/herstart_bestendig_WIP.patch` (+ `autostart_WIP.sh`). `cel/pc/` zelf staat op
+   de laatst volledig geteste versie (test_start.sh 138/138).
+4. Kleinere punten uit de proefrit: race in `cel/pc/tests/test_sweep_kill.sh` (pid opnieuw lezen
+   vlak voor kill), `test_thinning.sh` zelfstandig maken, kop van
+   `cel/pc/voorbeelden/lipide_architectuur_memB.txt` is verouderd, `longrun.py --forceer-engine`
+   van GPU naar CPU moet het checkpoint eerst omzetten met `cel/engine_gpu/ckpt_to_cpu.py`,
+   `cel/engine/oercel.c` zou stats/events/snapshots moeten fsyncen bij een checkpoint (WSL-shutdown).
+5. Daarna het eigenlijke doel: deling robuust en herhaald krijgen (generaties), en kijken of de
+   snelle enzymvariant (Kb) de langzame verdringt = natuurlijke selectie.
+
 ## De emergentieregel (niet onderhandelbaar)
 Staat in `cel/SPEC.md` §0. Kort: alleen natuurwetten (krachten, bindingen binnen moleculen,
 lokale reacties tussen moleculen die elkaar raken, omgeving die elk deeltje gelijk behandelt).

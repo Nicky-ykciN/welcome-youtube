@@ -24,7 +24,13 @@ Example parameter files in `params/`:
 - `membranes.ini`: **the membrane physics** (tied double-tailed lipid + two-phase nutrient).
   A random soup at L = 100 forms 10-17 closed bilayer vesicles with catalysts inside within
   10-15k steps. See "Lipid templates and the membrane physics". `runs/membranes_final/ckpt.bin`
-  is this file run as-is to step 100 000 (vesicle-rich starting state for the next stages).
+  is this file run as-is to step 100 000 (vesicle-rich starting state for the next stages; it
+  exists only on the development machine: elsewhere, run `engine/oercel engine/params/membranes.ini
+  runs/membranes_final` to make an equivalent one, bitwise equal only with the same build).
+
+Paths under `runs/` in this README are run directories on the development machine (git-ignored,
+not in a fresh clone). The teams' notes and key figures behind these results are copied to
+`notes/membranen/` (membrane teams A and B, the judge) and `notes/leven/` (life teams).
 
 ## What the emergence rule removed (and how the engine guards it)
 
@@ -36,7 +42,7 @@ Example parameter files in `params/`:
 
 The runs made with the removed features were deleted: `runs/val_seeded64` and `runs/scan_ves`
 (seeded), and `runs/val_soup64` (flood-fed; regenerated with this engine). In the toolkit's
-scratch area, the seeded runs `/tmp/oercel_scratch/runs/{seeded48,seedgrow,partial}` and
+scratch area, the seeded runs `/tmp/oercel_scratch/runs/{seeded48,seedgrow,partial}` (pad op de ontwikkelmachine) and
 the flood-fed runs `{soup64,soup128,val_chunk_D,val_restart_B}` were deleted, together with
 the scratch images rendered from seeded runs. `params/seeded_small.ini` and
 `tests/vesclosed.py` (a closure check for the placed vesicle on the old feed grid) were also
@@ -208,7 +214,8 @@ checkpoints treat every template the same way.
 independently written energy, and the template geometry (all bonds at rest length).
 
 **The membrane physics** (`params/membranes.ini`; tuned by team memB on top of team memA's
-two-phase nutrient, compared head-to-head in `runs/judge_src/NOTES.md`):
+two-phase nutrient, compared head-to-head in `notes/membranen/judge_NOTES.md`; the teams' logs are
+`notes/membranen/teamA_TUNING.md` and `teamB_TUNING.md`):
 - Lipid: `lip_arch = pi`, `lip_nT = 1`, `lip_tie = 1`, `r0_head = 0.7`, i.e. a small H2T2
   rectangle with 4 bonds (H1–H2 0.7, H–T 0.5, T–T tie 0.7) and **no angle terms** (k_angle has
   no effect on it). Tied tails cannot splay, so bilayers form no Y/T junctions.
