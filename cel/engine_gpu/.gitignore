@@ -1,0 +1,7 @@
+oercel_gpu
+oercel_emu
+build/
+testruns/
+*.o
+__pycache__/
+nvcc.log

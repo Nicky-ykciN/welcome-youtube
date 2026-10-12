@@ -292,6 +292,8 @@ def ensure_built(kind, logf=None):
         target = []
     else:
         return os.path.exists(kind)
+    if os.environ.get("OERCEL_NO_BUILD") == "1":   # tests on a shared machine: never touch engine/
+        return os.path.exists(b)
     if not os.path.exists(os.path.join(d, "Makefile")):
         return os.path.exists(b)
     if os.path.exists(b) and not _newer(os.path.join(d, src), b) and not _newer(os.path.join(d, "*.h"), b):

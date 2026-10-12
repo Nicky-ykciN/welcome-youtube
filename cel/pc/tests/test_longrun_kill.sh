@@ -10,7 +10,7 @@
 #      bitwise identical to the reference; never two engines on the same directory.
 # usage: pc/tests/test_longrun_kill.sh [outdir]      (default pc/_test/kill; ~2-3 minutes)
 set -u
-cd "$(dirname "$0")/../.."     # -> cel/
+cd "$(dirname "$0")/../.." || exit 1     # -> cel/
 OUT=${1:-pc/_test/kill}
 RUNS=$OUT/runs
 NAME=k1

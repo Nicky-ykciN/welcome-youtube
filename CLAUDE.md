@@ -40,6 +40,8 @@ Als iets niet vanzelf ontstaat: eerlijk melden.
 - `cel/pc/` — installatie (`setup_wsl.sh`), parameter-sweeps over 64 kernen (`sweep.py`),
   lange runs met automatisch hervatten (`longrun.py`), overzicht (`status.py`).
 - `cel/notes/` — wat eerdere teams geleerd hebben (lees dit voor je gaat afstemmen).
+  Voor groei en deling: `cel/notes/literatuur_deling.md` (vijf routes uit de literatuur,
+  vertaald naar onze knoppen).
 - `cel/runs/` — simulatie-uitvoer (niet in git).
 - `cel/beelden/` — afbeeldingen voor de gebruiker.
 - `index.html` (in de root) — een eerdere speelgoedversie; de gebruiker vond die lelijk. Niet verder gebruiken.

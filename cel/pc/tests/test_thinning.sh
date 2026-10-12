@@ -8,7 +8,7 @@
 # analysis of the thinned run still finds the division, and a second invocation changes nothing.
 # usage: pc/tests/test_thinning.sh [outdir]      (default pc/_test/thin; ~1 minute)
 set -u
-cd "$(dirname "$0")/../.."     # -> cel/
+cd "$(dirname "$0")/../.." || exit 1     # -> cel/
 OUT=${1:-pc/_test/thin}
 SRC=runs/memA_F0
 [ -f $SRC/snap_0000092000.bin ] || { echo "SKIP: $SRC not present"; exit 0; }

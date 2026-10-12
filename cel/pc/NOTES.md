@@ -23,9 +23,15 @@ Test outputs go to pc/_test/ (git-ignored via pc/.gitignore), never to runs/ of 
 
 ## Status
 - [x] read SPEC/engine/tools
-- [ ] pclib.py
-- [ ] longrun.py + tests
-- [ ] sweep.py + tests
+- [x] pclib.py
+- [x] longrun.py + tests
+  - tests/test_longrun_kill.sh PASS (02:25): kill -9 engine, kill -9 supervisor (engine stops via
+    PDEATHSIG with ckpt), kill -9 both; final stats/events/ckpt + 61 snapshots bitwise == reference.
+  - tests/test_thinning.sh PASS (02:27): adopted copy of runs/memA_F0 (division at 92000): window kept,
+    51 -> 20 snaps, re-analysis still finds division, micro/goodsell/timelapse rendered.
+- [x] sweep.py + tests
+  - tests/test_sweep_kill.sh PASS (02:31): 8 jobs, kill -9 engine + kill -9 sweep supervisor, resume;
+    2 jobs bitwise == uninterrupted reference; SAMENVATTING.md/.csv OK.
 - [ ] status.py
 - [ ] setup_wsl.sh + dry-run tests
 - [ ] README.md
