@@ -23,5 +23,12 @@ nagekeken. Wordt na elke stap bijgewerkt (crashveiligheid).
   __AVX512BW__ && __AVX512VL__ && !OERCEL_SCALAR` (regel 42); anders scalaire kernel. Geen
   runtime-dispatch nodig: `-march=native` op de Threadripper kiest zelf. Testbinary met
   `-march=x86-64-v3`: 0 zmm/k-registers/xmm16+ (objdump). Met native (deze Xeon): 85 zmm.
-- [stap 2b] LOPEND: validate.sh in kopie (scratchpad) met CFLAGS=-march=x86-64-v3 en nep-"vreemde"
-  binaries (SIGILL-script, nieuwer dan bron) → moet alles herbouwen en slagen.
+- [stap 2b] KLAAR: validate.sh in een kopie (scratchpad) met `CFLAGS=-O3 -march=x86-64-v3 ...` en
+  nep-"vreemde" binaries (script dat zichzelf SIGILL stuurt, 1 uur nieuwer dan de bron):
+  rooktest zag de SIGILL, engine opnieuw gebouwd; testbinaries ondanks nieuwere mtime opnieuw
+  gebouwd; "scalar force kernel"; **0 FAIL** (alle 8 secties, 2 min 12 s). Engine en molforcetest
+  van die build: 0 zmm/k-registerinstructies.
+- [stap 2c] Kruiscompilatie forcetest voor `-march=znver2/znver3` (Threadripper 3990X/5995WX,
+  geen AVX-512): compileert zonder waarschuwingen, scalaire kernel, FORCETEST PASS (hier gedraaid).
+  `-march=znver4` (Threadripper 7980X, wel AVX-512): AVX-512-pad, PASS. Niet getest: een echte
+  AMD-CPU en WSL2 (deze machine is een Intel Xeon met AVX-512).
