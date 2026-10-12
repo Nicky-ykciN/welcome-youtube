@@ -1,0 +1,4 @@
+# start.sh/stop.sh/setup_wsl.sh must keep LF line endings, also when the repo is cloned with Git for Windows
+*.sh text eol=lf
+*.py text eol=lf
+*.txt text eol=lf

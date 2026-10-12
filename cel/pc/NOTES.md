@@ -188,3 +188,28 @@ Test outputs go to pc/_test/ (git-ignored via pc/.gitignore), never to runs/ of 
   Still untestable here: real WSL2/CUDA/GPU, sudo prompt, /mnt/c (drvfs flock, C: free space), 64-core sizing.
   Note: pc/README.md, pc/tests/* (most) and pc/voorbeelden/ are not yet tracked by git -> whoever commits
   must add the whole cel/pc directory (git status showed them as untracked; read-only check).
+
+## START-TAAK (one-command start: start.sh, stop.sh, plan.txt, plan.py, STARTEN.md) — 2026-10-12 vanaf 04:35
+Opdracht: pc/start.sh (setup indien nodig -> claude installeren -> plan starten/hervatten -> status
+--kort -> Claude Remote Control in tmux 'oercel-claude'), pc/stop.sh, pc/plan.txt, voorbeelden/leven_scan.txt,
+/home/user/welcome-youtube/STARTEN.md, README-verwijzing. Geen git. engine/, engine_gpu/, SPEC, CLAUDE.md, runs/
+(behalve eigen testmappen) NIET aanraken. Tests licht (1-2 threads, kleine dozen). setup_wsl.sh hier NOOIT
+echt draaien (root! zie Incident): in tests een nep-setup via OERCEL_SETUP_CMD.
+Ontwerp (besloten):
+- setup klaar = nieuwste niet-DROOG runs/_setup/setup_*.log bevat "Klaar. Volgende stap" (+ engine/oercel bestaat).
+  Eerdere poging mislukt en CPU-engine+python werken -> eerst plan hervatten, dan setup opnieuw, dan plan nogmaals.
+- plan.py (stdlib + pclib): regels 'longrun.py ...' / 'sweep.py ...', '#'-commentaar, '\'-vervolgregels,
+  'als PAD bestaat: ...' / 'anders: ...' (production.ini-terugval). Per regel: nieuw -> start; draait -> niets;
+  klaar -> niets; bewust gestopt (--stop) zonder stop.sh-merkteken -> blijft staan; anders hervatten.
+  Daarna: andere onderbroken runs/sweeps (status.py-logica) + alles met stop.sh-merkteken hervatten.
+- oersoep_groot met --engine gpu (geen CPU-terugval: L=512 op 32 CPU-threads zou de sweep overboeken).
+- sweep leven_scan: 54 varianten x 2 seeds = 108 jobs, --threads 2 --reserve 20 -> 54 tegelijk op 128 threads.
+- stop.sh: merkteken pc_gestopt_door_stop_sh in elke draaiende run/sweep + --stop (parallel); --alles ook tmux.
+- Claude RC: wrapper pc/claude_rc.sh in tmux (herstart na netwerkverlies, --continue bij herstart).
+Voortgang:
+- [04:50] geschreven: plan.py (start/lijst/proef/stop), plan.txt, voorbeelden/leven_scan.txt (108 jobs),
+  claude_rc.sh (tmux-wrapper), start.sh, stop.sh, pc/.gitattributes (LF), setup_wsl.sh PKGS + curl tmux.
+  plan.py proef op het echte plan: 0 fouten (CPU-engine accepteert de terugvalregel; sweep --proef 108 jobs).
+  Snelheid hier: L=100 chemie aan, 2 threads: 1,3 ms/stap. VOLGENDE: tests (pc/tests/test_start.sh) met nep-HOME,
+  nep-claude/curl/nvidia-smi, echte tmux op eigen socket (-L), nep-setup (OERCEL_SETUP_CMD), OERCEL_RUNS in scratch.
+- [04:58] tests/test_start.sh geschreven (14 secties); eerste run gestart -> _test/start.log

@@ -262,7 +262,7 @@ if [ "$DO_APT" = 1 ] && [ "$DRY" != 1 ] && [ "$NO_ROOT" != 1 ] && [ -n "$(dpkg -
 fi
 PKGS=(build-essential make gcc g++ python3 python3-venv python3-pip python3-numpy python3-scipy
       python3-matplotlib python3-pandas python3-pil python3-yaml ffmpeg fonts-dejavu-core
-      wget ca-certificates gnupg git procps)
+      wget curl ca-certificates gnupg git procps tmux)    # curl + tmux: start.sh (Claude Code, Remote Control)
 PYCHECK='import sys, numpy, scipy, matplotlib, pandas, PIL
 matplotlib.use("Agg")
 import matplotlib.pyplot
