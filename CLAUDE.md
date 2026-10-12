@@ -46,6 +46,13 @@ Als iets niet vanzelf ontstaat: eerlijk melden.
 - `cel/beelden/` — afbeeldingen voor de gebruiker.
 - `index.html` (in de root) — een eerdere speelgoedversie; de gebruiker vond die lelijk. Niet verder gebruiken.
 
+## Toestemmingen
+`.claude/settings.json` staat een smalle lijst commando's toe zonder vragen (de scripts in
+`cel/pc/` en `cel/tools/`, de engines, `make -C cel/...`, git op deze branch, alleen-lezen
+commando's) en verbiedt o.a. `sudo` en force-push. Gebruik die vaste vormen (vanuit de
+repo-root, bv. `python3 cel/pc/status.py --kort`), dan hoeft de gebruiker niets goed te keuren.
+Breid de lijst niet zelf uit; vraag het de gebruiker als iets anders echt nodig is.
+
 ## Werkwijze op deze pc
 - Hardware: AMD Threadripper 64 kernen, NVIDIA Quadro RTX 8000 (48 GB, sm_75), WSL2.
 - Grote runs op de GPU; de 64 kernen voor veel kleine runs tegelijk (sweeps, replicaties).
