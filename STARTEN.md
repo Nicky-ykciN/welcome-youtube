@@ -1,8 +1,8 @@
 # Oercel starten op je werkplek
 
 Nodig: Windows 11 met **Ubuntu (WSL2)**, de gewone **NVIDIA-driver voor Windows**, een
-**Claude-abonnement** (Pro, Max, Team of Enterprise) en ongeveer **100 GB vrij op schijf C:**
-(daar staat de Linux-schijf van Ubuntu). Verder hoef je niets te installeren.
+**Claude-abonnement** (Pro, Max, Team of Enterprise), je **GitHub-account** en ongeveer **100 GB vrij
+op schijf C:** (daar staat de Linux-schijf van Ubuntu). Verder hoef je niets te installeren.
 
 ## Stap voor stap
 
@@ -24,18 +24,25 @@ Nodig: Windows 11 met **Ubuntu (WSL2)**, de gewone **NVIDIA-driver voor Windows*
 7. Daarna vraagt hij je **in te loggen bij Claude**. Er opent een browser, of je krijgt een link
    (Ctrl+klik). Log in. Toont de browser een code: kopieer die, plak hem in het Ubuntu-venster
    (rechtermuisknop) en druk op Enter.
-8. Druk op Enter om naar het Claude-venster te gaan, en beantwoord de vragen:
+8. Meteen daarna log je **één keer in bij GitHub**, zodat Claude de resultaten op GitHub kan bewaren.
+   Eerst vraagt hij `Authenticate Git with your GitHub credentials? (Y/n)`: druk op **Enter** (= ja).
+   Dan zie je een code van 8 tekens (zoals `ABCD-1234`). Druk op Enter: de browser opent
+   github.com/login/device (gebeurt dat niet, ga daar dan zelf heen in Windows). Log in bij GitHub, typ
+   de code, klik **Continue** en daarna **Authorize**. Vraagt het Ubuntu-venster daarna nog iets: Enter.
+   (Overslaan kan met Ctrl+C; alles werkt dan, alleen kan Claude niets op GitHub zetten.)
+9. Druk op Enter om naar het Claude-venster te gaan, en beantwoord de vragen:
    - `Enable Remote Control? (y/n)` → **y** en Enter
    - `Trust ...?` (vertrouw je deze map?) → **y** en Enter
    - een andere vraag (bijvoorbeeld een kleurenschema kiezen, of "Press Enter") → **Enter**
-9. Zie je een link naar claude.ai/code, dan is het klaar. Druk **Ctrl+b**, laat los, druk **d**:
-   je bent terug in Ubuntu en Claude blijft draaien.
-   Te vroeg teruggegaan, voordat je de vragen had beantwoord? Typ dan nog eens `bash cel/pc/start.sh`:
-   hij brengt je terug naar de vraag.
-10. Open de **Claude-app** (telefoon, of claude.ai/code) → **Code** → **Oercel werkstation**.
-    Vanaf nu praat je daar met Claude. Vraagt Claude daar toestemming om iets uit te voeren, geef die
-    dan; meestal kun je ook kiezen dat hij het voor die opdracht niet opnieuw vraagt.
-11. Laat het Ubuntu-venster open (minimaliseren mag) en zet de slaapstand van Windows op **Nooit**
+10. Zie je een link naar claude.ai/code, dan is het klaar. Druk **Ctrl+b**, laat los, druk **d**:
+    je bent terug in Ubuntu en Claude blijft draaien.
+    Te vroeg teruggegaan, voordat je de vragen had beantwoord? Typ dan nog eens `bash cel/pc/start.sh`:
+    hij brengt je terug naar de vraag.
+11. Open de **Claude-app** (telefoon, of claude.ai/code) → **Code** → **Oercel werkstation**.
+    Vanaf nu praat je daar met Claude. Zijn eigen experimentcommando's mag Claude zonder te vragen
+    uitvoeren (alleen een vaste lijst, in `.claude/settings.json` van de repo); voor al het andere vraagt
+    hij toestemming in de app: geef die dan.
+12. Laat het Ubuntu-venster open (minimaliseren mag) en zet de slaapstand van Windows op **Nooit**
     (Instellingen → Systeem → Energie), anders pauzeert alles als de pc gaat slapen.
 
 ## Wat gebeurt er daarna?
@@ -48,8 +55,8 @@ Meteen na de installatie starten de experimenten uit `cel/pc/plan.txt` vanzelf, 
 - **leven_scan** — 108 kleine proeven op de 64 kernen, 54 tegelijk (geschat 3 tot 5 uur), om te zien
   welke instellingen cellen laten eten, groeien en delen.
 
-Claude kijkt mee, laat je beelden zien en zegt eerlijk wat wel en niet werkt. Hij past het plan aan
-en start nieuwe proeven als dat nodig is. Zolang de afgestemde chemie (`engine/params/production.ini`)
+Claude kijkt mee, laat je beelden zien, zegt eerlijk wat wel en niet werkt en bewaart notities en
+beelden op GitHub. Hij past het plan aan en start nieuwe proeven als dat nodig is. Zolang de afgestemde chemie (`engine/params/production.ini`)
 er nog niet is, gebruikt oersoep_groot een voorzichtige gok; dat staat in `plan.txt`.
 
 **De beelden zelf bekijken in Windows:** typ in Ubuntu
@@ -90,6 +97,8 @@ kan de pc 's nachts herstarten; doe dan hetzelfde.)
 - **De repo staat onder `/mnt/c`** — start.sh maakt dan zelf een kopie in `~/welcome-youtube` en gaat
   daar verder. Gebruik voortaan die. Lukt het niet: doe stap 2 opnieuw.
 - **Foutmelding met `$'\r'`** — de repo is met Git voor Windows gekloond. Doe stap 2 in Ubuntu.
+- **GitHub-inloggen overgeslagen of mislukt** — draai `bash cel/pc/start.sh` opnieuw: dan vraagt hij het
+  nog eens (zie stap 8). Of zelf: `gh auth login --web` (bij elke vraag Enter), daarna `gh auth setup-git`.
 - **Inloggen lukt niet** — typ `~/.local/bin/claude auth login` (zo werkt het ook in hetzelfde
   venster), daarna weer `bash cel/pc/start.sh`. Remote Control werkt alleen met een abonnement, niet
   met een API-sleutel.

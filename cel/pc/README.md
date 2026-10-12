@@ -9,7 +9,7 @@ beslissen welke *bestanden* bewaard blijven, nooit om de simulatie bij te sturen
 `STARTEN.md` in de root):
 
 ```bash
-bash cel/pc/start.sh      # installatie (eenmalig) + Claude Code + experimenten uit plan.txt + status + Remote Control
+bash cel/pc/start.sh      # installatie (eenmalig) + Claude Code + experimenten uit plan.txt + status + Remote Control + GitHub-login (eenmalig)
 bash cel/pc/stop.sh       # alle experimenten netjes stoppen (Claude blijft draaien; --alles: ook Claude)
 ```
 
@@ -57,6 +57,29 @@ bash cel/pc/stop.sh       # alle experimenten netjes stoppen (Claude blijft draa
    "Trust?"; terug met Ctrl+b, d. Ook later schakelt het ernaar als Claude daar op een antwoord wacht
    (bijvoorbeeld als de gebruiker de eerste keer te vroeg terugging); anders zegt het alleen dat Claude
    draait. Tijdens dat venster is het slot van `start.sh` vrij (Claude kan intussen `--alleen-plan` doen).
+6. **GitHub** (meteen na het inloggen bij Claude, vóór het Claude-venster): de kloon is anoniem (https), dus
+   zonder inlog kan Claude niet pushen. Eén keer, in de voorgrond:
+   `gh auth login --hostname github.com --git-protocol https --web`. gh vraagt dan eerst
+   "Authenticate Git with your GitHub credentials? (Y/n)" (Enter = ja; gh zet dan zelf de credential-helper),
+   en toont daarna pas de code van 8 tekens en "Press Enter to open https://github.com/login/device"
+   (volgorde nagekeken in cli/cli `pkg/cmd/auth/shared/login_flow.go`). In WSL opent een klein hulpscript
+   `_build/open_url.sh` de Windows-browser (`wslview`, anders `explorer.exe`); het wordt als `GH_BROWSER`
+   én `BROWSER` meegegeven, want gh 2.4.0 leest alleen `BROWSER`. Opent er niets, dan gaat de gebruiker
+   zelf naar github.com/login/device (staat in de uitleg en in gh's eigen regel). Daarna, als git gh nog
+   niet als credential-helper heeft: `gh auth setup-git` (het token blijft in gh's eigen configuratie in
+   `~/.config/gh` of de sleutelbos, nooit in de repo of in een log). Overgeslagen als `gh auth status` al
+   lukt, als de remote geen github.com is, en zonder terminal. `gh auth status` controleert het token
+   online en faalt dus ook als GitHub even onbereikbaar is (bv. net na een herstart): staat er al een login
+   (`gh auth token`, of bij oude gh `oauth_token` in `hosts.yml`) en antwoordt `https://api.github.com`
+   niet (`curl`), dan wordt er niet opnieuw ingelogd ("GitHub is nu niet bereikbaar"). Overslaan (Ctrl+C,
+   stopt alleen gh; de terminalinstellingen worden daarna hersteld) of mislukken → één regel "pushen naar
+   GitHub kan nog niet: … gh auth login" en verder. Oudere gh zonder `--git-protocol` (Ubuntu 22.04: 2.4.0;
+   met `--web` stelt die geen vragen) → zonder die optie, dan
+   `gh config set -h github.com git_protocol https`. Daarnaast: ontbreken `user.name`/`user.email`, dan
+   zet `start.sh` ze **lokaal** in de repo: uit `gh api user` (naam, en het openbare e-mailadres of anders
+   het noreply-adres `ID+login@users.noreply.github.com`), zonder GitHub-login de plaatsvervanger
+   `Oercel werkstation <oercel@localhost>` (die later, na een login, wordt vervangen). Een eigen identiteit
+   wordt nooit veranderd. `--geen-claude` en `--alleen-plan` slaan deze stap over.
 
 Alleen het plan toepassen (bijv. door Claude na een wijziging van `plan.txt`):
 `bash cel/pc/start.sh --alleen-plan`, of `python3 cel/pc/plan.py start`. Controleren zonder te starten:
@@ -94,8 +117,18 @@ Het doet:
 1. **Controle**: draait het in WSL2 (niet WSL1)? Staat de repo onder `/mnt/c` (traag → het zegt hoe
    je hem naar `~` verplaatst)? Ubuntu-versie, kernen, geheugen, vrije schijf.
 2. **apt**: `build-essential`, `python3` met numpy/scipy/matplotlib/pandas/pillow/yaml, `ffmpeg`,
-   lettertypen, `git`. Lukt de systeem-Python niet, dan maakt het een venv in `cel/pc/.venv`
-   (en laat `~/.bashrc` die laden via `env.sh`).
+   lettertypen, `git`, `tmux`, `curl`. Lukt de systeem-Python niet, dan maakt het een venv in `cel/pc/.venv`
+   (en laat `~/.bashrc` die laden via `env.sh`). Daarna de **GitHub CLI `gh`** (voor de GitHub-login van
+   `start.sh`) uit GitHubs officiële apt-repository, precies volgens "Recommended (Official)" in `cli/cli`
+   `docs/install_linux.md` (sleutel `https://cli.github.com/packages/githubcli-archive-keyring.gpg` →
+   `/etc/apt/keyrings/`, regel `deb [arch=… signed-by=…] https://cli.github.com/packages stable main` in
+   `/etc/apt/sources.list.d/github-cli.list`, `apt update`, `apt install gh`). Ubuntu's eigen pakket `gh` is
+   alleen de terugval: het is oud (22.04: 2.4.0, 24.04: 2.45.0, 20.04: geen), en volgens dat document
+   (sinds nov. 2025) zijn de community-pakketten 2.45.x/2.46.x kapot door uitgefaseerde GitHub-API's
+   (inloggen en pushen werken er wel mee). Ziet apt na `update` de repository van cli.github.com niet, of
+   mislukt de installatie, dan wordt de regel weer verwijderd en volgt de terugval. Een al geïnstalleerde
+   gh ouder dan 2.47 wordt via GitHubs repository bijgewerkt; nieuwere blijft staan. Lukt gh niet, dan is
+   dat een WAARSCHUWING (alles werkt, alleen pushen niet).
 3. **CUDA**: eerst `nvidia-smi` (moet werken, anders: Windows-driver installeren/bijwerken en in
    PowerShell `wsl --shutdown`). Dan alleen het pakket `cuda-toolkit-X-Y` uit NVIDIA's officiële
    **WSL-Ubuntu**-repository:
@@ -120,13 +153,18 @@ Het doet:
 4. **Bouwen**: `make -C engine` (CPU, `-march=native`) en `make -C engine_gpu` (als die map er is).
    De Threadripper heeft mogelijk geen AVX-512 (Zen 2/3); dan gebruikt de engine automatisch zijn
    geteste scalaire kernel.
-5. **Tests**: `engine/tests/validate.sh` (29 controles), `engine_gpu/selftest_gpu.sh` (als die er
+5. **Tests**: `engine/tests/validate.sh` (29 controles), `tools/selftest.py` (analyse, alle beeldsoorten,
+   video en `kill -9`-bestendigheid op **synthetische** testdata, ~1-2 min, 2 processen; in de samenvatting
+   `tools-zelftest` met PASS en het aantal controles, of FOUT met FAIL, de aantallen en de eerste mislukte
+   controles; ontbreekt ffmpeg en faalt alleen de video-controle, dan WAARSCHUWING, net als bij ffmpeg zelf;
+   log `runs/_setup/tools_selftest.log`), `engine_gpu/selftest_gpu.sh` (als die er
    is), een korte GPU-proefrun, een proefrun van soep → `tools/analyze.py` → `tools/render.py`.
 6. **Samenvatting** met per onderdeel OK / WAARSCHUWING / FOUT / OVERGESLAGEN. Log:
    `cel/runs/_setup/setup_<tijd>.log`. De uitslag van de GPU-zelftest wordt per build onthouden in
    `cel/pc/_build/gpu_selftest.json`: faalde de zelftest, dan gebruikt `longrun.py` de CPU-engine.
 
-Opties: `--geen-apt`, `--geen-cuda`, `--cuda-versie X-Y`, `--snel` (zonder validate.sh, GPU-zelftest `--quick`),
+Opties: `--geen-apt`, `--geen-cuda`, `--cuda-versie X-Y`, `--snel` (zonder validate.sh en tools/selftest.py,
+GPU-zelftest `--quick`),
 `--geen-tests`, `--droog` (alleen tonen wat er met root zou gebeuren).
 
 **sudo**: apt en CUDA hebben root nodig. Claude Code kan geen wachtwoord typen. Draai het script
@@ -250,6 +288,11 @@ python3 cel/pc/longrun.py prod1 --analyseer-nu        # nu analyse + beelden i.p
   `timelapse_<stap>.png` zodra er een deling is (alleen opnieuw als de delingen veranderen). Per
   soort blijven de nieuwste `--images-keep` (4) bewaard. Beelden worden eerst als `*.tmp.png` gemaakt
   en pas als ze af zijn hernoemd, dus een `kill` tijdens het tekenen laat geen halve PNG achter.
+  Breedte: zonder `--width` kiest `tools/render.py` zelf (2000 px; het microscoopbeeld van de hele schaal
+  van een doos met L > 1024 breder, tot 4000 px, zodat membranen zichtbaar blijven); de time-lapse krijgt
+  2400 px (5 panelen rond één cel). Met `--width N` precies N (time-lapse minstens 2400). Runs van vóór deze
+  wijziging (toestand versie 1) hadden altijd de oude standaard 2000 opgeslagen: die wordt automatisch;
+  een andere opgeslagen waarde blijft.
 - **Schijf begrensd** (na elke analyse): de nieuwste `--keep-recent` (200) geanalyseerde snapshots
   blijven; oudere worden uitgedund met een stap die met de leeftijd verdubbelt (1 op 2, 4, 8, …,
   max 1 op `--max-stride` = 64). Altijd bewaard: snapshot 0, alles wat nog niet geanalyseerd is of
@@ -311,7 +354,7 @@ met `bash cel/pc/tests/alle_tests.sh` (~30 min; op de pc ook met de echte GPU-en
 | `tests/test_gpu_fallback.sh` | GPU-engine die niet draait → CPU; `--engine gpu` dan geweigerd; zelftest gefaald → CPU; GPU die midden in een run wegvalt → géén checkpoint als kapot gemarkeerd, na terugkeer verder vanaf het nieuwste checkpoint, bit-gelijk |
 | `tests/test_stop_hervat.sh` | SIGTERM van buiten (afsluiten) → `--hervat` start opnieuw; bewuste `--stop` → `--hervat` laat het staan (run én sweep); `--steps` op een draaiende run → `NIET TOEGEPAST`; bestandssysteem zonder `flock` (gesimuleerd) → vergrendeling via `/tmp`; sweep met volle schijf → jobs pauzeren met checkpoint, geen crash geteld, daarna bit-gelijk klaar |
 | `tests/test_kill_stress.sh` | `kill -9` van engine / supervisor / beide **tijdens het schrijven van een checkpoint** (gericht), tijdens een snapshot, en willekeurig; `kill -9` van de supervisor tijdens `analyze.py`/`render.py` en het uitdunnen; sweep-supervisor willekeurig gedood → alles bit-gelijk, geldige JSON, geen halve bestanden of beelden |
-| `tests/test_start.sh` | `start.sh`/`stop.sh`/`plan.py` met nep-HOME, nep-`claude` (+ installer via nep-`curl`), nep-`nvidia-smi`/GPU-engine, nep-setup en de echte tmux op een eigen socket: eerste start in een pseudo-terminal (wachtwoordloze nep-setup, installatie, PATH in `~/.bashrc`, inloggen met code plakken, plan met terugvalregel, status, tmux + "Enable Remote Control? (y/n)" + Ctrl+b d); opnieuw = niets dubbel; `kill -9` van alles → hervat; `stop.sh` → `start.sh` hervat, bewuste `--stop` blijft staan; production.ini verschijnt later → melding, run houdt eigen instellingen; production.ini bij een nieuwe run → `als`-regel; GPU weg → wacht; mislukte setup → eerst hervatten, dan opnieuw; runs buiten het plan; repo op de "Windows-schijf"; planfouten; `stop.sh --alles` → Claude met `--continue` terug; wrapper herstart Claude; meer stappen in het plan → hervat; vraag in tmux niet beantwoord (te vroeg Ctrl+b d) → volgende `start.sh` brengt je terug, zonder terminal een hint; `start.sh --alleen-plan` werkt terwijl de gebruiker in het Claude-venster zit |
+| `tests/test_start.sh` | `start.sh`/`stop.sh`/`plan.py` met nep-HOME, nep-`claude` (+ installer via nep-`curl`), nep-`nvidia-smi`/GPU-engine, nep-setup en de echte tmux op een eigen socket: eerste start in een pseudo-terminal (wachtwoordloze nep-setup, installatie, PATH in `~/.bashrc`, inloggen met code plakken, plan met terugvalregel, status, tmux + "Enable Remote Control? (y/n)" + Ctrl+b d); opnieuw = niets dubbel; `kill -9` van alles → hervat; `stop.sh` → `start.sh` hervat, bewuste `--stop` blijft staan; production.ini verschijnt later → melding, run houdt eigen instellingen; production.ini bij een nieuwe run → `als`-regel; GPU weg → wacht; mislukte setup → eerst hervatten, dan opnieuw; runs buiten het plan; repo op de "Windows-schijf"; planfouten; `stop.sh --alles` → Claude met `--continue` terug; wrapper herstart Claude; meer stappen in het plan → hervat; vraag in tmux niet beantwoord (te vroeg Ctrl+b d) → volgende `start.sh` brengt je terug, zonder terminal een hint; `start.sh --alleen-plan` werkt terwijl de gebruiker in het Claude-venster zit; GitHub (nep-`gh` die de vragen in de volgorde van de echte gh stelt, nep-`explorer.exe`, eigen test-git-repo): login 1x na de Claude-login met de juiste opties, eerst "Authenticate Git…?" en dan de code, browser via explorer.exe, credential-helper, identiteit uit `gh api user` (noreply), geen token in de repo of de uitvoer, opnieuw = geen tweede login, zonder terminal één regel, Ctrl+C stopt alleen gh, mislukte login, oude gh zonder `--git-protocol` (browser via `BROWSER`), plaatsvervanger → later vervangen, eigen identiteit blijft, andere remote, gh ontbreekt, `--alleen-plan` raakt GitHub niet, ingelogd maar GitHub onbereikbaar → geen nieuwe loginvraag (ook oude gh met `hosts.yml`), token ongeldig en GitHub bereikbaar → wel opnieuw inloggen, echte `.git/config` onveranderd; `longrun.py`-beeldbreedte (argumenten, echte PNG-breedtes 2000/640, oude toestand); `setup_wsl.sh --droog` in een kopie: gh uit GitHubs repository (ook als Ubuntu een oud pakket heeft), terugval op Ubuntu's pakket als die repository niet lukt, oude gh 2.45 bijwerken, nieuwe laten staan (alles alleen getoond), echte `tools/selftest.py` → PASS in de samenvatting, nep-selftest die faalt → FOUT/FAIL, overgeslagen met `--snel`/`--geen-tests` |
 | `setup_wsl.sh --test-functies` | versiekeuze van de toolkit (ook Ubuntu 20.04 → max. 12.x, terugvalvolgorde), parsen van `nvidia-smi`, WSL1/WSL2-herkenning |
 | `setup_wsl.sh --droog` als root op een kopie van de repo van een andere gebruiker | de mappen die setup maakt (`runs/`, `runs/_setup`, `pc/_build`) zijn van de eigenaar; proefrun lukt (zo draait `wsl -u root`) |
 | `setup_wsl.sh --droog` in een kopie van de repo | met nep-WSL2-kernel en nep-`nvidia-smi`: alle stappen, bouwen (ook `engine_gpu/oercel_gpu` met nvcc 12.0 + g++-12), validate.sh (29 PASS), proefrun; CUDA-testprogramma compileert voor sm_75 |
@@ -334,6 +377,16 @@ met `bash cel/pc/tests/alle_tests.sh` (~30 min; op de pc ook met de echte GPU-en
   niet, dan vergrendelen de scripts via `/tmp`, getest met een gesimuleerde fout);
 - prestaties en de standaardinstellingen op 64 kernen (jobs × threads) — dat moet op de pc zelf
   blijken; pas zo nodig `--jobs/--threads` aan.
+- de échte GitHub-login: `gh auth login --web` in WSL2 (code, browser via `explorer.exe`/`wslview`, de vraag
+  "Authenticate Git with your GitHub credentials?"), `gh auth setup-git` en een echte `git push`. Getest met
+  een nep-`gh` die de vragen stelt in de volgorde uit de broncode van cli/cli (trunk en v2.4.0 nagelezen);
+  GitHubs apt-repository en Ubuntu's pakket `gh` zijn alleen droog getest (cli.github.com is hier
+  geblokkeerd); of gh 2.4.0 (terugval op 22.04) het device-inloggen nog goed doet is niet gecontroleerd.
+  Hoe de echte gh reageert op Ctrl+C in zijn Y/n-vraag (ruwe terminalmodus) is niet getest; start.sh herstelt
+  daarna in elk geval de terminalinstellingen (`stty`). De bereikbaarheidsproef (`curl https://api.github.com/`)
+  is alleen met een nep-`curl` getest.
+- `tools/selftest.py` binnen een echte (niet-droge) `setup_wsl.sh`-run in WSL2: alleen in een droge kopie
+  getest (de selftest zelf draaide daar echt).
 - `start.sh` met de échte Claude Code: de officiële installer, `claude auth login` in WSL2 (browser/code),
   de exacte tekst van de vragen van `claude remote-control` (de herkenning "staat er een vraag in beeld?"
   bij latere starts is een gok op `(y/n)`, `trust`, `paste`, `press enter` … in de regels ná de laatste

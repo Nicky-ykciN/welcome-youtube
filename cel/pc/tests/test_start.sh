@@ -20,7 +20,19 @@
 #  13. Claude stopt in tmux -> de wrapper start hem opnieuw; tmux-sessie zonder Claude -> vervangen
 #  14. klaar + het plan wil meer stappen -> hervat tot het nieuwe doel
 #  15. vraag in tmux niet beantwoord (te vroeg Ctrl+b d) -> start.sh brengt je terug; het slot is vrij tijdens attach
-# usage: bash cel/pc/tests/test_start.sh [outdir]      (default cel/pc/_test/start; ~5-10 minuten, 1 thread)
+#  16. GitHub: (in 1 en 2 al: eenmalig gh auth login --hostname github.com --git-protocol https --web na de
+#      Claude-login, eerst gh's vraag "Authenticate Git...?" en dan de code, Windows-browser via explorer.exe,
+#      credential-helper, git-naam/e-mail uit gh api user, geen token in de repo; opnieuw = geen tweede login)
+#      niet ingelogd zonder terminal -> één regel; Ctrl+C -> start.sh gaat door; login mislukt; oude gh zonder
+#      --git-protocol (browser via BROWSER); plaatsvervangende identiteit, later vervangen; eigen identiteit blijft;
+#      remote geen github.com; gh ontbreekt; --alleen-plan raakt GitHub niet; ingelogd maar GitHub onbereikbaar ->
+#      geen nieuwe loginvraag (ook oude gh); token ongeldig en GitHub bereikbaar -> wel opnieuw inloggen
+#  17. longrun.py: zonder --width kiest render.py de breedte (geen --width doorgegeven, time-lapse 2400); met
+#      --width precies die; oude toestand (versie 1, width 2000) -> automatisch, andere waarde blijft
+#  18. setup_wsl.sh (droog, in een kopie): gh uit GitHubs officiële repository (ook als Ubuntu een oud pakket heeft;
+#      onbereikbaar -> Ubuntu-pakket; oude gh bijwerken, nieuwe laten staan), tools/selftest.py PASS/FAIL in de
+#      samenvatting (zonder ffmpeg alleen video-fout -> waarschuwing), overgeslagen met --snel/--geen-tests
+# usage: bash cel/pc/tests/test_start.sh [outdir]      (default cel/pc/_test/start; ~5-15 minuten, 1-2 threads)
 set -u
 CEL=$(cd "$(dirname "$0")/../.." && pwd)
 PC=$CEL/pc
@@ -67,8 +79,9 @@ esac
 EOF
 cat > "$T/bin/curl" <<EOF
 #!/bin/bash
-# nep-curl: levert alleen de 'installer' van de nep-claude
+# nep-curl: levert alleen de 'installer' van de nep-claude (en 'GitHub bereikbaar' voor de nep-proef-URL)
 for a in "\$@"; do
+  case "\$a" in *nep-github-bereikbaar*) exit 0 ;; esac      # start.sh: "is GitHub bereikbaar?"
   case "\$a" in *install.sh)
     echo "\$(date +%T) installer" >> "\$HOME/fake_install.log"
     echo 'mkdir -p "\$HOME/.local/bin" && cp "$T/bin/claude_fake" "\$HOME/.local/bin/claude" && chmod +x "\$HOME/.local/bin/claude" && echo "Claude Code (NEP) installed to ~/.local/bin/claude"'
@@ -98,7 +111,77 @@ case "$*" in
 esac
 EOF
 printf '#!/bin/bash\n# nep-GPU-engine: de CPU-engine\nexec %s "$@"\n' "$CEL/engine/oercel" > "$T/bin/gpu_ok"
-chmod +x "$T/bin/"* "$T/gpubin/"*
+# nep-gh (GitHub CLI): inloggen met een 'code', setup-git schrijft de credential-helper in ~/.gitconfig, api user.
+# Zoals de echte gh (cli/cli pkg/cmd/auth/shared/login_flow.go): in een terminal met --git-protocol https vraagt hij
+# EERST "Authenticate Git with your GitHub credentials? (Y/n)" (niet als gh al de helper is), dan pas de code.
+# FAKE_GH_OLD=1: zoals gh 2.4.0 (Ubuntu 22.04): geen --git-protocol, met --web geen vragen, browser alleen via
+#   BROWSER (niet GH_BROWSER), geen 'auth token', token in ~/.config/gh/hosts.yml
+# FAKE_GH_RESULT=fout: inloggen mislukt.  FAKE_GH_OFFLINE=1: GitHub onbereikbaar (status/api falen, token blijft)
+mkdir -p "$T/ghbin"
+cat > "$T/ghbin/gh" <<'EOF2'
+#!/bin/bash
+d=$HOME/.nep_gh; mkdir -p "$d"
+echo "$(date +%T) $*" >> "$HOME/fake_gh.log"
+old=${FAKE_GH_OLD:-0}
+case "$1 ${2:-}" in
+  "--version ") [ "$old" = 1 ] && echo "gh version 2.4.0+dfsg1 (2022-03-23 Ubuntu 2.4.0+dfsg1-2)" || echo "gh version 9.9.9 (NEP)" ;;
+  "auth status")
+    if [ -s "$d/token" ] && [ "${FAKE_GH_OFFLINE:-0}" = 1 ]; then
+      echo "github.com"; echo "  X Timeout trying to log in to github.com account nepuser (nep)" >&2; exit 1; fi
+    if [ -s "$d/token" ]; then echo "github.com"; echo "  ✓ Logged in to github.com account nepuser (nep)"; exit 0; fi
+    echo "You are not logged into any GitHub hosts. To log in, run: gh auth login" >&2; exit 1 ;;
+  "auth token")
+    [ "$old" = 1 ] && { echo 'unknown command "token" for "gh auth"' >&2; exit 1; }
+    [ -s "$d/token" ] && { cat "$d/token"; exit 0; }
+    echo "no oauth token found for github.com" >&2; exit 1 ;;
+  "auth login")
+    if [ "${3:-}" = --help ]; then
+      echo "FLAGS"; echo "  -h, --hostname string   The hostname of the GitHub instance to authenticate with"
+      [ "$old" = 1 ] || echo "  -p, --git-protocol string   The protocol to use for git operations on this host: {ssh|https}"
+      echo "  -w, --web   Open a browser to authenticate"; exit 0
+    fi
+    for a in "$@"; do [ "$a" = --git-protocol ] && [ "$old" = 1 ] && { echo "unknown flag: --git-protocol" >&2; exit 1; }; done
+    setup=0
+    if [ "$old" != 1 ] && [ -t 0 ] && case " $* " in *" --git-protocol https "*) true ;; *) false ;; esac &&
+       ! git config --global --get-all credential.https://github.com.helper 2>/dev/null | grep -q 'auth git-credential'; then
+      printf '? Authenticate Git with your GitHub credentials? (Y/n) '
+      read -r ans || exit 1
+      case "$ans" in ""|y|Y|yes) setup=1 ;; esac
+    fi
+    echo "! First copy your one-time code: NEP1-2345"
+    printf 'Press Enter to open https://github.com/login/device in your browser... '
+    read -r _ || exit 1
+    if [ "$old" = 1 ]; then br=${BROWSER:-}; else br=${GH_BROWSER:-${BROWSER:-}}; fi
+    if [ -n "$br" ]; then $br https://github.com/login/device || echo "! Failed opening a web browser"; fi
+    [ "${FAKE_GH_RESULT:-ok}" = ok ] || { echo "error: authentication failed (nep)" >&2; exit 1; }
+    echo "nep-token-GEHEIM-0123" > "$d/token"
+    if [ "$old" = 1 ]; then mkdir -p "$HOME/.config/gh"; printf 'github.com:\n    oauth_token: nep-token-GEHEIM-0123\n    user: nepuser\n' > "$HOME/.config/gh/hosts.yml"; fi
+    case " $* " in *" --git-protocol https "*) echo https > "$d/git_protocol" ;; esac
+    if [ "$setup" = 1 ]; then
+      git config --global --replace-all credential.https://github.com.helper ''
+      git config --global --add credential.https://github.com.helper "!$0 auth git-credential"
+    fi
+    echo "✓ Authentication complete."; echo "✓ Logged in as nepuser" ;;
+  "auth setup-git")
+    git config --global --replace-all credential.https://github.com.helper ''
+    git config --global --add credential.https://github.com.helper "!$0 auth git-credential" ;;
+  "config get") [ "$*" = "config get -h github.com git_protocol" ] && cat "$d/git_protocol" 2>/dev/null ;;
+  "config set") [ "$*" = "config set -h github.com git_protocol https" ] && echo https > "$d/git_protocol" ;;
+  "api user")
+    [ -s "$d/token" ] || { echo "gh: Requires authentication (HTTP 401)" >&2; exit 1; }
+    [ "${FAKE_GH_OFFLINE:-0}" = 1 ] && { echo "error connecting to api.github.com (nep)" >&2; exit 1; }
+    if [ "${3:-}" = --jq ]; then echo nepuser
+    else echo '{"login":"nepuser","id":12345,"name":"Nep  Gebruiker","email":null,"type":"User"}'; fi ;;
+  *) echo "nep-gh: onbekend: $*" >&2; exit 2 ;;
+esac
+EOF2
+# nep-explorer.exe (WSL: opent een URL in de Windows-browser; de echte geeft altijd code 1)
+printf '#!/bin/bash\necho "$*" >> "$HOME/fake_explorer.log"\nexit 1\n' > "$T/bin/explorer.exe"
+chmod +x "$T/bin/"* "$T/gpubin/"* "$T/ghbin/"*
+# git-repo voor de GitHub-stap (start.sh mag de echte repo niet aanpassen): remote op github.com, geen identiteit
+newrepo() { rm -rf "$1"; git init -q "$1" && git -C "$1" remote add origin "${2:-https://github.com/Nicky-ykciN/welcome-youtube}"; }
+newrepo "$T/gitrepo"
+REAL_GITCFG=$(cksum < "$CEL/../.git/config" 2>/dev/null)
 
 cat > "$T/pty_drive.py" <<'EOF'
 # drives a command in a pseudo-terminal: waits for each text and then types the answer
@@ -144,7 +227,10 @@ export OERCEL_SETUP_LOGDIR=$T/setup_logs OERCEL_START_STATE=$T/state OERCEL_SETU
 export OERCEL_TMUX_SOCKET=$SOCK OERCEL_TMUX_SESSION=oercel-claude OERCEL_TEST_NO_APT=1 OERCEL_RC_PEEK_S=3
 export OERCEL_ENGINE_GPU=$T/bin/gpu_ok OERCEL_GPU_SELFTEST_FILE=$T/gpu_selftest.json OERCEL_GPU_SMOKE_FILE=$T/gpu_smoke.json
 export OERCEL_ATTACH_WAIT=20 OERCEL_RC_RESTART_S=1
+export OERCEL_GH=$T/ghbin/gh OERCEL_TEST_GIT_REPO=$T/gitrepo GIT_CONFIG_NOSYSTEM=1 OERCEL_GITHUB_PROBE=https://nep-github-weg.invalid/
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_CONFIG_DIR TMUX TMUX_PANE
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_HOST GH_CONFIG_DIR GH_BROWSER BROWSER XDG_CONFIG_HOME
+unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL EMAIL
 touch "$HOME/.bashrc"
 cleanup() {
   tmux -L "$SOCK" kill-server 2>/dev/null
@@ -199,7 +285,7 @@ kill_run() {   # kill -9 supervisor + engine of runs/$1 (power cut)
 
 # ------------------------------------------------------------------------------ 1. first start
 echo "== 1. eerste start in een terminal =="
-PTY_LOG=$T/s1.pty PTY_TIMEOUT=300 PTY_STEPS='[["Paste code here", "NEPCODE\r"], ["naar Claude te gaan", "\r"], ["(y/n)", "y\r"], ["session_fake", "\u0002\u0001d"]]' \
+PTY_LOG=$T/s1.pty PTY_TIMEOUT=300 PTY_STEPS='[["Paste code here", "NEPCODE\r"], ["Authenticate Git with your GitHub credentials? (Y/n)", "\r"], ["Press Enter to open", "\r"], ["naar Claude te gaan", "\r"], ["(y/n)", "y\r"], ["session_fake", "\u0002\u0001d"]]' \
   python3 "$T/pty_drive.py" bash "$PC/start.sh" > "$T/s1.json"
 python3 - "$T/s1.pty" > "$T/s1.txt" <<'EOF'
 import re, sys
@@ -224,6 +310,25 @@ check "Remote Control in tmux, met --name 'Oercel werkstation' en zonder --conti
 check "tmux-sessie oercel-claude bestaat en Claude draait erin" test "$(nrc)" = 1
 check "uitleg Ctrl+b d getoond, en samenvatting na het terugkomen" grep -q "Ctrl+b indrukken, loslaten, dan d" "$T/s1.txt"
 grep -q "Terug uit het Claude-venster" "$T/s1.txt" && grep -q "== Samenvatting ==" "$T/s1.txt" && pass "teruggekeerd uit tmux, samenvatting" || fail "geen samenvatting na detach"
+ngl() { grep -c "auth login --hostname" "$HOME/fake_gh.log" 2>/dev/null || echo 0; }
+check "GitHub: na de Claude-login en vóór het Claude-venster, met uitleg (code, Authorize, Ctrl+C)" python3 -c "
+t=open('$T/s1.txt').read(); a=t.find('Login successful'); b=t.find('één keer inloggen bij GitHub'); c=t.find('naar Claude te gaan')
+assert 0 <= a < b < c, (a, b, c); assert 'github.com/login/device' in t and 'Authorize' in t and 'Ctrl+C' in t"
+check "  ... gh auth login --hostname github.com --git-protocol https --web, precies 1x" \
+  bash -c "test \"\$(grep -c 'auth login --hostname github.com --git-protocol https --web$' '$HOME/fake_gh.log')\" = 1"
+check "  ... Windows-browser geopend met github.com/login/device (via explorer.exe)" grep -qx "https://github.com/login/device" "$HOME/fake_explorer.log"
+check "  ... eerst gh's vraag 'Authenticate Git ...?', dan de code (echte volgorde); Enter = ja" python3 -c "
+t=open('$T/s1.txt').read(); a=t.find('Authenticate Git with your GitHub'); b=t.find('one-time code: NEP1-2345')
+assert 0 <= a < b, (a, b)"
+check "  ... git vraagt gh om de inlog voor github.com (~/.gitconfig; door gh na 'ja')" \
+  bash -c "git config --global --get-all credential.https://github.com.helper | grep -q 'auth git-credential'"
+check "  ... start.sh deed daarna geen tweede gh auth setup-git (helper herkend)" test "$(grep -c 'auth setup-git' "$HOME/fake_gh.log")" = 0
+check "  ... git-identiteit uit gh api user, alleen in deze repo (noreply-adres)" bash -c "
+  test \"\$(git -C '$T/gitrepo' config --local user.name)\" = 'Nep Gebruiker' &&
+  test \"\$(git -C '$T/gitrepo' config --local user.email)\" = '12345+nepuser@users.noreply.github.com' &&
+  ! git config --global user.name >/dev/null"
+check "  ... samenvatting: ingelogd bij GitHub" grep -q "GitHub .*ingelogd als nepuser" "$T/s1.txt"
+check "  ... geen token in de repo (ook niet in .git)" bash -c "! grep -rq 'nep-token-GEHEIM' '$T/gitrepo'"
 
 # ------------------------------------------------------------------------------ 2. again
 echo "== 2. meteen nog eens (zonder terminal) =="
@@ -235,6 +340,9 @@ grep -qE "groot \(lange run\): (draait al|klaar)" "$T/s2.txt" && pass "groot: $(
 grep -qE "scan \(sweep\): (draait al|klaar)" "$T/s2.txt" && pass "scan overgeslagen" || fail "scan niet overgeslagen"
 check "Claude: 'draait al', geen tweede gestart" grep -q "draait al in tmux-sessie" "$T/s2.txt"
 check "nog steeds precies één Claude" test "$(nrc)" = 1
+check "GitHub: geen tweede login, setup-git niet opnieuw" bash -c "test \"\$(grep -c 'auth login --hostname' '$HOME/fake_gh.log')\" = 1 &&
+  test \"\$(grep -c 'auth setup-git' '$HOME/fake_gh.log')\" = 0"
+check "  ... meldt: ingelogd bij GitHub als nepuser" grep -q "ingelogd bij GitHub als nepuser" "$T/s2.txt"
 
 # ------------------------------------------------------------------------------ 3. power cut
 echo "== 3. kill -9 van alles (stroomstoring) -> start.sh hervat =="
@@ -433,6 +541,210 @@ check "draait al + open vraag -> opnieuw naar Claude geschakeld, beantwoord, ter
 check "  ... 'Claude wacht daar nog op een antwoord' gemeld" grep -q "Claude wacht daar nog op een antwoord" "$T/s15c.pty"
 check "  ... geen valse waarschuwing na het beantwoorden" bash -c "! grep -q 'Claude wacht nog op een antwoord' '$T/s15c.pty'"
 check "  ... nog steeds precies één Claude" test "$(nrc)" = 1
+
+# ------------------------------------------------------------------------------ 16. GitHub
+echo "== 16. GitHub-login: overslaan, mislukken, oude gh, identiteit, andere remote, geen gh =="
+ngh() { wc -l < "$HOME/fake_gh.log"; }
+gh_logout() { rm -f "$HOME/.nep_gh/token" "$HOME/.config/gh/hosts.yml"; }
+gh_logout
+n0=$(ngl); S --geen-setup > "$T/s16a.txt"
+check "niet ingelogd, geen terminal: geen loginpoging" test "$(ngl)" = "$n0"
+check "  ... één regel: pushen kan pas na gh auth login" grep -q "pushen naar GitHub kan nog niet: typ later in Ubuntu  gh auth login" "$T/s16a.txt"
+check "  ... in de samenvatting" grep -q "GitHub .*niet ingelogd: pushen kan pas na  gh auth login" "$T/s16a.txt"
+PTY_LOG=$T/s16b.pty PTY_TIMEOUT=120 PTY_STEPS='[["Press Enter to open", "\u0003"]]' \
+  python3 "$T/pty_drive.py" bash "$PC/start.sh" --geen-setup > "$T/s16b.json"
+check "Ctrl+C tijdens de GitHub-login: start.sh gaat door tot het eind (code 0)" \
+  python3 -c "import json; d=json.load(open('$T/s16b.json')); assert d['rc']==0 and not d['missing'], d"
+check "  ... samenvatting + regel 'pushen kan nog niet'" bash -c "grep -q '== Samenvatting ==' '$T/s16b.pty' && grep -q 'pushen naar GitHub kan nog niet' '$T/s16b.pty'"
+check "  ... niet ingelogd" test ! -s "$HOME/.nep_gh/token"
+check "  ... Claude draait nog (1x): Ctrl+C raakte alleen gh" test "$(nrc)" = 1
+PTY_LOG=$T/s16c.pty PTY_TIMEOUT=120 PTY_STEPS='[["Press Enter to open", "\r"]]' FAKE_GH_RESULT=fout \
+  python3 "$T/pty_drive.py" bash "$PC/start.sh" --geen-setup > "$T/s16c.json"
+check "login mislukt: start.sh gaat door (code 0) met de regel 'pushen kan nog niet'" bash -c "
+  python3 -c \"import json; d=json.load(open('$T/s16c.json')); assert d['rc']==0 and not d['missing'], d\" &&
+  grep -q 'pushen naar GitHub kan nog niet' '$T/s16c.pty'"
+git config --global --unset-all credential.https://github.com.helper; rm -f "$HOME/.nep_gh/git_protocol"
+nexp=$(wc -l < "$HOME/fake_explorer.log")
+PTY_LOG=$T/s16d.pty PTY_TIMEOUT=120 PTY_STEPS='[["Press Enter to open", "\r"]]' FAKE_GH_OLD=1 \
+  python3 "$T/pty_drive.py" bash "$PC/start.sh" --geen-setup > "$T/s16d.json"
+check "oude gh (leest alleen BROWSER, niet GH_BROWSER): Windows-browser toch geopend via explorer.exe" \
+  test "$(wc -l < "$HOME/fake_explorer.log")" = "$((nexp + 1))"
+check "oude gh (zoals 2.4.0, Ubuntu 22.04): login zonder --git-protocol" bash -c "
+  python3 -c \"import json; d=json.load(open('$T/s16d.json')); assert d['rc']==0 and not d['missing'], d\" &&
+  tail -n 12 '$HOME/fake_gh.log' | grep -q 'auth login --hostname github.com --web$' && test -s '$HOME/.nep_gh/token'"
+check "  ... daarna git_protocol https (gh config set) en setup-git opnieuw" bash -c "
+  grep -qx https '$HOME/.nep_gh/git_protocol' && git config --global --get-all credential.https://github.com.helper | grep -q 'auth git-credential'"
+check "  ... eigen (eerder gezette) identiteit van de repo blijft" test "$(git -C "$T/gitrepo" config user.name)" = "Nep Gebruiker"
+newrepo "$T/gitrepo2"; gh_logout
+OERCEL_TEST_GIT_REPO=$T/gitrepo2 S --geen-setup > "$T/s16e.txt"
+check "zonder GitHub-login: plaatsvervanger 'Oercel werkstation <oercel@localhost>' (lokaal), zodat commits werken" bash -c "
+  test \"\$(git -C '$T/gitrepo2' config --local user.name)\" = 'Oercel werkstation' &&
+  test \"\$(git -C '$T/gitrepo2' config --local user.email)\" = 'oercel@localhost' &&
+  git -C '$T/gitrepo2' commit -q --allow-empty -m test"
+echo "nep-token-GEHEIM-0123" > "$HOME/.nep_gh/token"
+OERCEL_TEST_GIT_REPO=$T/gitrepo2 S --geen-setup > "$T/s16f.txt"
+check "  ... later ingelogd: plaatsvervanger vervangen door het GitHub-account" bash -c "
+  test \"\$(git -C '$T/gitrepo2' config user.name)\" = 'Nep Gebruiker' &&
+  test \"\$(git -C '$T/gitrepo2' config user.email)\" = '12345+nepuser@users.noreply.github.com'"
+newrepo "$T/gitrepo3"; git -C "$T/gitrepo3" config user.name "Echte Naam"; git -C "$T/gitrepo3" config user.email "echt@voorbeeld.nl"
+OERCEL_TEST_GIT_REPO=$T/gitrepo3 S --geen-setup > "$T/s16g.txt"
+check "eigen identiteit van de gebruiker wordt nooit veranderd" bash -c "
+  test \"\$(git -C '$T/gitrepo3' config user.name)\" = 'Echte Naam' && test \"\$(git -C '$T/gitrepo3' config user.email)\" = 'echt@voorbeeld.nl'"
+newrepo "$T/gitrepo4" "$T/ergens/anders.git"; gh_logout
+n0=$(ngh); OERCEL_TEST_GIT_REPO=$T/gitrepo4 S --geen-setup > "$T/s16h.txt"
+check "remote is geen github.com: GitHub-login overgeslagen, gh niet aangeroepen" bash -c "
+  grep -q 'GitHub-login overgeslagen' '$T/s16h.txt' && test \"\$(wc -l < '$HOME/fake_gh.log')\" = '$n0'"
+check "  ... wel een identiteit voor commits" test "$(git -C "$T/gitrepo4" config user.name)" = "Oercel werkstation"
+OERCEL_GH=$T/geen/gh S --geen-setup > "$T/s16i.txt"
+check "gh ontbreekt: één regel (installeren, dan gh auth login), start.sh gaat door" bash -c "
+  grep -q 'pushen naar GitHub kan nog niet: gh ontbreekt' '$T/s16i.txt' && grep -q '== Samenvatting ==' '$T/s16i.txt'"
+n0=$(ngh); S --alleen-plan > "$T/s16j.txt"
+check "--alleen-plan (Claude) raakt GitHub niet aan" bash -c "test \"\$(wc -l < '$HOME/fake_gh.log')\" = '$n0' && ! grep -q 'GitHub' '$T/s16j.txt'"
+# ingelogd, maar GitHub nu onbereikbaar (bv. net na een herstart): 'gh auth status' faalt dan ook met een geldig token
+gh_logout; echo "nep-token-GEHEIM-0123" > "$HOME/.nep_gh/token"; n0=$(ngl)
+PTY_LOG=$T/s16k.pty PTY_TIMEOUT=120 PTY_STEPS='[]' FAKE_GH_OFFLINE=1 \
+  python3 "$T/pty_drive.py" bash "$PC/start.sh" --geen-setup > "$T/s16k.json"
+check "ingelogd maar GitHub onbereikbaar (in een terminal): geen nieuwe loginvraag, start.sh gaat door (code 0)" bash -c "
+  python3 -c \"import json; d=json.load(open('$T/s16k.json')); assert d['rc']==0, d\" && test \"\$(grep -c 'auth login --hostname' '$HOME/fake_gh.log')\" = '$n0' &&
+  grep -q 'GitHub is nu niet bereikbaar' '$T/s16k.pty' && grep -q 'GitHub .*eerder ingelogd; nu niet bereikbaar' '$T/s16k.pty' &&
+  ! grep -q 'inloggen bij GitHub' '$T/s16k.pty'"
+mkdir -p "$HOME/.config/gh"; printf 'github.com:\n    oauth_token: nep-token-GEHEIM-0123\n    user: nepuser\n' > "$HOME/.config/gh/hosts.yml"
+PTY_LOG=$T/s16l.pty PTY_TIMEOUT=120 PTY_STEPS='[]' FAKE_GH_OFFLINE=1 FAKE_GH_OLD=1 \
+  python3 "$T/pty_drive.py" bash "$PC/start.sh" --geen-setup > /dev/null
+check "  ... ook met oude gh zonder 'auth token' (token in ~/.config/gh/hosts.yml)" bash -c "
+  test \"\$(grep -c 'auth login --hostname' '$HOME/fake_gh.log')\" = '$n0' && grep -q 'GitHub is nu niet bereikbaar' '$T/s16l.pty'"
+PTY_LOG=$T/s16m.pty PTY_TIMEOUT=120 PTY_STEPS='[["Press Enter to open", "\u0003"]]' FAKE_GH_OFFLINE=1 OERCEL_GITHUB_PROBE=https://nep-github-bereikbaar.invalid/ \
+  python3 "$T/pty_drive.py" bash "$PC/start.sh" --geen-setup > "$T/s16m.json"
+check "token opgeslagen, status faalt, GitHub wel bereikbaar (token ongeldig): wel opnieuw inloggen" bash -c "
+  python3 -c \"import json; d=json.load(open('$T/s16m.json')); assert d['rc']==0 and not d['missing'], d\" &&
+  test \"\$(grep -c 'auth login --hostname' '$HOME/fake_gh.log')\" = '$((n0 + 1))'"
+check "geen token in de (test-)repo's of in de logs van start.sh" bash -c "! grep -rqs 'nep-token-GEHEIM' '$T'/gitrepo* '$T/state' '$T'/s1*.txt '$T'/s1*.pty"
+check "de echte repo is niet aangepast (.git/config)" test "$(cksum < "$CEL/../.git/config" 2>/dev/null)" = "$REAL_GITCFG"
+
+# ------------------------------------------------------------------------------ 17. image width
+echo "== 17. longrun.py: beeldbreedte automatisch, tenzij gezet =="
+python3 - "$PC" > "$T/s17a.txt" 2>&1 <<'EOF2'
+import os, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import longrun as L
+import pclib as P
+calls = []
+def fake_render_one(self, args, out, what):
+    calls.append(args)
+    return False
+L.Supervisor.render_one = fake_render_one
+P.interesting_track = lambda rd: (7, 1000)
+d = tempfile.mkdtemp()
+def args_for(width):
+    calls.clear()
+    st = dict(settings=dict(L.SETTINGS_DEFAULTS), beelden_dir=d, last_analysis_step=1000)
+    if width is not None:
+        st["settings"]["width"] = width
+    sup = L.Supervisor(os.path.join(d, "run"), st, open(os.devnull, "w"))
+    sup.save = lambda: None
+    sup.render(dict(divisions=1, divisions_confirmed=1, division_steps=[500]))
+    return {a[a.index("--kind") + 1]: a for a in calls}
+ok = True
+a = args_for(None)
+ok &= L.SETTINGS_DEFAULTS["width"] is None
+ok &= "--width" not in a["micro"] and "--width" not in a["goodsell"]
+ok &= a["timelapse"][a["timelapse"].index("--width") + 1] == "2400"
+b = args_for(3000)
+ok &= b["micro"][b["micro"].index("--width") + 1] == "3000" and b["goodsell"][b["goodsell"].index("--width") + 1] == "3000"
+ok &= b["timelapse"][b["timelapse"].index("--width") + 1] == "3000"
+c = args_for(1000)
+ok &= c["timelapse"][c["timelapse"].index("--width") + 1] == "2400" and c["micro"][c["micro"].index("--width") + 1] == "1000"
+print("auto:", a); print("3000:", b); print("1000:", c)
+print("OK" if ok else "FOUT")
+EOF2
+check "render-argumenten: auto = geen --width (time-lapse 2400); gezet = die breedte (time-lapse min. 2400)" grep -qx OK "$T/s17a.txt"
+pngw() { python3 -c "import struct,sys; print(struct.unpack('>I', open(sys.argv[1],'rb').read(24)[16:20])[0])" "$1"; }
+W17="init=soup L=24 snap_every=1000 stats_every=500 log_every=1000 ckpt_every=1000"
+L17="--threads 1 --chunk-min 0.05 --analyse-uur 0 --analyse-jobs 1 --poll 0.3 --backoff 0.2 --engine cpu"
+python3 "$PC/longrun.py" wauto --ini engine/params/membranes.ini --set $W17 steps=2000 $L17 > "$T/s17b.txt" 2>&1
+python3 "$PC/longrun.py" wvast --ini engine/params/membranes.ini --set $W17 steps=2000 $L17 --width 640 > "$T/s17c.txt" 2>&1
+check "zonder --width: opgeslagen als automatisch (None), toestand versie 2" \
+  python3 -c "import json; d=json.load(open('$T/runs/wauto/pc_longrun.json')); assert d['settings']['width'] is None and d['version']==2 and d['status']=='klaar', d['settings']"
+check "  ... render.py zonder --width aangeroepen, beeld 2000 px breed (render.py's keuze)" bash -c "
+  grep 'render.py' '$T/runs/wauto/pc_tools.log' | grep -q -- '--kind micro' && ! grep 'render.py' '$T/runs/wauto/pc_tools.log' | grep -q -- '--width' &&
+  test \"\$(ls '$T/beelden/wauto'/micro_*.png | wc -l)\" = 1 && test \"\$(python3 -c \"import struct,glob; print(struct.unpack('>I', open(glob.glob('$T/beelden/wauto/micro_*.png')[0],'rb').read(24)[16:20])[0])\")\" = 2000"
+check "met --width 640: opgeslagen, doorgegeven en het beeld is 640 px breed" bash -c "
+  python3 -c \"import json; d=json.load(open('$T/runs/wvast/pc_longrun.json')); assert d['settings']['width']==640\" &&
+  grep 'render.py' '$T/runs/wvast/pc_tools.log' | grep -q -- '--width 640' &&
+  test \"\$(python3 -c \"import struct,glob; print(struct.unpack('>I', open(glob.glob('$T/beelden/wvast/micro_*.png')[0],'rb').read(24)[16:20])[0])\")\" = 640"
+python3 - "$T/runs" <<'EOF2'
+import json, sys
+for name, w in (("wauto", 2000), ("wvast", 1500)):      # as the old longrun.py (version 1) stored it
+    p = f"{sys.argv[1]}/{name}/pc_longrun.json"; d = json.load(open(p))
+    d["version"] = 1; d["settings"]["width"] = w
+    json.dump(d, open(p, "w"))
+EOF2
+python3 "$PC/longrun.py" wauto --steps 3000 > "$T/s17d.txt" 2>&1
+python3 "$PC/longrun.py" wvast --steps 3000 > "$T/s17e.txt" 2>&1
+check "oude toestand (versie 1) met de oude standaard 2000: nu automatisch, zonder --width" bash -c "
+  python3 -c \"import json; d=json.load(open('$T/runs/wauto/pc_longrun.json')); assert d['settings']['width'] is None and d['version']==2 and d['steps']==3000 and d['status']=='klaar', d\" &&
+  test \"\$(grep 'render.py' '$T/runs/wauto/pc_tools.log' | grep -c -- '--kind micro')\" = 2 && ! grep 'render.py' '$T/runs/wauto/pc_tools.log' | grep -q -- '--width'"
+check "oude toestand met een gekozen breedte (1500): blijft 1500" bash -c "
+  python3 -c \"import json; d=json.load(open('$T/runs/wvast/pc_longrun.json')); assert d['settings']['width']==1500 and d['version']==2, d['settings']\" &&
+  grep 'render.py' '$T/runs/wvast/pc_tools.log' | tail -n1 | grep -q -- '--width 1500'"
+
+# ------------------------------------------------------------------------------ 18. setup_wsl.sh
+echo "== 18. setup_wsl.sh (droog, zonder root, in een kopie): gh en tools/selftest.py =="
+M=$T/mock; rm -rf "$M"; mkdir -p "$M/cel/pc" "$M/cel/notes/membranen"
+for f in setup_wsl.sh env.sh pclib.py status.py cuda_check.cu; do cp -p "$PC/$f" "$M/cel/pc/"; done
+cp -a "$CEL/engine" "$M/cel/engine"; cp -a "$CEL/tools" "$M/cel/tools"; rm -rf "$M/cel/tools/__pycache__"
+cp "$CEL/notes/membranen/teamA_membranes.ini" "$M/cel/notes/membranen/"
+printf '#!/bin/bash\n# nep-validate.sh (de echte duurt minuten; hier gaat het om tools/selftest.py)\necho "PASS  nep-validatie"\n' > "$M/cel/engine/tests/validate.sh"
+GHL_BEFORE=$(ls /etc/apt/sources.list.d/github-cli.list /etc/apt/keyrings/githubcli-archive-keyring.gpg 2>/dev/null)
+su18() { env -u OERCEL_RUNS -u OERCEL_BEELDEN OERCEL_TEST_NO_ROOT=1 OERCEL_TEST_NO_GH=1 bash "$M/cel/pc/setup_wsl.sh" --droog --geen-cuda "$@" 2>&1; }
+OERCEL_TEST_GH_CANDIDATE=2.45.0-1ubuntu0.3 su18 > "$T/s18a.txt"; rc18a=$?
+sed -n '/=== SAMENVATTING ===/,$p' "$T/s18a.txt"
+check "tools/selftest.py gedraaid: PASS in de samenvatting (code $rc18a)" bash -c "
+  grep -qE '^  OK +tools-zelftest +tools/selftest.py: PASS \([0-9]+ controles' '$T/s18a.txt' && grep -q '^    PASS' '$T/s18a.txt'"
+check "  ... werkmap opgeruimd, log bewaard" bash -c "test ! -e '$M/cel/runs/_setup/tools_selftest' && grep -q '^PASS' '$M/cel/runs/_setup/tools_selftest.log'"
+check "gh: GitHubs officiële repository eerst, ook als Ubuntu een (oud) pakket heeft (droog: alleen getoond)" bash -c "
+  grep -q 'github-cli.list: deb \[arch=[a-z0-9]* signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg\] https://cli.github.com/packages stable main' '$T/s18a.txt' &&
+  grep -q 'GitHub CLI .*droog: gh zou worden geïnstalleerd (GitHubs officiële repository)' '$T/s18a.txt' &&
+  ! grep -q 'install --no-install-recommends gh$' '$T/s18a.txt'"
+OERCEL_TEST_GH_CANDIDATE=none su18 --snel > "$T/s18b.txt"
+check "--snel: tools/selftest.py overgeslagen" grep -qE '^  OVERGESLAGEN +tools-zelftest' "$T/s18b.txt"
+check "gh zonder Ubuntu-pakket: GitHubs officiële repository (sleutel in /etc/apt/keyrings, signed-by, stable main)" bash -c "
+  grep -q 'cli.github.com/packages/githubcli-archive-keyring.gpg' '$T/s18b.txt' &&
+  grep -q 'github-cli.list: deb \[arch=[a-z0-9]* signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg\] https://cli.github.com/packages stable main' '$T/s18b.txt' &&
+  grep -q 'GitHub CLI .*officiële repository' '$T/s18b.txt'"
+check "  ... (droog) niets in /etc geschreven" test "$(ls /etc/apt/sources.list.d/github-cli.list /etc/apt/keyrings/githubcli-archive-keyring.gpg 2>/dev/null)" = "$GHL_BEFORE"
+su18 --geen-tests > "$T/s18c.txt"
+check "--geen-tests: tools/selftest.py overgeslagen" grep -qE '^  OVERGESLAGEN +tools-zelftest' "$T/s18c.txt"
+OERCEL_TEST_GH_CANDIDATE=2.45.0-1ubuntu0.3 OERCEL_TEST_GH_REPO_FAIL=1 su18 --geen-tests > "$T/s18e.txt"
+check "gh: GitHubs repository onbereikbaar -> terugval op Ubuntu's pakket" bash -c "
+  grep -q '\[droog\] .*apt-get .* install --no-install-recommends gh$' '$T/s18e.txt' &&
+  grep -q 'GitHub CLI .*droog: gh zou worden geïnstalleerd (Ubuntu-pakket 2.45.0-1ubuntu0.3, terugval)' '$T/s18e.txt'"
+OERCEL_TEST_GH_VERSION=2.45.0 su18 --geen-tests > "$T/s18f.txt"
+check "gh 2.45.0 al aanwezig (Ubuntu 24.04, volgens cli/cli kapot): bijwerken via GitHubs repository" bash -c "
+  grep -q 'gh 2.45.0 is oud' '$T/s18f.txt' && grep -q 'https://cli.github.com/packages stable main' '$T/s18f.txt'"
+OERCEL_TEST_GH_VERSION=2.89.0 su18 --geen-tests > "$T/s18g.txt"
+check "gh 2.89.0 al aanwezig: niets gedaan" bash -c "
+  grep -qE '^  OK +GitHub CLI +al aanwezig: gh 2.89.0' '$T/s18g.txt' && ! grep -q 'cli.github.com' '$T/s18g.txt'"
+cat > "$M/cel/tools/selftest.py" <<'EOF2'
+print("PASS  nep-controle 1")
+print("FAIL  nep-controle 2 (bewust)")
+raise SystemExit(1)
+EOF2
+su18 --geen-apt > "$T/s18d.txt"; rc18d=$?
+check "tools/selftest.py faalt: FOUT met FAIL en aantallen in de samenvatting, setup-code 1 ($rc18d)" bash -c "
+  grep -qE '^  FOUT +tools-zelftest +tools/selftest.py: FAIL \(1 van 2 controles' '$T/s18d.txt' && grep -q 'nep-controle 2' '$T/s18d.txt' && test $rc18d = 1"
+check "--geen-apt: gh niet geïnstalleerd -> waarschuwing (geen fout)" grep -qE '^  WAARSCHUWING +GitHub CLI +gh ontbreekt' "$T/s18d.txt"
+cat > "$M/cel/tools/selftest.py" <<'EOF2'
+print("PASS  nep-controle 1")
+print("FAIL  video.py maakt een geldige MP4")
+raise SystemExit(1)
+EOF2
+OERCEL_TEST_NO_FFMPEG=1 su18 --geen-apt > "$T/s18h.txt"; rc18h=$?
+check "zonder ffmpeg faalt alleen de video-controle: WAARSCHUWING (zoals ffmpeg zelf), geen FOUT (code $rc18h)" bash -c "
+  grep -qE '^  WAARSCHUWING +tools-zelftest +tools/selftest.py: PASS \(1 controles\), alleen video.py faalt: ffmpeg ontbreekt' '$T/s18h.txt' && test $rc18h = 0"
+su18 --geen-apt > "$T/s18i.txt"; rc18i=$?
+check "  ... met ffmpeg is diezelfde video-fout wél een FOUT (code $rc18i)" bash -c "grep -qE '^  FOUT +tools-zelftest' '$T/s18i.txt' && test $rc18i = 1"
+rm -rf "$M"
 
 echo "== $fails fout(en) =="
 exit $fails

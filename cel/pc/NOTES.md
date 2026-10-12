@@ -278,3 +278,83 @@ test dirs under cel/pc/_test/review2/. setup_wsl.sh NEVER for real here (root; s
   Not fixable in pc/ (for the main session): permission prompts in the app (user decision: allowlist in
   .claude/settings.json or --permission-mode), git push credentials on the workstation, merge the lifeB engine
   keys into engine/ + engine_gpu/ before production.ini uses them.
+
+## AFWERKING STARTKNOP (gh-login, beeldbreedte, tools-zelftest) — 2026-10-12
+Opdracht: (1) setup installeert gh (Ubuntu-apt, anders GitHubs officiële apt-repo); start.sh eenmalig
+`gh auth login --hostname github.com --git-protocol https --web` + `gh auth setup-git` (overslaan als ingelogd of
+remote geen github.com; mislukt/overgeslagen -> één regel), git user.name/email lokaal als die ontbreken (gh api user,
+anders 'Oercel werkstation <oercel@localhost>'); (2) longrun.py: --width alleen als expliciet gezet; (3) setup:
+tools/selftest.py in de tests (PASS/FAIL in de samenvatting); (4) STARTEN.md: GitHub-stap + zin over .claude/settings.json.
+Geen git commit/push. engine/, engine_gpu/, tools/, SPEC, CLAUDE.md, .claude/ NIET aanraken. setup_wsl.sh hier alleen
+--droog + OERCEL_TEST_NO_ROOT=1 (root-machine, zie Incident). Let op: deze repo heeft origin github.com en de omgeving
+heeft GH_TOKEN/GITHUB_TOKEN -> tests moeten een eigen nep-git-repo en nep-gh gebruiken (hooks), tokens unset.
+- [stap 0] gelezen: CLAUDE.md, STARTEN.md, README, NOTES, start.sh, setup_wsl.sh, longrun.py (render), tools/render.py
+  (breedte: standaard 2000, micro hele schaal L>1024 -> tot 4000), tools/selftest.py (exit = aantal FAIL), test_start.sh.
+- [stap 1] gh-onderzoek (bron cli/cli op GitHub): officiële Debian/Ubuntu-installatie = keyring
+  cli.github.com/packages/githubcli-archive-keyring.gpg -> /etc/apt/keyrings (chmod go+r), regel `deb [arch=..
+  signed-by=..] https://cli.github.com/packages stable main` in /etc/apt/sources.list.d/github-cli.list, apt update,
+  apt install gh. cli.github.com is hier GEBLOKKEERD (proxy 403) -> alleen droog getest. Ubuntu: 24.04 gh 2.45.0
+  (hier apt-cache), 22.04 gh 2.4.0, 20.04 geen pakket. gh 2.4.0 heeft `auth setup-git` maar GEEN `--git-protocol`
+  (en met --web is login daar niet-interactief) -> start.sh kijkt in `gh auth login --help` en zet anders
+  `gh config set -h github.com git_protocol https`. Nieuwe gh met --web vraagt nog "Authenticate Git with your
+  GitHub credentials? (Y/n)" (Enter = ja). Device-code verloopt na 15 min -> login meteen NA de Claude-login (dan
+  zit de gebruiker er), vóór het tmux-venster.
+- [stap 2] geschreven: longrun.py (width None = automatisch, VERSION 2 + migratie width 2000 -> None, time-lapse 2400
+  of max(2400, width)); setup_wsl.sh (2b gh, tools/selftest.py --dir runs/_setup/tools_selftest in de tests, FOUT bij
+  FAIL, overgeslagen met --snel/--geen-tests); start.sh (setup_github: gh_ok/gh_login met trap ':' INT zodat Ctrl+C
+  alleen gh stopt, GH_BROWSER-hulpscript _build/open_url.sh via explorer.exe in WSL, setup-git, git_identity;
+  hooks OERCEL_GH en OERCEL_TEST_GIT_REPO); STARTEN.md stap 8 (GitHub) + zin over .claude/settings.json; README.
+- [stap 3] verkorte testrun (secties 1, 2, 16-18): 1 FAIL = testfout (pgrep in `bash -c` telde zichzelf; Claude
+  draaide wel nog, gecontroleerd) -> check gesplitst. Secties 16 en 17 verder PASS.
+- [stap 4] volledige tests/test_start.sh (18 secties): 126 PASS, 0 FAIL, 261 s (pc/_test/start_full.log). Ook: bash -n
+  op alle .sh, py_compile op alle .py, setup_wsl.sh --test-functies 0 fouten. Tweede volledige run loopt
+  (pc/_test/start_full2.log): ook 126 PASS, 0 FAIL (322 s). Testdata gewist, logs bewaard. KLAAR.
+  NIET getest (kon hier niet): echte `gh auth login --web` in WSL2 (device-code, explorer.exe, de vraag
+  "Authenticate Git...?"), echte `gh auth setup-git` + `git push`, de echte apt-installatie van gh (Ubuntu-pakket
+  en GitHubs repository; cli.github.com geblokkeerd, alleen droog), gh 2.4.0 van 22.04 in het echt (alleen de
+  opties uit de broncode), setup_wsl.sh niet-droog met de selftest (alleen droog in een kopie; de selftest zelf
+  draaide echt: 18 PASS), render-breedte > 2000 bij L > 1024 via longrun (render.py-logica, niet hier getest).
+- Voor de hoofdsessie (buiten pc/): CLAUDE.md zou kunnen noemen dat pushen werkt na de GitHub-login van start.sh
+  (gh als credential-helper; mislukt een push, eerst `gh auth status`), en dat de git-identiteit lokaal in de repo
+  staat (GitHub-account, of 'Oercel werkstation <oercel@localhost>' zonder login).
+
+## REVIEW AFWERKING STARTKNOP (onafhankelijke review + fixes) — 2026-10-12
+Bronnen nagelezen (git-proxy, alleen-lezen): cli/cli trunk (docs/install_linux.md, pkg/cmd/auth/shared/login_flow.go,
+internal/authflow/flow.go, pkg/cmd/auth/status/status.go, factory/default.go) en tag v2.4.0 (login.go, login_flow.go,
+flow.go, setupgit.go, web_browser.go).
+Bevindingen en wat eraan gedaan is:
+- [groot, gefixt] setup_wsl.sh nam eerst Ubuntu's eigen pakket gh. install_linux.md noemt GitHubs apt-repository
+  "Recommended (Official)" en zet Ubuntu/Debian onder "Community (Unofficial)" met: "As of November 2025, GitHub CLI
+  maintainers strongly recommend official Debian packages especially as the community-distributed 2.45.x / 2.46.x
+  version is broken due to deprecated GitHub APIs" (24.04 = 2.45.0; 22.04 = 2.4.0). Nu: officiële repository eerst
+  (zelfde commando's), Ubuntu-pakket alleen als terugval; een aanwezige gh < 2.47 wordt via de repository bijgewerkt.
+  Ook: na `apt update` wordt gecontroleerd dat apt cli.github.com echt ziet (anders zou `apt install gh` stil het oude
+  Ubuntu-pakket nemen en de onbereikbare regel blijven staan) -> regel weg, terugval.
+- [groot, gefixt] gh 2.4.0 (flow.go) opent de browser met `os.Getenv("BROWSER")`, niet GH_BROWSER: het
+  explorer.exe-hulpscript werd daar genegeerd. Nu GH_BROWSER én BROWSER.
+- [middel, gefixt] Volgorde van de echte gh (trunk, met --git-protocol https in een terminal): EERST "Authenticate Git
+  with your GitHub credentials? (Y/n)" (credentialFlow.Prompt, overgeslagen als gh al de helper is), DAN pas de
+  code + "Press Enter to open https://github.com/login/device". STARTEN.md stap 8 zei code eerst, "daarna nog iets".
+  Tekst (STARTEN, uitleg in start.sh, README) aangepast; de nep-gh stelt de vraag nu in die volgorde (s1 beantwoordt
+  hem; zegt de gebruiker ja, dan zet gh zelf de helper en doet start.sh geen tweede setup-git — getest).
+  gh 2.4.0 met --web: Interactive=false -> geen vragen (klopt met NOTES hierboven).
+- [middel, gefixt] Opnieuw draaien terwijl GitHub onbereikbaar is: `gh auth status` geeft dan exit 1, ook met een
+  geldig token (status.go: timeout/fout -> SilentError). start.sh bood dan in een terminal opnieuw de hele login
+  aan. Nu: login opgeslagen (`gh auth token`, of bij oude gh `oauth_token` in hosts.yml) én https://api.github.com/
+  antwoordt niet (curl, elk HTTP-antwoord telt) -> "GitHub is nu niet bereikbaar", geen loginvraag, helper/protocol
+  wel nagelopen. Wel bereikbaar maar status faalt (token ingetrokken) -> opnieuw inloggen zoals eerst.
+- [klein, gefixt] `gh auth login --help | grep -q` onder `set -o pipefail` kan vals falen (SIGPIPE als grep vroeg
+  stopt) -> eerst in een variabele. Terminalinstellingen worden na gh hersteld (stty -g), ook na Ctrl+C in gh's
+  Y/n-vraag (ruwe modus). Hint bij ontbrekende gh wees naar `sudo apt-get install gh` (bestaat niet op 20.04,
+  geeft elders het kapotte pakket) -> nu `bash cel/pc/setup_wsl.sh --geen-tests`.
+- [klein, gefixt] Zonder ffmpeg (stap 3 = alleen WAARSCHUWING) faalt in tools/selftest.py alleen de video-controle;
+  dat maakte er een FOUT van (setup "mislukt", start.sh probeert hem tot 3x opnieuw). Nu WAARSCHUWING als alleen
+  video.py faalt en ffmpeg ontbreekt (hook OERCEL_TEST_NO_FFMPEG). video.py laat zonder ffmpeg geen tmp-bestand
+  achter (Popen faalt vóór het tmp-bestand), dus "geen tijdelijke bestanden" blijft PASS.
+- Nagekeken, in orde: gh-repositorycommando's == install_linux.md (keyring, chmod go+r, signed-by, "stable main");
+  Ctrl+C (trap ':' INT: bash wacht op gh en gaat door; s16b); idempotentie (GH_DONE, helper-check, geen 2e login);
+  geen token in repo/.git/uitvoer (token alleen naar /dev/null bij `gh auth token`); git-identiteit alleen lokaal en
+  nooit over een eigen (ook globale) identiteit heen; longrun.py-breedte (None -> geen --width; migratie v1).
+- Nieuwe testhooks: start.sh OERCEL_GITHUB_PROBE; setup_wsl.sh OERCEL_TEST_GH_VERSION, OERCEL_TEST_GH_REPO_FAIL,
+  OERCEL_TEST_NO_FFMPEG. Nieuwe controles in tests/test_start.sh (s1 vraagvolgorde, s16d BROWSER, s16k-m offline/
+  ongeldig token, token-lek-check, s18e-g gh-bron, s18h ffmpeg).

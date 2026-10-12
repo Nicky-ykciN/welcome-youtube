@@ -41,7 +41,7 @@ STATE = "pc_longrun.json"
 SUPLOG = "pc_supervisor.log"
 ENGOUT = "pc_engine.out"
 STOP_REQ = "pc_stop_verzoek"      # written by --stop: a deliberate stop (status.py --hervat leaves it alone)
-VERSION = 1
+VERSION = 2     # 2: settings.width None = automatic (render.py chooses); version 1 stored the old default 2000
 
 # engine messages that mean "this checkpoint file cannot be used" (engine/oercel.c read_ckpt, die())
 CKPT_ERR_RE = re.compile(r"checkpoint|ckpt", re.I)
@@ -49,7 +49,7 @@ CKPT_ERR_RE = re.compile(r"checkpoint|ckpt", re.I)
 # settings that may be changed on every (re)start; physics (ini + overrides) may not
 SETTINGS_DEFAULTS = dict(threads=None, chunk_min=60, analyse_uur=2.0, analyse_jobs=8, keep_recent=200,
                          max_stride=64, max_snap_gb=100.0, keep_ckpt=3, div_window=10, images_keep=4,
-                         width=2000, render=True, poll_s=5.0, max_failures=6, backoff_s=10.0, min_free_gb=10.0)
+                         width=None, render=True, poll_s=5.0, max_failures=6, backoff_s=10.0, min_free_gb=10.0)
 
 
 # ----------------------------------------------------------------------------- thinning
@@ -516,24 +516,29 @@ class Supervisor:
         self.sync_images()
         step = st["last_analysis_step"]
         imgs = st.setdefault("images", {})
-        w = str(self.cfg["width"])
+        # --width only when it was set for this run (longrun.py --width); otherwise render.py chooses: 2000 px,
+        # and a whole-dish micrograph of a big box (L > 1024) up to 4000 px so membranes stay visible
+        w = self.cfg.get("width")
+        wa = ["--width", str(int(w))] if w else []
         tag = f"{int(step):010d}"
         r = os.path.join(P.TOOLS, "render.py")
         f = os.path.join(out_dir, f"micro_{tag}.png")
-        if self.render_one([r, self.rundir, "--kind", "micro", "--step", str(step), "--width", w], f, "micro-beeld"):
+        if self.render_one([r, self.rundir, "--kind", "micro", "--step", str(step)] + wa, f, "micro-beeld"):
             imgs.setdefault("micro", []).append(f)
         it = P.interesting_track(self.rundir)
         if it is not None:
             tid, tstep = it
             f = os.path.join(out_dir, f"goodsell_{int(tstep):010d}_spoor{tid}.png")
-            if self.render_one([r, self.rundir, "--kind", "goodsell", "--cell", str(tid), "--step", str(tstep),
-                                "--width", w], f, "goodsell-beeld"):
+            if self.render_one([r, self.rundir, "--kind", "goodsell", "--cell", str(tid), "--step", str(tstep)] + wa,
+                               f, "goodsell-beeld"):
                 imgs.setdefault("goodsell", []).append(f)
         if summ.get("divisions", 0) > 0:
             sig = f"{summ['divisions']}:{summ['divisions_confirmed']}:{summ.get('division_steps')}"
             if sig != st.get("timelapse_sig"):
                 f = os.path.join(out_dir, f"timelapse_{tag}.png")
-                if self.render_one([r, self.rundir, "--kind", "timelapse", "--width", str(max(2400, int(w)))], f, "time-lapse"):
+                # time-lapse: 5 panels zoomed on one cell (independent of the box size), at least 480 px each
+                tw = max(2400, int(w)) if w else 2400
+                if self.render_one([r, self.rundir, "--kind", "timelapse", "--width", str(tw)], f, "time-lapse"):
                     imgs.setdefault("timelapse", []).append(f)
                     st["timelapse_sig"] = sig
         self.sync_images()
@@ -730,7 +735,9 @@ def main():
     ap.add_argument("--keep-ckpt", type=int, default=None, help="aantal checkpoint-kopieën (3)")
     ap.add_argument("--div-window", type=int, default=None, help="snapshots rond een deling altijd houden (10 ervoor en erna)")
     ap.add_argument("--images-keep", type=int, default=None, help="beelden per soort bewaren in beelden/NAAM (4)")
-    ap.add_argument("--width", type=int, default=None, help="beeldbreedte in pixels (2000)")
+    ap.add_argument("--width", type=int, default=None,
+                    help="beeldbreedte in pixels (standaard automatisch: render.py kiest 2000, voor de hele schaal van een "
+                         "grote doos tot 4000; time-lapse 2400)")
     ap.add_argument("--geen-beelden", action="store_true", help="geen beelden maken (alleen analyse)")
     ap.add_argument("--min-vrij-gb", type=float, default=None, help="engine pauzeren als er minder vrij is (10 GB)")
     ap.add_argument("--runs-dir", default=None)
@@ -872,6 +879,11 @@ def main():
         if a.beelden_dir:
             st["beelden_dir"] = P.beelden_dir(a.beelden_dir)
     s = st["settings"]
+    if int(st.get("version", 1)) < 2:
+        # version 1 always stored width=2000 (the old default, also when nobody chose it): from now on automatic
+        if s.get("width") == 2000:
+            s["width"] = None
+        st["version"] = VERSION
     for k, v in (("threads", a.threads), ("chunk_min", a.chunk_min), ("analyse_uur", a.analyse_uur),
                  ("analyse_jobs", a.analyse_jobs), ("keep_recent", a.keep_recent), ("max_stride", a.max_stride),
                  ("max_snap_gb", a.max_snap_gb), ("keep_ckpt", a.keep_ckpt), ("div_window", a.div_window),

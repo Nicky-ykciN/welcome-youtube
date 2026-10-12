@@ -7,13 +7,14 @@
 # Wat het doet (elke stap wordt overgeslagen als hij al gedaan is):
 #   1. controleert dat het in WSL2 draait (waarschuwt als de repo onder /mnt/c staat: traag)
 #   2. apt: bouwgereedschap, python3 + numpy/scipy/matplotlib/pandas/pillow, ffmpeg, lettertypen
-#      (lukt de systeem-Python niet, dan een venv in cel/pc/.venv)
+#      (lukt de systeem-Python niet, dan een venv in cel/pc/.venv), en de GitHub CLI 'gh' uit GitHubs officiële
+#      apt-repository (start.sh logt daarmee één keer in, zodat Claude resultaten naar GitHub kan pushen)
 #   3. CUDA: controleert nvidia-smi (de WINDOWS-driver levert de GPU), installeert dan ALLEEN de
 #      cuda-toolkit uit NVIDIA's officiële WSL-Ubuntu-repository, in een versie die de driver aankan.
 #      Nooit een Linux-NVIDIA-driver: die pakketten worden met een apt-pin geblokkeerd.
 #   4. bouwt engine/oercel (CPU) en engine_gpu/oercel_gpu (GPU, als die map er is)
-#   5. draait engine/tests/validate.sh, engine_gpu/selftest_gpu.sh (als die er is), een CUDA-test
-#      en een korte proefrun met analyse + beeld
+#   5. draait engine/tests/validate.sh, tools/selftest.py (analyse en beelden op synthetische data),
+#      engine_gpu/selftest_gpu.sh (als die er is), een CUDA-test en een korte proefrun met analyse + beeld
 #   6. drukt een samenvatting af; log in cel/runs/_setup/
 #
 # sudo: apt en CUDA hebben root nodig. Draai het script daarom één keer zelf in een terminal (het
@@ -40,7 +41,8 @@ gebruik: bash cel/pc/setup_wsl.sh [opties]
   --geen-apt          geen apt-pakketten installeren (alleen controleren)
   --geen-cuda         CUDA-toolkit overslaan (alleen CPU-engine)
   --cuda-versie X-Y   deze toolkit-versie installeren (bijv. 12-6) i.p.v. automatisch kiezen
-  --snel              validate.sh (~1-2 min) overslaan en GPU-zelftest met --quick; wel bouwen + proefrun
+  --snel              validate.sh (~1-2 min) en tools/selftest.py (~1-2 min) overslaan, GPU-zelftest met
+                      --quick; wel bouwen + proefrun
   --geen-tests        geen tests en geen proefrun
   --droog             niets met root uitvoeren of downloaden: alleen tonen wat er zou gebeuren
   --test-functies     interne zelftest van de versiekeuze/parsers (voor ontwikkelaars)
@@ -294,6 +296,94 @@ else
   fi
 fi
 
+# ------------------------------------------------------------------------------------- 2b. GitHub CLI
+# The repository is cloned anonymously (https), so git cannot push.  start.sh logs in once with
+# 'gh auth login' and makes git use gh for github.com ('gh auth setup-git'); the token stays in ~/.config/gh.
+# Source: GitHub's official apt repository, exactly as "Recommended (Official)" in
+# https://github.com/cli/cli/blob/trunk/docs/install_linux.md (keyring in /etc/apt/keyrings, list in
+# /etc/apt/sources.list.d/github-cli.list).  Ubuntu's own package 'gh' is only the fallback when that repository
+# cannot be used: it is old (22.04: 2.4.0, 24.04: 2.45.0, 20.04: none), and the same document says (since Nov 2025)
+# that the community 2.45.x/2.46.x packages are broken by deprecated GitHub APIs.  Logging in and pushing work
+# with them, so an old gh that cannot be upgraded is only a warning.
+hdr "2b. GitHub CLI (gh)"
+GH_PKGS=https://cli.github.com/packages
+GH_KEYRING=/etc/apt/keyrings/githubcli-archive-keyring.gpg
+GH_LIST=/etc/apt/sources.list.d/github-cli.list
+GH_MIN=2.47        # older: Ubuntu's/Debian's community package -> upgrade through GitHub's repository
+have_gh() { [ -n "${OERCEL_TEST_GH_VERSION:-}" ] || { [ "${OERCEL_TEST_NO_GH:-0}" != 1 ] && have gh; }; }   # test hooks
+gh_ver() {
+  if [ -n "${OERCEL_TEST_GH_VERSION:-}" ]; then echo "$OERCEL_TEST_GH_VERSION"; return; fi
+  gh --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1
+}
+gh_candidate() {     # version apt would install, empty when none
+  local c
+  if [ -n "${OERCEL_TEST_GH_CANDIDATE:-}" ]; then c=$OERCEL_TEST_GH_CANDIDATE     # test hook ("none" = no package)
+  else c=$(apt-cache policy gh 2>/dev/null | awk '/Candidate:/ {print $2; exit}'); fi
+  case "$c" in ""|"(none)"|none) return 0 ;; *) printf '%s' "$c" ;; esac
+}
+gh_official_repo() {
+  local arch tmp
+  arch=$(dpkg --print-architecture 2>/dev/null || echo amd64)
+  info "GitHubs officiële apt-repository: $GH_PKGS (sleutel: $GH_KEYRING)"
+  if [ "${OERCEL_TEST_GH_REPO_FAIL:-0}" = 1 ]; then info "[test] GitHubs repository niet bereikbaar"; return 1; fi
+  if [ "$DRY" = 1 ]; then
+    echo "  [droog] wget -nv -O \$tmp $GH_PKGS/githubcli-archive-keyring.gpg && tee $GH_KEYRING && chmod go+r $GH_KEYRING" >&2
+    echo "  [droog] $GH_LIST: deb [arch=$arch signed-by=$GH_KEYRING] $GH_PKGS stable main" >&2
+    priv "${APT[@]}" update; priv "${APT[@]}" install gh
+    return
+  fi
+  if [ "$NO_ROOT" = 1 ]; then echo "  [geen root] zou GitHubs apt-repository toevoegen en gh installeren" >&2; return 99; fi
+  tmp=$(mktemp) || return 1
+  if ! { wget -nv -O "$tmp" "$GH_PKGS/githubcli-archive-keyring.gpg" || curl -fsSL -o "$tmp" "$GH_PKGS/githubcli-archive-keyring.gpg"; } \
+     || [ ! -s "$tmp" ]; then
+    rm -f "$tmp"; info "download van de sleutel mislukt ($GH_PKGS): internet/proxy?"; return 1
+  fi
+  priv mkdir -p -m 755 /etc/apt/keyrings && priv tee "$GH_KEYRING" < "$tmp" >/dev/null && priv chmod go+r "$GH_KEYRING" \
+    || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  priv mkdir -p -m 755 /etc/apt/sources.list.d && \
+    echo "deb [arch=$arch signed-by=$GH_KEYRING] $GH_PKGS stable main" | priv tee "$GH_LIST" >/dev/null || return 1
+  priv "${APT[@]}" update >/dev/null || info "apt-get update gaf een fout (zie log)"
+  # only when apt really sees GitHub's repository (else 'install gh' would quietly take Ubuntu's old package);
+  # never leave an unreachable repository behind: every later apt-get update would complain about it
+  if ! apt-cache policy gh 2>/dev/null | grep -q 'cli\.github\.com'; then
+    info "apt ziet GitHubs repository niet (cli.github.com niet bereikbaar?)"; priv rm -f "$GH_LIST"; return 1
+  fi
+  priv "${APT[@]}" install gh || { priv rm -f "$GH_LIST"; return 1; }
+}
+GH_NOW=""; have_gh && GH_NOW=$(gh_ver)
+if [ -n "$GH_NOW" ] && ver_le "$GH_MIN" "$GH_NOW"; then
+  res OK "GitHub CLI" "al aanwezig: gh $GH_NOW"
+elif [ "$DO_APT" = 0 ]; then
+  if have_gh; then res WAARSCHUWING "GitHub CLI" "gh ${GH_NOW:-?} is oud (niet bijgewerkt door --geen-apt); inloggen en pushen werken wel"
+  else res WAARSCHUWING "GitHub CLI" "gh ontbreekt (niet geïnstalleerd door --geen-apt); zonder gh kan Claude niet naar GitHub pushen"; fi
+else
+  [ -n "$GH_NOW" ] && info "gh $GH_NOW is oud (Ubuntu-pakket?): bijwerken via GitHubs officiële repository"
+  GH_HOW=""
+  if gh_official_repo; then
+    GH_HOW="GitHubs officiële repository"
+  elif ! have_gh; then
+    GHC=$(gh_candidate)
+    if [ -z "$GHC" ] && [ "$DRY" != 1 ] && [ "$NO_ROOT" != 1 ]; then
+      priv "${APT[@]}" update >/dev/null 2>&1; GHC=$(gh_candidate)      # package lists may be old
+    fi
+    if [ -n "$GHC" ]; then
+      info "terugval: Ubuntu's eigen pakket gh $GHC (oud, maar inloggen en pushen werken)"
+      priv "${APT[@]}" install --no-install-recommends gh && GH_HOW="Ubuntu-pakket $GHC, terugval"
+    else
+      info "Ubuntu ${UB_VER:-?} heeft geen pakket 'gh'"
+    fi
+  fi
+  if [ "$DRY" = 1 ]; then res OVERGESLAGEN "GitHub CLI" "droog: gh zou worden geïnstalleerd (${GH_HOW:-?})"
+  elif have_gh && [ -n "$GH_HOW" ]; then res OK "GitHub CLI" "geïnstalleerd ($GH_HOW): gh $(gh_ver)"
+  elif have_gh; then
+    res WAARSCHUWING "GitHub CLI" "gh $(gh_ver) is oud en bijwerken via GitHubs repository lukte niet (internet/root?); inloggen en pushen werken wel"
+  else
+    # not fatal: everything runs without it, only pushing to GitHub does not (start.sh says so)
+    res WAARSCHUWING "GitHub CLI" "gh niet geïnstalleerd (root/internet?); Claude kan dan niet naar GitHub pushen. Later: bash cel/pc/setup_wsl.sh --geen-tests"
+  fi
+fi
+
 # ------------------------------------------------------------------------------------- 3. python
 hdr "3. Python voor analyse en beelden"
 TOOLS_PY=""
@@ -346,7 +436,7 @@ fi
 if [ -n "$TOOLS_PY" ] && [ "$TOOLS_PY" = "$VENV/bin/python" ]; then
   venv_in_bashrc
 fi
-FFOK=0; have ffmpeg && FFOK=1
+FFOK=0; have ffmpeg && [ "${OERCEL_TEST_NO_FFMPEG:-0}" != 1 ] && FFOK=1     # test hook: pretend ffmpeg is missing
 [ $FFOK = 1 ] && res OK "ffmpeg" "$(ffmpeg -version 2>/dev/null | head -n1 | cut -d' ' -f1-3)" || res WAARSCHUWING "ffmpeg" "ontbreekt (alleen nodig voor MP4-video's)"
 
 # ------------------------------------------------------------------------------------- 4. CUDA
@@ -624,6 +714,31 @@ if [ "$DO_TESTS" = 1 ] && [ -x "$CEL/engine/oercel" ] && [ -n "$TOOLS_PY" ]; the
   rm -rf "$S"
   if as_owner python3 "$PC_DIR/status.py" --kort > /dev/null 2>&1; then res OK "pc-scripts" "pc/status.py werkt"
   else res FOUT "pc-scripts" "pc/status.py faalt"; fi
+fi
+# tools/selftest.py: analysis + all image kinds + video on SYNTHETIC data (never a simulation result), kill -9
+# robustness; ~1-2 minutes, 2 processes.  Exit code = number of failed checks.
+if [ "$DO_VALIDATE" = 1 ] && [ -n "$TOOLS_PY" ] && [ -f "$CEL/tools/selftest.py" ]; then
+  info "tools/selftest.py (analyse en beelden op synthetische testdata, 1-2 minuten) ..."
+  TS=$LOGDIR/tools_selftest
+  rm -rf "$TS"; mkdir_owner "$TS"
+  as_owner timeout 1800 "$TOOLS_PY" "$CEL/tools/selftest.py" --dir "$TS" > "$LOGDIR/tools_selftest.log" 2>&1
+  trc=$?
+  tp=$(grep -c '^PASS' "$LOGDIR/tools_selftest.log"); tf=$(grep -c '^FAIL' "$LOGDIR/tools_selftest.log")
+  grep -E '^(PASS|FAIL)' "$LOGDIR/tools_selftest.log" | sed 's/^/    /' | cut -c1-160
+  # without ffmpeg only the video check can fail; that is a warning, like the missing ffmpeg itself (step 3)
+  tfv=$tf; [ "$FFOK" = 0 ] && tfv=$(grep '^FAIL' "$LOGDIR/tools_selftest.log" | grep -vc 'video\.py')
+  if [ "$trc" = 0 ] && [ "$tf" = 0 ] && [ "$tp" -gt 0 ]; then
+    res OK "tools-zelftest" "tools/selftest.py: PASS ($tp controles, synthetische data)"
+  elif [ "$FFOK" = 0 ] && [ "$tfv" = 0 ] && [ "$trc" = "$tf" ] && [ "$tp" -gt 0 ]; then
+    res WAARSCHUWING "tools-zelftest" "tools/selftest.py: PASS ($tp controles), alleen video.py faalt: ffmpeg ontbreekt"
+  else
+    res FOUT "tools-zelftest" "tools/selftest.py: FAIL ($tf van $((tp + tf)) controles, code $trc; log: $LOGDIR/tools_selftest.log): $(grep -m2 '^FAIL' "$LOGDIR/tools_selftest.log" | cut -c7-90 | tr '\n' ' ')"
+  fi
+  rm -rf "$TS"
+elif [ "$DO_VALIDATE" != 1 ]; then
+  res OVERGESLAGEN "tools-zelftest" "tools/selftest.py niet gedraaid (--snel/--geen-tests)"
+else
+  res OVERGESLAGEN "tools-zelftest" "tools/selftest.py niet gedraaid (geen werkende Python, zie boven)"
 fi
 if [ "$DO_VALIDATE" = 1 ] && [ -x "$CEL/engine/oercel" ] && [ -n "$TOOLS_PY" ]; then
   info "engine/tests/validate.sh (1-3 minuten) ..."

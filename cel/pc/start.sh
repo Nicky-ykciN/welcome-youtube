@@ -10,9 +10,11 @@
 #   4. korte status
 #   5. Claude Remote Control in tmux-sessie 'oercel-claude' (eerst inloggen als dat nog niet gedaan is);
 #      daarna staat de sessie 'Oercel werkstation' in de Claude-app onder Code
+#   6. één keer inloggen bij GitHub (gh auth login; meteen na het inloggen bij Claude), zodat Claude resultaten
+#      kan pushen; git krijgt een naam en e-mail voor commits (alleen in deze repo) als die nog ontbreken
 # Opties:
 #   --geen-setup     installatie overslaan        --setup          installatie opnieuw, ook als hij al gelukt is
-#   --geen-claude    stap 2 en 5 overslaan        --alleen-plan    alleen stap 3 en 4 (handig voor Claude)
+#   --geen-claude    stap 2, 5 en 6 overslaan     --alleen-plan    alleen stap 3 en 4 (handig voor Claude)
 # Stoppen: bash cel/pc/stop.sh (experimenten; Claude blijft draaien)  ·  bash cel/pc/stop.sh --alles
 set -u -o pipefail
 
@@ -24,6 +26,8 @@ SETUP_LOGDIR=${OERCEL_SETUP_LOGDIR:-$CEL/runs/_setup}
 STATE=${OERCEL_START_STATE:-$PC_DIR/_build}
 SES=${OERCEL_TMUX_SESSION:-oercel-claude}
 CLAUDE_URL=${OERCEL_CLAUDE_INSTALL_URL:-https://claude.ai/install.sh}
+GH=${OERCEL_GH:-gh}                          # GitHub CLI
+GITREPO=${OERCEL_TEST_GIT_REPO:-$REPO}       # the git repository whose identity/remote start.sh looks at
 RC_NAME=${OERCEL_CLAUDE_NAME:-Oercel werkstation}
 TMUXC=(tmux)
 [ -n "${OERCEL_TMUX_SOCKET:-}" ] && TMUXC=(tmux -L "$OERCEL_TMUX_SOCKET")
@@ -142,7 +146,7 @@ run_setup() {
   if [ "$1" = nooit ]; then
     say "Eerste keer: dit duurt 20-50 minuten (CUDA-toolkit van enkele GB downloaden, engines bouwen, tests)."
     say "sudo vraagt zo één keer je Linux-wachtwoord (je ziet niets als je typt; daarna Enter)."
-    say "Daarna mag je weglopen; aan het eind vraag ik je nog om bij Claude in te loggen."
+    say "Daarna mag je weglopen; aan het eind vraag ik je nog om in te loggen bij Claude en bij GitHub."
   elif [ "$1" = ok ]; then
     say "Installatie opnieuw (--setup); wat al klaar is gaat snel."
   else
@@ -374,6 +378,8 @@ start_rc() {
       tm kill-session -t "=$SES" 2>/dev/null ;;
   esac
   login_claude || let_op "zonder inloggen start Remote Control niet; in het tmux-venster zie je de melding"
+  setup_github      # the user is at the keyboard now (the Claude login needed them): GitHub too, before tmux
+  kop "Claude Remote Control (vervolg)"
   if ! have tmux; then apt_install tmux || true; fi
   if ! have tmux; then
     fout "tmux ontbreekt en kon niet geïnstalleerd worden."
@@ -414,6 +420,151 @@ start_rc() {
   if [ "$first" = 0 ] || interactive; then : > "$STATE/claude_rc_eerder_gestart"; fi
 }
 
+# ------------------------------------------------------------------------------------ 6. GitHub
+# The clone is anonymous (https): without credentials Claude cannot push its results.  Once: 'gh auth login'
+# with a one-time code in the browser, then 'gh auth setup-git' (git asks gh for the token of github.com).
+# The token stays in gh's own configuration (~/.config/gh or the system keyring), never in the repository.
+GH_DONE=0
+GIT_PH_NAME="Oercel werkstation"; GIT_PH_MAIL="oercel@localhost"     # placeholder identity without a GitHub login
+GH_PROBE=${OERCEL_GITHUB_PROBE:-https://api.github.com/}            # test hook: "is GitHub reachable?"
+# 'gh auth status' checks the token online: it also fails (exit 1) when GitHub cannot be reached, with a valid token
+gh_ok() { have "$GH" && "$GH" auth status --hostname github.com >/dev/null 2>&1 9>&-; }
+gh_token_stored() {    # is a GitHub login stored on this pc?  (offline; the token itself is never shown or kept)
+  "$GH" auth token --hostname github.com >/dev/null 2>&1 9>&- && return 0
+  # gh older than 2.17 (Ubuntu 22.04: 2.4.0) has no 'auth token'; it keeps the token in hosts.yml
+  grep -qs 'oauth_token:' "${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}/hosts.yml"
+}
+github_reachable() { ! have curl || curl -s -m 15 -o /dev/null "$GH_PROBE" 9>&-; }    # any HTTP answer counts
+gh_git_helper() {    # does git already ask gh for github.com credentials?
+  git config --global --get-regexp '^credential\..*github\.com.*\.helper$' 2>/dev/null | grep -q 'auth git-credential'
+}
+# in WSL a Linux program cannot open the Windows browser by itself (unless wslu's wslview is installed):
+# for gh, a small opener that hands the URL to Windows; it always succeeds, because explorer.exe returns 1
+gh_browser() {
+  local exp
+  [ -n "${GH_BROWSER:-}${BROWSER:-}" ] && return 1
+  exp=$(command -v explorer.exe 2>/dev/null || true)
+  [ -z "$exp" ] && [ -x /mnt/c/Windows/explorer.exe ] && exp=/mnt/c/Windows/explorer.exe
+  [ -z "$exp" ] && return 1
+  { echo '#!/bin/sh'
+    echo '# Oercel (cel/pc/start.sh): opens a URL in the Windows browser (for gh auth login in WSL)'
+    echo 'command -v wslview >/dev/null 2>&1 && wslview "$1" >/dev/null 2>&1 && exit 0'
+    printf '%q "$1" >/dev/null 2>&1\n' "$exp"
+    echo 'exit 0'
+  } > "$STATE/open_url.sh" && chmod +x "$STATE/open_url.sh" && printf '%q' "$STATE/open_url.sh"
+}
+gh_login() {
+  printf '\a'
+  say ""
+  say "${B}Nu één keer inloggen bij GitHub${N}, zodat Claude de resultaten op GitHub kan bewaren (pushen)."
+  say "  - Eerst vraagt hij (meestal) 'Authenticate Git with your GitHub credentials? (Y/n)': druk op Enter (= ja)."
+  say "  - Dan zie je een code van 8 tekens (zoals ABCD-1234). Druk op Enter: de browser opent github.com/login/device"
+  say "    (opent hij niet, ga daar dan zelf heen in Windows). Log in bij GitHub, typ de code en klik op Authorize."
+  say "  - Vraagt hij nog iets ('Press Enter', HTTPS of SSH): Enter."
+  say "  - Overslaan: Ctrl+C (alles werkt dan gewoon, alleen kan Claude niets naar GitHub sturen)."
+  local args=(auth login --hostname github.com) gb rc help tty_mode=""
+  # --git-protocol exists since gh 2.x; Ubuntu 22.04's gh 2.4.0 does not know it (then: gh config set below).
+  # Captured first: 'gh ... | grep -q' can fail under pipefail when grep stops reading early.
+  help=$("$GH" auth login --help 2>&1 9>&-)
+  case "$help" in *--git-protocol*) args+=(--git-protocol https) ;; esac
+  args+=(--web)
+  gb=$(gh_browser) || gb=""
+  # Ctrl+C must stop gh, not start.sh: with a trap (not "ignore") bash waits for gh and then goes on.
+  # gh's questions put the terminal in raw mode; its settings are restored afterwards in any case.
+  [ -t 0 ] && tty_mode=$(stty -g 2>/dev/null)
+  trap ':' INT
+  # GH_BROWSER for current gh, BROWSER for old gh (2.4.0 reads only BROWSER)
+  if [ -n "$gb" ]; then GH_BROWSER=$gb BROWSER=$gb "$GH" "${args[@]}" 9>&-; else "$GH" "${args[@]}" 9>&-; fi
+  rc=$?
+  trap - INT
+  [ -n "$tty_mode" ] && stty "$tty_mode" 2>/dev/null
+  say ""
+  return "$rc"
+}
+git_identity() {    # name + e-mail for commits, only in this repository and only when missing
+  local n m cur_n cur_m info
+  cur_n=$(git -C "$GITREPO" config user.name 2>/dev/null); cur_m=$(git -C "$GITREPO" config user.email 2>/dev/null)
+  # missing, or still our placeholder while a GitHub login now exists
+  if [ -n "$cur_n" ] && [ -n "$cur_m" ] && { [ "$1" != ok ] || { [ "$cur_n" != "$GIT_PH_NAME" ] && [ "$cur_m" != "$GIT_PH_MAIL" ]; }; }; then
+    return 0
+  fi
+  n=$GIT_PH_NAME; m=$GIT_PH_MAIL
+  if [ "$1" = ok ]; then
+    info=$("$GH" api user 2>/dev/null 9>&- | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+login = (d.get("login") or "").strip()
+if not login:
+    sys.exit(1)
+uid = d.get("id")
+mail = d.get("email") or (f"{uid}+{login}@users.noreply.github.com" if uid else f"{login}@users.noreply.github.com")
+print(" ".join((d.get("name") or login).split()))
+print(mail.strip())' 2>/dev/null) && [ "$(printf '%s\n' "$info" | wc -l)" = 2 ] && { n=$(printf '%s\n' "$info" | sed -n 1p); m=$(printf '%s\n' "$info" | sed -n 2p); }
+  fi
+  local changed=0
+  if [ -z "$cur_n" ] || [ "$cur_n" = "$GIT_PH_NAME" ]; then
+    [ "$cur_n" != "$n" ] && git -C "$GITREPO" config --local user.name "$n" && changed=1
+  fi
+  if [ -z "$cur_m" ] || [ "$cur_m" = "$GIT_PH_MAIL" ]; then
+    [ "$cur_m" != "$m" ] && git -C "$GITREPO" config --local user.email "$m" && changed=1
+  fi
+  [ "$changed" = 1 ] && goed "git: commits als $(git -C "$GITREPO" config user.name) <$(git -C "$GITREPO" config user.email)> (alleen in deze repo)"
+  return 0
+}
+setup_github() {
+  [ "$GH_DONE" = 1 ] && return 0
+  GH_DONE=1
+  kop "GitHub (resultaten bewaren)"
+  if ! have git || [ "$(git -C "$GITREPO" rev-parse --is-inside-work-tree 2>/dev/null)" != true ]; then
+    say "  geen git-repository; overgeslagen"; noteer "GitHub" "overgeslagen (geen git-repository)"; return 0
+  fi
+  local url st=geen
+  url=$(git -C "$GITREPO" remote get-url origin 2>/dev/null || true)
+  case "$url" in
+    *github.com[:/]*) ;;
+    *) say "  de remote is geen github.com (${url:-geen remote}); GitHub-login overgeslagen"
+       noteer "GitHub" "overgeslagen (remote: ${url:-geen})"
+       git_identity geen; return 0 ;;
+  esac
+  if ! have "$GH"; then
+    # setup_wsl.sh installs gh; this is for an older installation (only when apt has a package)
+    if apt-cache policy gh 2>/dev/null | grep -q 'Candidate: [0-9]'; then apt_install gh || true; fi
+  fi
+  if ! have "$GH"; then
+    st=geen-gh
+  elif gh_ok; then
+    st=ok
+  elif gh_token_stored && ! github_reachable; then
+    st=offline      # logged in before, but GitHub cannot be reached now (network not up yet?): do not log in again
+  elif interactive; then
+    gh_login
+    gh_ok && st=ok
+  fi
+  if [ "$st" = ok ] || [ "$st" = offline ]; then
+    "$GH" config get -h github.com git_protocol 2>/dev/null 9>&- | grep -qx https ||
+      "$GH" config set -h github.com git_protocol https >/dev/null 2>&1 9>&-
+    if ! gh_git_helper; then
+      "$GH" auth setup-git 9>&- && gh_git_helper || let_op "gh auth setup-git lukte niet; git kan dan nog niet pushen"
+    fi
+  fi
+  if [ "$st" = ok ]; then
+    local who
+    who=$("$GH" api user --jq .login 2>/dev/null 9>&- || true)
+    goed "ingelogd bij GitHub${who:+ als $who}; git gebruikt gh voor github.com (Claude kan pushen)"
+    noteer "GitHub" "ingelogd${who:+ als $who}; Claude kan pushen"
+  elif [ "$st" = offline ]; then
+    let_op "GitHub is nu niet bereikbaar (internet?); de GitHub-login van eerder blijft staan (niet gecontroleerd)"
+    noteer "GitHub" "eerder ingelogd; nu niet bereikbaar (niet gecontroleerd)"
+  elif [ "$st" = geen-gh ]; then
+    let_op "pushen naar GitHub kan nog niet: gh ontbreekt (installeren: bash cel/pc/setup_wsl.sh --geen-tests), daarna: gh auth login"
+    noteer "GitHub" "niet ingelogd (gh ontbreekt)"
+  else
+    let_op "pushen naar GitHub kan nog niet: typ later in Ubuntu  gh auth login  (of start.sh opnieuw); tot dan blijven resultaten op deze pc"
+    noteer "GitHub" "niet ingelogd: pushen kan pas na  gh auth login"
+  fi
+  git_identity "$st"
+}
+
 # ------------------------------------------------------------------------------------ uitvoeren
 if [ "$DO_CLAUDE" = 1 ]; then install_claude; fi
 if [ "$DO_PLAN" = 1 ]; then
@@ -422,7 +573,7 @@ if [ "$DO_PLAN" = 1 ]; then
 fi
 kop "4. Status"
 python3 "$PC_DIR/status.py" --kort 9>&- || true
-if [ "$DO_CLAUDE" = 1 ]; then start_rc; fi
+if [ "$DO_CLAUDE" = 1 ]; then start_rc; setup_github; fi
 
 kop "Samenvatting"
 for l in "${RESULT[@]}"; do say "  $l"; done
