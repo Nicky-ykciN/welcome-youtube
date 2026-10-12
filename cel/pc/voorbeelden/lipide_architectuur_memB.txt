@@ -1,0 +1,12 @@
+# Lipiden met twee staarten (lip_arch = pi) zoals team B onderzoekt.  LET OP: lip_arch, r0_head,
+# k_head, cos_head, lip_tie en syn_nN bestaan (nog) NIET in engine/oercel; sweep.py weigert dit
+# bestand dan met een duidelijke melding.  Gebruik een engine die ze wel kent, bijvoorbeeld:
+#   make -C runs/memB_src && python3 pc/sweep.py pc/voorbeelden/lipide_architectuur_memB.txt --engine runs/memB_src/oercel
+# (runs/ staat niet in git: dit werkt alleen waar die map bestaat, of nadat de functies in engine/
+# zijn samengevoegd.)
+naam  = lipide_pi
+basis = notes/membranen/teamA_membranes.ini
+seeds = 1-4
+zet   = steps=100000 snap_every=2000 lip_arch=pi lip_nT=3
+raster a_W_T = 80 100
+raster lip_tie = 0 1

@@ -10,8 +10,9 @@ repulsion matrix and its `nZ` column in `stats.csv`, which is always 0.
 
 ```
 make              # builds ./oercel  (gcc -O3 -march=native -fopenmp)
-make test         # force unit tests (kernel vs O(N^2) brute force incl. stirring + kT(t), bonded vs finite differences)
-tests/validate.sh # full validation suite, ~70 s, prints PASS/FAIL per check (run from anywhere)
+make test         # force unit tests (kernel vs O(N^2) brute force incl. stirring + kT(t), bonded vs finite differences,
+                  #   tests/molforcetest: bonded forces of every lipid template vs finite differences)
+tests/validate.sh # full validation suite, ~90 s, prints PASS/FAIL per check (run from anywhere)
 ./oercel params.ini outdir [key=value ...]   # run; extra key=value arguments override the ini
 ./oercel --params                            # print every parameter with its default
 ```
@@ -20,6 +21,10 @@ Example parameter files in `params/`:
 - `soup_small.ini`: L = 64 random soup with chemistry and a uniform food supply. Commented
   lines show the vent, stirring and temperature-cycle options.
 - `water.ini`: pure water, used for validation.
+- `membranes.ini`: **the membrane physics** (tied double-tailed lipid + two-phase nutrient).
+  A random soup at L = 100 forms 10-17 closed bilayer vesicles with catalysts inside within
+  10-15k steps. See "Lipid templates and the membrane physics". `runs/membranes_final/ckpt.bin`
+  is this file run as-is to step 100 000 (vesicle-rich starting state for the next stages).
 
 ## What the emergence rule removed (and how the engine guards it)
 
@@ -85,8 +90,14 @@ matrix, the derived σ, and command-line overrides listed in a comment.
 | `k_bond` | 100 | harmonic bond constant, U = k/2 (r-r0)^2 |
 | `r0` | 0.5 | bond rest length |
 | `k_angle` | 10 | angle constant, U = k (1 - cos theta) on consecutive triplets |
-| `lip_nH` | 1 | head beads per lipid |
-| `lip_nT` | 3 | tail beads per lipid |
+| `lip_nH` | 1 | head beads per lipid (linear) |
+| `lip_nT` | 3 | tail beads per lipid (linear) or per tail (pi, y, bola) |
+| `lip_arch` | linear | lipid molecule template: `linear` (lip_nH heads then lip_nT tails), `pi` (2 bonded heads, each carrying a tail of lip_nT beads), `y` (1 head carrying two tails), `bola` (head pair, two tails, one head at the other end) |
+| `r0_head` | 0.5 | pi/bola: rest length of the head-head bond and of the tie bonds |
+| `k_head` | 0 | pi/y/bola: junction angle term U = k_head (cos θ − cos_head)² at the branch beads (0 = free) |
+| `cos_head` | 0 | pi/y/bola: preferred cos of the junction deviation angle |
+| `lip_tie` | 0 | pi/y/bola: number of tie bonds (ladder rungs) between bead m of tail a and bead m of tail b, m = 1..lip_tie |
+| `syn_nN` | 0 | lipid synthesis consumes syn_nN N; the remaining beads of the new lipid are the nearest W of the catalyst (0 = all beads from N) |
 | `steps` | 10000 | run until this absolute step number |
 | `snap_every` | 1000 | snapshot interval (0 = none) |
 | `stats_every` | 100 | stats.csv interval (0 = none) |
@@ -147,9 +158,10 @@ Default repulsion matrix a_ij (key `a_X_Y`, symmetric; `a_K_X` sets Ka and Kb at
 Notes:
 - σ = sqrt(2 γ kT) is always derived (fluctuation–dissipation); it cannot be set separately.
   With the temperature cycle, σ(t) = sqrt(2 γ kT(t)).
-- The lipid is a linear chain of `lip_nH` heads followed by `lip_nT` tails, at most 8 beads
-  (default H–T–T–T). Bonds join consecutive beads; the angle term acts on every consecutive
-  triplet.
+- The lipid follows a molecule template, at most 12 beads. The default `lip_arch = linear` is
+  the chain of `lip_nH` heads followed by `lip_nT` tails (default H–T–T–T): bonds join
+  consecutive beads and the angle term acts on every consecutive triplet. The branched
+  templates are described in "Lipid templates and the membrane physics".
 - **Chemistry probabilities are per check** (one check every `n_chem` steps), not per unit time.
 - `soup_small.ini` and the compiled defaults use the SPEC *starting* repulsion matrix and
   untuned starting rates (see "Known issues").
@@ -176,6 +188,50 @@ Notes:
   soup contains overlapping beads with a = 80/120 repulsions, which stretched bonds to 1.70
   in the first 10 steps (measured). With the ramp, the initial maximum is 1.0–1.2. Physics
   after the warm-up is unaffected; the ramp state is checkpointed.
+
+## Lipid templates and the membrane physics (`params/membranes.ini`)
+
+A lipid is a fixed molecule template: bead types by position (heads first), a list of bonds
+(with their rest lengths) and a list of angle terms. It is a law of nature of this world (one
+kind of molecule), the same for every lipid, whether it comes from the soup or from synthesis.
+The beads of one molecule stay linked through `nxt` in template order, so sorting, decay and
+checkpoints treat every template the same way.
+
+| `lip_arch` | beads | bonds | angle terms |
+|---|---|---|---|
+| `linear` | lip_nH heads, then lip_nT tails | consecutive beads, r0 | k_angle (1 − cos θ) on consecutive triplets |
+| `pi` | H1, H2, tail a (lip_nT beads on H1), tail b (on H2) | H1–H2 at r0_head; along each tail at r0; lip_tie rungs a_m–b_m at r0_head | k_angle along each tail; k_head at the junctions |
+| `y` | H, tail a, tail b (both on H) | along each tail at r0; rungs at 1.2 r0 | k_angle along each tail; k_head between the two first tail beads |
+| `bola` | H1, H2, H3, two tails from H1 and H2 that join at H3 | as pi, plus both tails bonded to H3; rungs shorten towards H3 | as pi |
+
+`tests/molforcetest` checks the bonded forces of ten templates against finite differences of an
+independently written energy, and the template geometry (all bonds at rest length).
+
+**The membrane physics** (`params/membranes.ini`; tuned by team memB on top of team memA's
+two-phase nutrient, compared head-to-head in `runs/judge_src/NOTES.md`):
+- Lipid: `lip_arch = pi`, `lip_nT = 1`, `lip_tie = 1`, `r0_head = 0.7`, i.e. a small H2T2
+  rectangle with 4 bonds (H1–H2 0.7, H–T 0.5, T–T tie 0.7) and **no angle terms** (k_angle has
+  no effect on it). Tied tails cannot splay, so bilayers form no Y/T junctions.
+- `k_bond = 300`: new lipids are synthesised inside the nutrient/catalyst lumen, which repels
+  tails; with k_bond 100 their bonds stretched to 1.5–2.1. The stiffer bonds cost about 1.5 % in
+  T_kin (0.985).
+- Nutrient N does not mix with plain water (`a_W_N = 45`), so the soup demixes into N-rich
+  droplets (an aqueous two-phase system). Heads slightly prefer N (`a_H_N = 22`); tails repel
+  water and N strongly (`a_W_T = 200`, `a_T_N = 120`, `a_T_K = 200`). Lipids wrap each droplet in
+  a bilayer, heads facing the N lumen and the water. Catalysts are as water-shy as their
+  substrate (`a_W_K = 45`) and sit in the droplets before they close.
+- Measured (chem = 0, L = 100, 100k steps, `tools/cells.py` detector, mean over 50k–100k):
+  10–13 closed vesicles (seeds 1, 2, 3, 7, 8: 13.4, 13.6, 11.7, 9.7, 11.3; peak 15–17); the
+  first ≥ 3 after 10–15k steps; 95–100 % contain catalysts (median 10–13). With memA's linear
+  H–T–T–T physics, the same measure gave 4.3 and 6.6 (seeds 7, 8). Neither ingredient alone
+  does it: the linear lipid with these tail repulsions gave 6–8 cells, mostly networked; the pi
+  lipid with memA's repulsions gave none.
+- Catalysts never crossed an intact bilayer (900 τ windows with snapshots every 100 steps). N
+  permeates slowly in both directions.
+- Limits: the lumen is the N phase, so synthesis consumes it. With `p_syn_a` = 2·10⁻³ all
+  vesicles were gone within 10k steps; with 2·10⁻⁴ about half within 30k. Loose bilayer
+  ribbons (excess lipid) coexist with the vesicles. Without chemistry the vesicles coarsen
+  slowly (≈ 11 → 8.5 between 100k and 200k steps).
 
 ## Environment: uniform physics for every bead (SPEC §0, §6)
 
@@ -229,9 +285,11 @@ if ever violated), so the search window is simply enlarged by 0.5.
    xoshiro256** RNG, which is checkpointed). For each K, the N beads within `r_cat` are
    collected and sorted by distance (ties broken by gid).
    - **Synthesis**: if ≥ mlen N are present, with probability p_syn(variant), the mlen nearest
-     N become a lipid (heads first). They are re-placed as a straight chain with spacing r0
-     centred on their centroid and all given their mean ṽ and vh (momentum conserving), and
-     the bonds are created at rest length. Two documented refinements, both local (they see
+     N become a lipid (heads first). With `syn_nN` > 0, only the syn_nN nearest N are used and
+     the rest of the molecule comes from the nearest W. The beads are re-placed in the template
+     geometry (a straight chain with spacing r0 for `linear`), centred on their centroid. All
+     of them get their mean ṽ and vh (momentum conserving), and every template bond is created
+     at rest length. Two documented refinements, both local (they see
      only the immediate neighbourhood of the new molecule):
      - Orientation: the lowest conservative overlap energy among `syn_tries` random
        orientations (1 = purely random as in SPEC).
@@ -270,7 +328,8 @@ if ever violated), so the search window is simply enlarged by 0.5.
   uint8 type and int32 bonds, all indexed by **permanent bead id** = gid, bonds with i < j).
   A bead's id never changes, so ids track beads across snapshots and events. Snapshots are
   written to a temporary file and renamed, so a reader never sees a partial file. Bonds are
-  listed in order of the first bead's id.
+  listed in order of the first bead's id (for branched templates: of the molecule's template
+  bead that comes first in the bond, then in template order). Every template bond is listed.
 - `stats.csv`: `step,time,T_kin,nW,nH,nT,nN,nKa,nKb,nZ,n_lipids,max_bond`, with
   - `T_kin`: instantaneous at that step (lab frame);
   - `max_bond`: the largest bond length over **all steps since the previous row**, not just
@@ -318,13 +377,19 @@ if ever violated), so the search window is simply enlarged by 0.5.
   char[4]  "END!"
   ```
 
-  Version 2 is written only by this engine, which has no placed-structure start and no
+  **Version 3** is identical except for one extra `int32 arch` (0 linear, 1 pi, 2 y, 3 bola)
+  right after `nH`. It is written for branched lipid templates; linear lipids keep version 2,
+  so older readers still work for them. A restart refuses a checkpoint whose mlen, nH or arch
+  differs from the parameters. The template details (`lip_nT`, `lip_tie`, `r0_head`, …) are
+  laws, like the a_ij, and are taken from the ini.
+
+  Versions 2 and 3 are written only by this engine, which has no placed-structure start and no
   flood-fill supply, so every version 2 checkpoint descends from a random soup. Version 1
   files (the previous engine) are refused with an explanation. On load, the engine verifies
   that the gids form a permutation, that the lipid links are consistent, and that no bead has
   type Z. The slot order is stored on purpose: restoring it exactly makes the continuation
-  bitwise identical. `tests/snapcheck.py` has a reader (`read_ckpt`, returns gid-ordered
-  arrays and full velocities).
+  bitwise identical. `tests/snapcheck.py` has a reader (`read_ckpt`, versions 2 and 3,
+  returns gid-ordered arrays and full velocities).
 
 ## Determinism
 
@@ -348,6 +413,24 @@ bit. Checked twice:
   threads: identical `stats.csv` and identical positions, types and bonds in every compared
   snapshot. Only the header `time` differs, in the last bits (8999.999999994907 vs 9000.0):
   that run accumulated t += dt, while the engine now computes t from the step.
+
+**Lipid templates (added after the runs above).** With `lip_arch = linear`, the bonded forces,
+the soup initialisation, the synthesis placement, its overlap energy and its relaxation keep
+the previous code verbatim. The generic template code gives the same numbers mathematically,
+but the compiler fuses multiply-adds (FMA, `-march=native`) differently, which changes the
+last bits. Checked with `cmp`:
+- linear, chem = 0: identical to the previous binary (memA's `membranes.ini`, the full 100k
+  steps of `runs/memA_z25`: snapshots, `stats.csv` and checkpoint), and so are linear runs
+  with the vent, stirring and the temperature cycle over 3000 steps;
+- pi (`params/membranes.ini`): identical to team memB's engine copy, with and without
+  chemistry (the full 100k steps of `runs/memB_F01_wt200_kb300`; 3000 steps with 160
+  syntheses);
+- **not identical**: linear runs with lipid synthesis can differ from the previous binary in the
+  last bit of a new lipid's coordinates. In `soup_small.ini` this first happened at the
+  synthesis of step 2550, after which the trajectories decorrelate. Copying the old chemistry
+  functions verbatim does not help, because GCC inlines and contracts them differently in the
+  larger source file. The physics is the same; the runs are statistically equivalent, not
+  bitwise.
 
 ## Performance design
 
@@ -401,7 +484,7 @@ binary on this host is ±10 %.
 - At L = 128 with 2 threads, ≈ 2.2 ms/step means ≈ 1.6·10⁶ steps or ≈ 49 000 time units per
   hour (dt = 0.03).
 
-## Validation (tests/validate.sh, final binary: 29 of 29 checks PASS, ~70 s)
+## Validation (tests/validate.sh, final binary: 32 of 32 checks PASS, ~90 s)
 
 | check | result |
 |---|---|
@@ -419,6 +502,9 @@ binary on this host is ±10 %.
 | food supply (`tests/feedcheck.py`, snapshots every check; every W→N change identified by gid) | see below |
 | Kolmogorov stirring (water L = 48, A = 0.0015) | sine profile u0 = 0.266 ± 0.005, ν = 0.33, max\|P\| 1.3·10⁻¹², T_kin − u0²/4 = 0.9963 |
 | temperature cycle (water L = 32, kT = 1 + 0.2 sin(2πt/30)) | T_kin = 0.9953 + 0.1961 sin(2πt/30 − 0.10) |
+| membrane lipid: `tests/molforcetest` (10 templates: linear, pi, y, bola, ties, junction angles) | bonded forces vs finite differences ≤ 1.2·10⁻⁷ (forces up to ~165); template bonds at rest length to 2·10⁻¹⁵ |
+| membrane lipid: restart at 300 (3 threads → 1 thread), `membranes.ini` physics, every reaction, feed, stirring, kT cycle | checkpoint version 3; snapshots, stats, events, final checkpoint bitwise identical |
+| membrane lipid: soup L = 48, `membranes.ini` + fast synthesis (p_syn_a 0.02), 20 000 steps | 490 syntheses, max bond 1.218, ⟨T⟩ = 0.981, every molecule an intact H2T2 template |
 
 Food-supply checks:
 - Per-check conversions equal the logged `feed` counts in all 5 runs, and all conversions
@@ -444,12 +530,15 @@ are in the run directories; these are sanity plots, not the project renderer.
 
 ## Known issues and honest caveats
 
-1. **No cell has emerged yet.** With the SPEC starting parameters, soups form micelles and
-   bilayer patches/strips but no closed vesicle (`val_soup64`, `val_soup64_nochem`). Membrane
-   and rate parameters still need tuning. Earlier tests with *placed* vesicles (removed, data
-   deleted) also indicated that bilayers with these parameters open pores within a few hundred
-   t.u. Stiffer lipids (`k_angle` ≈ 30) and stronger head hydration (`a_W_H` ≈ 30) looked more
-   stable there. That is a hint for tuning only; it was not obtained under SPEC §0 rules.
+1. **Closed vesicles emerge only with `params/membranes.ini`; nothing else of life yet.**
+   That file gives 10–13 closed bilayer vesicles with catalysts at L = 100 (see "Lipid
+   templates and the membrane physics"). Their lumen is the nutrient phase, so synthesis eats
+   it, and growth, division and selection have not been shown. With the SPEC starting
+   parameters, soups form micelles and bilayer patches/strips but no closed vesicle
+   (`val_soup64`, `val_soup64_nochem`); with N miscible in water, about 200 lipid
+   architectures and parameter sets gave at most 1–3 closed vesicles at a time at L = 100
+   (memA, memB). The chemistry rates still need tuning against the slow N influx into the
+   lumens.
 2. **Chemistry rates sit on a knife edge.** With `soup_small.ini`, catalyst replication is
    just below decay. The effective replication is 4.3·10⁻⁴ vs decay 5.2·10⁻⁴ per catalyst per
    check, because ≥ 2 N within r_cat are often missing at c_N = 0.12. Catalysts die out over
@@ -471,6 +560,11 @@ are in the run directories; these are sanity plots, not the project renderer.
    beads and 0.982 at 60 % (dt = 0.03); 0.996 and 0.990 at dt = 0.02. Within ±3 % for all
    tested compositions, but prefer dt = 0.03 over 0.04 once membranes dominate. With
    stirring, `T_kin` also contains the flow energy u0²/4 (see "Environment").
-5. The fast path needs AVX-512 (this machine has it). Elsewhere the scalar kernel is used;
+5. **Membrane physics caveats** (`membranes.ini`): `k_bond = 300` lowers T_kin to about
+   0.985 (0.981 with many new lipids), still within ±3 %. `tools/cells.py` misses vesicles that
+   touch a loose bilayer ribbon (memB counted ≈ 18 closed by eye in the 100k state of
+   `runs/membranes_final`, where the detector finds 14). Its 'growth'/'death' marks without chemistry are passive
+   coarsening, not life.
+6. The fast path needs AVX-512 (this machine has it). Elsewhere the scalar kernel is used;
    its pair kernel is ~1.6–1.8× slower. It is tested via `-DOERCEL_SCALAR` (forcetest PASS,
    including the stirring and kT(t) checks).

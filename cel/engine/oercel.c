@@ -11,7 +11,10 @@
  * bead has a permanent id (gid, 0..N-1) used for the pair-noise hash,
  * snapshots and the event log.  Lipid chains are stored per slot (nxt = slot of
  * the next bead, mpos = position in the chain) and remapped by the sort;
- * slot[gid] is only rebuilt for output.
+ * slot[gid] is only rebuilt for output.  A lipid follows a molecule template
+ * (lip_arch: the linear chain, or the branched pi / y / bola shapes, see
+ * mol_build): the template lists its bonds and angle terms, the nxt links only
+ * enumerate the beads of one molecule in template order.
  *
  * Parallel pair forces: half shell per bead i = its own column upward
  * (y_i .. y_i+1) plus the next column (y_i-1 .. y_i+1), two contiguous slot
@@ -44,7 +47,7 @@
 #define NTYPES 7
 enum { TW = 0, TH = 1, TT = 2, TN = 3, TKA = 4, TKB = 5, TZ = 6 };
 static const char *TNAME[NTYPES] = {"W", "H", "T", "N", "Ka", "Kb", "Z"};
-#define MAXMLEN 8
+#define MAXMLEN 12
 #define SQRT12 3.4641016151377545870548926830117
 
 /* ------------------------------------------------------------------ util */
@@ -177,6 +180,10 @@ typedef struct {
     double L, rho, dt, lambda, gamma, kT;
     double k_bond, r0, k_angle;
     int lip_nH, lip_nT;
+    char lip_arch[16];  /* linear | pi | y | bola: lipid molecule template, see mol_build */
+    double r0_head, k_head, cos_head;
+    int lip_tie;
+    int syn_nN;
     double a[NTYPES][NTYPES];
     /* run control */
     long steps, snap_every, stats_every, ckpt_every, log_every;
@@ -238,7 +245,13 @@ static const pdef_t PDEFS[] = {
     {"r0", PT_DBL, OFF(r0), "0.5", "bond rest length"},
     {"k_angle", PT_DBL, OFF(k_angle), "10", "angle constant, U = k (1 - cos theta) on consecutive triplets"},
     {"lip_nH", PT_INT, OFF(lip_nH), "1", "head beads per lipid"},
-    {"lip_nT", PT_INT, OFF(lip_nT), "3", "tail beads per lipid"},
+    {"lip_nT", PT_INT, OFF(lip_nT), "3", "tail beads per lipid (linear) or per tail (pi, y)"},
+    {"lip_arch", PT_STR, OFF(lip_arch), "linear", "lipid architecture: linear (lip_nH heads then lip_nT tails), pi (2 bonded heads, each carrying a tail of lip_nT beads), y (1 head carrying two tails of lip_nT beads) or bola (asymmetric membrane-spanning macrocycle: head pair, two tails of lip_nT beads, one head on the other end)"},
+    {"r0_head", PT_DBL, OFF(r0_head), "0.5", "pi: rest length of the head-head bond (and of the optional tie bond)"},
+    {"k_head", PT_DBL, OFF(k_head), "0", "pi/y: junction angle term U = k_head (cos theta - cos_head)^2 at the branch beads (theta = deviation from straight; 0 = free)"},
+    {"cos_head", PT_DBL, OFF(cos_head), "0", "pi/y: preferred cos of the junction deviation angle (0 = 90 degrees)"},
+    {"lip_tie", PT_INT, OFF(lip_tie), "0", "pi/y: number of ladder rungs: bonds between tail beads Ta_m and Tb_m, m = 1..lip_tie (pi: rest r0_head; y: rest 1.2 r0)"},
+    {"syn_nN", PT_INT, OFF(syn_nN), "0", "lipid synthesis: number of N consumed (0 = all beads of the lipid); the remaining beads of the new lipid are the nearest W beads of the catalyst"},
     {"steps", PT_LONG, OFF(steps), "10000", "run until this absolute step number"},
     {"snap_every", PT_LONG, OFF(snap_every), "1000", "snapshot interval (0 = none)"},
     {"stats_every", PT_LONG, OFF(stats_every), "100", "stats.csv interval (0 = none)"},
@@ -420,10 +433,153 @@ static int read_ini(const char *path, kv_t **out) {
     return n;
 }
 
+/* ------------------------------------------------------------------ lipid molecule template
+ * A lipid is a fixed template: bead types by position (heads first), bonds
+ * (position pairs, each with a rest length), angle terms on position triplets.
+ * The beads of one molecule are still linked through nxt[] in position order
+ * (mpos = position), so the sort, decay and checkpoint code is unchanged; only
+ * the bonded forces, the snapshot bond list, the soup init and the synthesis
+ * placement read the template.  For lip_arch = linear those four places keep
+ * the previous engine's code verbatim (lip_arch == ARCH_LINEAR branches): the
+ * template computes the same numbers mathematically, but with -march=native the
+ * compiler fuses multiply-adds (FMA) differently, so only the verbatim code keeps
+ * linear-lipid runs bitwise identical to the engine before the template existed
+ * (checked: identical with -ffp-contract=off, different in the last bits
+ * without the branches). */
+enum { ARCH_LINEAR = 0, ARCH_PI = 1, ARCH_Y = 2, ARCH_BOLA = 3 };
+#define MAXMB (2 * MAXMLEN)
+typedef struct {
+    int arch, mlen, nH, nT;
+    int nb;                       /* bonds */
+    int bi[MAXMB], bj[MAXMB];
+    double br0[MAXMB];
+    int na;                       /* angle terms, j = middle bead */
+    int ai[MAXMB], aj[MAXMB], ak[MAXMB];
+    int akind[MAXMB];             /* 0: U = K (1 - cos th);  1: U = K (cos th - c0)^2 */
+    double aK[MAXMB], ac0[MAXMB];
+    double px[MAXMLEN], py[MAXMLEN]; /* template coordinates (centroid 0), long axis along +x */
+    double ix[MAXMLEN], iy[MAXMLEN]; /* soup-init offsets relative to bead 0 */
+} mol_t;
+static mol_t g_mol;
+
+static void mol_bond(mol_t *M, int i, int j, double r0) {
+    M->bi[M->nb] = i; M->bj[M->nb] = j; M->br0[M->nb] = r0; M->nb++;
+}
+static void mol_angle(mol_t *M, int i, int j, int k, int kind, double K, double c0) {
+    if (K == 0.0) return; /* zero terms are skipped (as the original engine did for k_angle = 0) */
+    M->ai[M->na] = i; M->aj[M->na] = j; M->ak[M->na] = k;
+    M->akind[M->na] = kind; M->aK[M->na] = K; M->ac0[M->na] = c0; M->na++;
+}
+/* straight bonded chain through positions c[0..n-1] (bonds r0, straight angles k_angle) */
+static void mol_chain(mol_t *M, const int *c, int n, double r0, double ka) {
+    for (int b = 0; b + 1 < n; b++) mol_bond(M, c[b], c[b + 1], r0);
+    for (int b = 0; b + 2 < n; b++) mol_angle(M, c[b], c[b + 1], c[b + 2], 0, ka, 0.0);
+}
+
+static void mol_build(const Params *P) {
+    mol_t *M = &g_mol;
+    memset(M, 0, sizeof *M);
+    const double r0 = P->r0;
+    const int nT = P->lip_nT;
+    M->nT = nT;
+    if (!strcmp(P->lip_arch, "linear")) {
+        M->arch = ARCH_LINEAR;
+        M->nH = P->lip_nH;
+        M->mlen = P->lip_nH + nT;
+        if (P->lip_nH < 1 || nT < 1 || M->mlen > MAXMLEN) die("lipid length must be 2..%d with >=1 head and tail", MAXMLEN);
+        /* bonds (b, b+1), then angles (b, b+1, b+2): the original engine's order */
+        for (int b = 0; b + 1 < M->mlen; b++) mol_bond(M, b, b + 1, r0);
+        for (int b = 0; b + 2 < M->mlen; b++) mol_angle(M, b, b + 1, b + 2, 0, P->k_angle, 0.0);
+        for (int b = 0; b < M->mlen; b++) {
+            M->px[b] = (b - 0.5 * (M->mlen - 1)) * r0;
+            M->py[b] = 0.0;
+            M->ix[b] = b * r0;
+            M->iy[b] = 0.0;
+        }
+        return;
+    }
+    if (nT < 1) die("lip_nT must be >= 1");
+    int ca[MAXMLEN + 1], cb[MAXMLEN + 1];
+    if (!strcmp(P->lip_arch, "pi")) {
+        /* H1(0)-H2(1) bonded heads; tail A on H1: 2..nT+1; tail B on H2: nT+2..2nT+1 */
+        M->arch = ARCH_PI;
+        M->nH = 2;
+        M->mlen = 2 + 2 * nT;
+        if (M->mlen > MAXMLEN) die("pi lipid with lip_nT=%d has %d beads (max %d)", nT, M->mlen, MAXMLEN);
+        const double h = P->r0_head;
+        mol_bond(M, 0, 1, h);
+        ca[0] = 0; cb[0] = 1;
+        for (int k = 1; k <= nT; k++) { ca[k] = 1 + k; cb[k] = 1 + nT + k; }
+        mol_chain(M, ca, nT + 1, r0, P->k_angle);
+        mol_chain(M, cb, nT + 1, r0, P->k_angle);
+        for (int m = 1; m <= P->lip_tie && m <= nT; m++) mol_bond(M, ca[m], cb[m], h); /* ladder rungs */
+        mol_angle(M, 1, 0, ca[1], 1, P->k_head, P->cos_head);
+        mol_angle(M, 0, 1, cb[1], 1, P->k_head, P->cos_head);
+        M->px[0] = 0.0; M->py[0] = -0.5 * h;
+        M->px[1] = 0.0; M->py[1] = 0.5 * h;
+        for (int k = 1; k <= nT; k++) {
+            M->px[ca[k]] = k * r0; M->py[ca[k]] = -0.5 * h;
+            M->px[cb[k]] = k * r0; M->py[cb[k]] = 0.5 * h;
+        }
+    } else if (!strcmp(P->lip_arch, "y")) {
+        /* one head (0) carrying tail A: 1..nT and tail B: nT+1..2nT */
+        M->arch = ARCH_Y;
+        M->nH = 1;
+        M->mlen = 1 + 2 * nT;
+        if (M->mlen > MAXMLEN) die("y lipid with lip_nT=%d has %d beads (max %d)", nT, M->mlen, MAXMLEN);
+        ca[0] = 0; cb[0] = 0;
+        for (int k = 1; k <= nT; k++) { ca[k] = k; cb[k] = nT + k; }
+        mol_chain(M, ca, nT + 1, r0, P->k_angle);
+        mol_chain(M, cb, nT + 1, r0, P->k_angle);
+        for (int m = 1; m <= P->lip_tie && m <= nT; m++) mol_bond(M, ca[m], cb[m], 1.2 * r0); /* rungs, template spacing */
+        mol_angle(M, ca[1], 0, cb[1], 1, P->k_head, P->cos_head);
+        M->px[0] = 0.0; M->py[0] = 0.0;
+        for (int k = 1; k <= nT; k++) {
+            M->px[ca[k]] = 0.8 * r0 + (k - 1) * r0; M->py[ca[k]] = -0.6 * r0;
+            M->px[cb[k]] = 0.8 * r0 + (k - 1) * r0; M->py[cb[k]] = 0.6 * r0;
+        }
+    } else if (!strcmp(P->lip_arch, "bola")) {
+        /* asymmetric membrane-spanning (bola) lipid, a macrocycle: head pair H1(0)-H2(1) on one
+         * face, a single head H3(2) on the other; tail A runs H1 -> Ta1..Ta_nT -> H3, tail B
+         * H2 -> Tb1..Tb_nT -> H3.  Both tails straight (k_angle, including the H3 end), the
+         * head pair r0_head apart: a wedge (wide face: 2 heads, narrow face: 1 head). */
+        M->arch = ARCH_BOLA;
+        M->nH = 3;
+        M->mlen = 3 + 2 * nT;
+        if (M->mlen > MAXMLEN) die("bola lipid with lip_nT=%d has %d beads (max %d)", nT, M->mlen, MAXMLEN);
+        const double h = P->r0_head;
+        mol_bond(M, 0, 1, h);
+        ca[0] = 0; cb[0] = 1;
+        for (int k = 1; k <= nT; k++) { ca[k] = 2 + k; cb[k] = 2 + nT + k; }
+        ca[nT + 1] = 2; cb[nT + 1] = 2;
+        mol_chain(M, ca, nT + 2, r0, P->k_angle);
+        mol_chain(M, cb, nT + 2, r0, P->k_angle);
+        for (int m = 1; m <= P->lip_tie && m <= nT; m++) mol_bond(M, ca[m], cb[m], h * (1.0 - (double)m / (nT + 1)));
+        mol_angle(M, 1, 0, ca[1], 1, P->k_head, P->cos_head);
+        mol_angle(M, 0, 1, cb[1], 1, P->k_head, P->cos_head);
+        /* template: straight tails from the head pair (x = 0, y = -+h/2) to H3 at (X, 0) */
+        const double X = sqrt((nT + 1) * r0 * (nT + 1) * r0 - 0.25 * h * h);
+        M->px[0] = 0.0; M->py[0] = -0.5 * h;
+        M->px[1] = 0.0; M->py[1] = 0.5 * h;
+        M->px[2] = X; M->py[2] = 0.0;
+        for (int k = 1; k <= nT; k++) {
+            const double f = (double)k / (nT + 1);
+            M->px[ca[k]] = f * X; M->py[ca[k]] = -0.5 * h * (1.0 - f);
+            M->px[cb[k]] = f * X; M->py[cb[k]] = 0.5 * h * (1.0 - f);
+        }
+    } else die("lip_arch must be linear, pi, y or bola");
+    double mx = 0, my = 0;
+    for (int b = 0; b < M->mlen; b++) { mx += M->px[b]; my += M->py[b]; }
+    mx /= M->mlen; my /= M->mlen;
+    for (int b = 0; b < M->mlen; b++) { M->px[b] -= mx; M->py[b] -= my; }
+    for (int b = 0; b < M->mlen; b++) { M->ix[b] = M->px[b] - M->px[0]; M->iy[b] = M->py[b] - M->py[0]; }
+}
+
 static void finalize_params(Params *P) {
     P->sigma = sqrt(2.0 * P->gamma * P->kT);
-    int mlen = P->lip_nH + P->lip_nT;
-    if (P->lip_nH < 1 || P->lip_nT < 1 || mlen > MAXMLEN) die("lipid length must be 2..%d with >=1 head and tail", MAXMLEN);
+    mol_build(P);
+    if (P->syn_nN < 0 || P->syn_nN > g_mol.mlen) die("syn_nN must be 0..%d", g_mol.mlen);
+    if (P->r0_head <= 0) die("r0_head must be > 0");
     if (P->L < 8) die("L must be >= 8");
     if (P->dt <= 0) die("dt must be > 0");
     if (P->threads < 1) P->threads = 1;
@@ -1059,8 +1215,61 @@ static void pair_forces(Sys *s, const Params *P, int64_t step, double t) {
     }
 }
 
-/* harmonic bonds + angle term of the lipid chain starting at slot h */
-static inline void chain_forces(Sys *s, const int h, const double kb, const double r0, const double ka, double *mb) {
+/* bonded forces of one molecule (template bonds and angles) whose bead slots
+ * are sl[0..mlen-1]; forces are added to fx/fy indexed by fidx[b] (slot or
+ * position).  Shared by the dynamics and the insertion relaxation. */
+static inline void mol_forces(const Sys *s, const int *sl, const double kb, double *restrict fx, double *restrict fy,
+                              const int byslot, double *mb) {
+    const mol_t *M = &g_mol;
+    const double L = s->L;
+    const double *restrict x = s->x, *restrict y = s->y;
+    for (int q = 0; q < M->nb; q++) {
+        const int bi = M->bi[q], bj = M->bj[q];
+        const int i = sl[bi], j = sl[bj];
+        const double dx = minimg(x[j] - x[i], L), dy = minimg(y[j] - y[i], L);
+        const double r = sqrt(dx * dx + dy * dy);
+        if (r > *mb) *mb = r;
+        const double f = -kb * (r - M->br0[q]) / r; /* force on j along (dx,dy) */
+        const int fi = byslot ? i : bi, fj = byslot ? j : bj;
+        fx[fj] += f * dx; fy[fj] += f * dy;
+        fx[fi] -= f * dx; fy[fi] -= f * dy;
+    }
+    for (int q = 0; q < M->na; q++) {
+        const int pi_ = M->ai[q], pj = M->aj[q], pk = M->ak[q];
+        const int i = sl[pi_], j = sl[pj], k = sl[pk];
+        const double ax = minimg(x[j] - x[i], L), ay = minimg(y[j] - y[i], L);
+        const double cxv = minimg(x[k] - x[j], L), cyv = minimg(y[k] - y[j], L);
+        const double la = sqrt(ax * ax + ay * ay), lc = sqrt(cxv * cxv + cyv * cyv);
+        const double ilac = 1.0 / (la * lc);
+        const double cs = (ax * cxv + ay * cyv) * ilac;
+        /* g = dU/dcos: kind 0, U = K (1 - cos): g = -K;  kind 1, U = K (cos - c0)^2: g = 2 K (cos - c0)
+         * dU/da = g (c/(la lc) - cos a/la^2), dU/dc = g (a/(la lc) - cos c/lc^2) */
+        const double g = M->akind[q] == 0 ? -M->aK[q] : 2.0 * M->aK[q] * (cs - M->ac0[q]);
+        const double dUax = g * (cxv * ilac - cs * ax / (la * la));
+        const double dUay = g * (cyv * ilac - cs * ay / (la * la));
+        const double dUcx = g * (ax * ilac - cs * cxv / (lc * lc));
+        const double dUcy = g * (ay * ilac - cs * cyv / (lc * lc));
+        const int fi = byslot ? i : pi_, fj = byslot ? j : pj, fk = byslot ? k : pk;
+        fx[fi] += dUax; fy[fi] += dUay;
+        fx[fj] += -dUax + dUcx; fy[fj] += -dUay + dUcy;
+        fx[fk] -= dUcx; fy[fk] -= dUcy;
+    }
+}
+
+/* slots of the molecule whose first bead (mpos 0) is slot h; returns the count */
+static inline int mol_slots(const Sys *s, const int h, int *sl) {
+    const int ml = s->mlen;
+    int n = 0;
+    for (int d = h; d >= 0 && n < ml; d = s->nxt[d]) sl[n++] = d;
+    return n;
+}
+
+/* lip_arch = linear: harmonic bonds + angle terms of the chain starting at slot
+ * h.  This is the previous engine's code, kept verbatim: it computes the same
+ * forces as mol_forces, but the compiler contracts the floating-point
+ * operations (FMA) differently, so keeping it makes linear-lipid runs bitwise
+ * identical to those of the engine before the molecule template existed. */
+static inline void chain_forces_linear(Sys *s, const int h, const double kb, const double r0, const double ka, double *mb) {
     const int ml = s->mlen;
     const double L = s->L;
     const double *restrict x = s->x, *restrict y = s->y;
@@ -1098,6 +1307,13 @@ static inline void chain_forces(Sys *s, const int h, const double kb, const doub
     }
 }
 
+/* branched lipids (pi, y, bola): template bonds + angle terms of the molecule whose first bead is slot h */
+static inline void chain_forces(Sys *s, const int h, const double kb, double *mb) {
+    int sl[MAXMLEN];
+    if (mol_slots(s, h, sl) != s->mlen) die("broken lipid chain at slot %d", h);
+    mol_forces(s, sl, kb, s->fx, s->fy, 1, mb);
+}
+
 /* Bonded forces.  Every bead belongs to at most one chain, so chains can be
  * processed concurrently without write conflicts; each thread takes the chains
  * whose first bead lies in its slot range (cache locality, the beads of a chain
@@ -1106,6 +1322,7 @@ static inline void chain_forces(Sys *s, const int h, const double kb, const doub
 static void bonded_forces(Sys *s, const Params *P) {
     const int N = s->N;
     const double kb = P->k_bond, r0 = P->r0, ka = P->k_angle;
+    const int linear = g_mol.arch == ARCH_LINEAR;
     double mbt = s->maxbond;
 #pragma omp parallel reduction(max : mbt)
     {
@@ -1113,8 +1330,13 @@ static void bonded_forces(Sys *s, const Params *P) {
         const int lo = (int)(((long)t * N) / nt), hi = (int)(((long)(t + 1) * N) / nt);
         const int8_t *restrict mpos = s->mpos;
         double mb = 0.0;
-        for (int d = lo; d < hi; d++)
-            if (mpos[d] == 0) chain_forces(s, d, kb, r0, ka, &mb);
+        if (linear) {
+            for (int d = lo; d < hi; d++)
+                if (mpos[d] == 0) chain_forces_linear(s, d, kb, r0, ka, &mb);
+        } else {
+            for (int d = lo; d < hi; d++)
+                if (mpos[d] == 0) chain_forces(s, d, kb, &mb);
+        }
         if (mb > mbt) mbt = mb;
     }
     s->maxbond = mbt;
@@ -1207,8 +1429,15 @@ static double chain_overlap_energy(Sys *s, const Params *P, double cx0, double c
     const double L = s->L;
     double U = 0.0;
     for (int b = 0; b < ml; b++) {
-        const double off = (b - 0.5 * (ml - 1)) * P->r0;
-        double px = cx0 + off * ux, py = cy0 + off * uy;
+        double px, py;
+        if (g_mol.arch == ARCH_LINEAR) { /* previous engine's expression (bit-compatible) */
+            const double off = (b - 0.5 * (ml - 1)) * P->r0;
+            px = cx0 + off * ux;
+            py = cy0 + off * uy;
+        } else {
+            px = cx0 + (g_mol.px[b] * ux - g_mol.py[b] * uy);
+            py = cy0 + (g_mol.px[b] * uy + g_mol.py[b] * ux);
+        }
         wrap1(&px, L);
         wrap1(&py, L);
         const int tb = b < s->nH ? TH : TT;
@@ -1292,24 +1521,29 @@ static void relax_new_chain(Sys *s, const Params *P, const int *sl) {
                 fy[b] += f * dy;
             }
         }
-        double bx[MAXMLEN], by[MAXMLEN], bl[MAXMLEN];
-        for (int b = 0; b < ml - 1; b++) {
-            const int i = sl[b], j = sl[b + 1];
-            bx[b] = minimg(s->x[j] - s->x[i], L);
-            by[b] = minimg(s->y[j] - s->y[i], L);
-            bl[b] = sqrt(bx[b] * bx[b] + by[b] * by[b]);
-            const double f = -P->k_bond * (bl[b] - P->r0) / bl[b];
-            fx[b + 1] += f * bx[b]; fy[b + 1] += f * by[b];
-            fx[b] -= f * bx[b]; fy[b] -= f * by[b];
-        }
-        for (int b = 0; b < ml - 2 && P->k_angle != 0.0; b++) {
-            const double ax = bx[b], ay = by[b], cxv = bx[b + 1], cyv = by[b + 1], la = bl[b], lc = bl[b + 1];
-            const double ilac = 1.0 / (la * lc), cs = (ax * cxv + ay * cyv) * ilac, ka = P->k_angle;
-            const double dUax = -ka * (cxv * ilac - cs * ax / (la * la)), dUay = -ka * (cyv * ilac - cs * ay / (la * la));
-            const double dUcx = -ka * (ax * ilac - cs * cxv / (lc * lc)), dUcy = -ka * (ay * ilac - cs * cyv / (lc * lc));
-            fx[b] += dUax; fy[b] += dUay;
-            fx[b + 1] += -dUax + dUcx; fy[b + 1] += -dUay + dUcy;
-            fx[b + 2] -= dUcx; fy[b + 2] -= dUcy;
+        if (g_mol.arch == ARCH_LINEAR) { /* previous engine's code (bit-compatible), same forces as mol_forces */
+            double bx[MAXMLEN], by[MAXMLEN], bl[MAXMLEN];
+            for (int b = 0; b < ml - 1; b++) {
+                const int i = sl[b], j = sl[b + 1];
+                bx[b] = minimg(s->x[j] - s->x[i], L);
+                by[b] = minimg(s->y[j] - s->y[i], L);
+                bl[b] = sqrt(bx[b] * bx[b] + by[b] * by[b]);
+                const double f = -P->k_bond * (bl[b] - P->r0) / bl[b];
+                fx[b + 1] += f * bx[b]; fy[b + 1] += f * by[b];
+                fx[b] -= f * bx[b]; fy[b] -= f * by[b];
+            }
+            for (int b = 0; b < ml - 2 && P->k_angle != 0.0; b++) {
+                const double ax = bx[b], ay = by[b], cxv = bx[b + 1], cyv = by[b + 1], la = bl[b], lc = bl[b + 1];
+                const double ilac = 1.0 / (la * lc), cs = (ax * cxv + ay * cyv) * ilac, ka = P->k_angle;
+                const double dUax = -ka * (cxv * ilac - cs * ax / (la * la)), dUay = -ka * (cyv * ilac - cs * ay / (la * la));
+                const double dUcx = -ka * (ax * ilac - cs * cxv / (lc * lc)), dUcy = -ka * (ay * ilac - cs * cyv / (lc * lc));
+                fx[b] += dUax; fy[b] += dUay;
+                fx[b + 1] += -dUax + dUcx; fy[b + 1] += -dUay + dUcy;
+                fx[b + 2] -= dUcx; fy[b + 2] -= dUcy;
+            }
+        } else {
+            double mbdummy = 0.0;
+            mol_forces(s, sl, P->k_bond, fx, fy, 0, &mbdummy); /* template bonds + angles, by position */
         }
         for (int b = 0; b < ml; b++) {
             double mx = alpha * fx[b], my = alpha * fy[b];
@@ -1344,7 +1578,7 @@ static int chemistry(Sys *s, const Params *P, int64_t step) {
             int b = (int)rng_below(&s->rng, a + 1);
             int t = ks[a]; ks[a] = ks[b]; ks[b] = t;
         }
-        nbr_t nb[256];
+        nbr_t nb[256], nbw[256];
         for (int q = 0; q < nk; q++) {
             const int k = ks[q];
             if (s->type[k] != TKA && s->type[k] != TKB) continue;
@@ -1355,14 +1589,18 @@ static int chemistry(Sys *s, const Params *P, int64_t step) {
             if (nn < 2) continue;
             int used = 0;
             const double xk = s->x[k], yk = s->y[k];
-            if (nn >= ml && rng_unif(&s->rng) < psyn) {
+            const int nsynN = P->syn_nN > 0 ? P->syn_nN : ml; /* N consumed per lipid */
+            int nw = 0;
+            if (nn >= nsynN && nsynN < ml) nw = find_type_near(s, k, P->r_cat, TW, nbw, 256);
+            if (nn >= nsynN && nsynN + nw >= ml && rng_unif(&s->rng) < psyn) {
                 /* lipid synthesis from the ml nearest N: straight chain with
                  * spacing r0 through their centroid, random orientation, mean
                  * velocity (momentum conserving), bonds at rest length */
                 double cxm = 0, cym = 0, mvx = 0, mvy = 0, mtx = 0, mty = 0;
                 int sl[MAXMLEN];
                 for (int b = 0; b < ml; b++) {
-                    const int j = nb[b].slot;
+                    /* the nsynN nearest N, then (syn_nN < mlen) the nearest W */
+                    const int j = b < nsynN ? nb[b].slot : nbw[b - nsynN].slot;
                     sl[b] = j;
                     cxm += minimg(s->x[j] - xk, L);
                     cym += minimg(s->y[j] - yk, L);
@@ -1382,9 +1620,14 @@ static int chemistry(Sys *s, const Params *P, int64_t step) {
                 }
                 for (int b = 0; b < ml; b++) {
                     const int j = sl[b];
-                    const double off = (b - 0.5 * (ml - 1)) * P->r0;
-                    s->x[j] = cxm + off * ux;
-                    s->y[j] = cym + off * uy;
+                    if (g_mol.arch == ARCH_LINEAR) { /* previous engine's expression (bit-compatible) */
+                        const double off = (b - 0.5 * (ml - 1)) * P->r0;
+                        s->x[j] = cxm + off * ux;
+                        s->y[j] = cym + off * uy;
+                    } else {
+                        s->x[j] = cxm + (g_mol.px[b] * ux - g_mol.py[b] * uy);
+                        s->y[j] = cym + (g_mol.px[b] * uy + g_mol.py[b] * ux);
+                    }
                     wrap1(&s->x[j], L);
                     wrap1(&s->y[j], L);
                     s->vx[j] = mvx; s->vy[j] = mvy;
@@ -1394,7 +1637,7 @@ static int chemistry(Sys *s, const Params *P, int64_t step) {
                 link_lipid(s, sl);
                 if (P->syn_relax > 0) relax_new_chain(s, P, sl);
                 add_event(s, step, EV_SYN, s->gid[k], xk, yk, var);
-                used = ml;
+                used = nsynN;
                 moved = 1;
             }
             if (nn - used >= 2 && rng_unif(&s->rng) < prep) {
@@ -1539,9 +1782,15 @@ static void init_soup(Sys *s, const Params *P) {
         const double hx = L * rng_unif(&s->rng), hy = L * rng_unif(&s->rng);
         const double phi = 2.0 * M_PI * rng_unif(&s->rng);
         int sl[MAXMLEN];
+        const double cph = cos(phi), sph = sin(phi);
         for (int b = 0; b < ml; b++) {
-            s->x[gi] = hx + b * P->r0 * cos(phi);
-            s->y[gi] = hy + b * P->r0 * sin(phi);
+            if (g_mol.arch == ARCH_LINEAR) { /* previous engine's expression (bit-compatible) */
+                s->x[gi] = hx + b * P->r0 * cos(phi);
+                s->y[gi] = hy + b * P->r0 * sin(phi);
+            } else {
+                s->x[gi] = hx + (g_mol.ix[b] * cph - g_mol.iy[b] * sph);
+                s->y[gi] = hy + (g_mol.ix[b] * sph + g_mol.iy[b] * cph);
+            }
             wrap1(&s->x[gi], L);
             wrap1(&s->y[gi], L);
             s->type[gi] = b < s->nH ? TH : TT;
@@ -1571,6 +1820,13 @@ static int file_exists(const char *p) {
     return stat(p, &st) == 0;
 }
 
+typedef struct { int32_t key, sub, i, j; } brec_t;
+static int brec_cmp(const void *a, const void *b) {
+    const brec_t *p = a, *q = b;
+    if (p->key != q->key) return p->key < q->key ? -1 : 1;
+    return (p->sub > q->sub) - (p->sub < q->sub);
+}
+
 static void write_snapshot(Sys *s, const char *dir) {
     char path[2048], tmp[2100];
     snprintf(path, sizeof path, "%s/snap_%010lld.bin", dir, (long long)s->step);
@@ -1579,8 +1835,9 @@ static void write_snapshot(Sys *s, const char *dir) {
     if (!f) die("cannot write %s", tmp);
     const int N = s->N;
     build_slot(s);
-    int32_t nb = 0;
-    for (int d = 0; d < N; d++) nb += s->nxt[d] >= 0;
+    int32_t nmol = 0;
+    for (int d = 0; d < N; d++) nmol += s->mpos[d] == 0;
+    const int32_t nb = nmol * g_mol.nb;
     const int32_t ver = 1, n32 = N;
     const int64_t st = s->step;
     fwrite("OCEL", 1, 4, f);
@@ -1599,19 +1856,29 @@ static void write_snapshot(Sys *s, const char *dir) {
     for (int g = 0; g < N; g++) tb[g] = s->type[s->slot[g]];
     fwrite(tb, 1, N, f);
     free(buf);
-    /* bonds in order of the first bead's id */
-    int32_t *bb = xmalloc((size_t)(nb + 1) * 2 * sizeof(int32_t));
+    /* template bonds, ordered by the id of the bond's first template bead, then
+     * by template order (for linear lipids: exactly the original engine's order) */
+    brec_t *br = xmalloc((size_t)(nb + 1) * sizeof(brec_t));
     int k = 0;
-    for (int g = 0; g < N; g++) {
-        const int d = s->slot[g];
-        if (s->nxt[d] < 0) continue;
-        const int32_t i = (int32_t)g, j = (int32_t)s->gid[s->nxt[d]];
-        bb[2 * k] = i < j ? i : j;
-        bb[2 * k + 1] = i < j ? j : i;
-        k++;
+    for (int d = 0; d < N; d++) {
+        if (s->mpos[d] != 0) continue;
+        int sl[MAXMLEN];
+        if (mol_slots(s, d, sl) != s->mlen) die("broken lipid chain at slot %d", d);
+        for (int q = 0; q < g_mol.nb; q++) {
+            const int32_t i = (int32_t)s->gid[sl[g_mol.bi[q]]], j = (int32_t)s->gid[sl[g_mol.bj[q]]];
+            br[k].key = i;
+            br[k].sub = q;
+            br[k].i = i < j ? i : j;
+            br[k].j = i < j ? j : i;
+            k++;
+        }
     }
+    qsort(br, (size_t)nb, sizeof(brec_t), brec_cmp);
+    int32_t *bb = xmalloc((size_t)(nb + 1) * 2 * sizeof(int32_t));
+    for (int q = 0; q < nb; q++) { bb[2 * q] = br[q].i; bb[2 * q + 1] = br[q].j; }
     fwrite(bb, 4, 2 * (size_t)nb, f);
     free(bb);
+    free(br);
     if (fclose(f) != 0) die("write error on %s", tmp);
     if (rename(tmp, path) != 0) die("rename %s failed", tmp);
 }
@@ -1627,12 +1894,14 @@ static void write_ckpt(Sys *s, const char *dir, int keep) {
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "wb");
     if (!f) die("cannot write %s", tmp);
-    const int32_t ver = CKPT_VERSION, N = s->N, ml = s->mlen, nH = s->nH;
+    const int32_t ver = g_mol.arch == ARCH_LINEAR ? CKPT_VERSION : 3, N = s->N, ml = s->mlen, nH = s->nH;
+    const int32_t arch = g_mol.arch;
     fwrite("OCKP", 1, 4, f);
     fwrite(&ver, 4, 1, f);
     fwrite(&N, 4, 1, f);
     fwrite(&ml, 4, 1, f);
     fwrite(&nH, 4, 1, f);
+    if (ver == 3) fwrite(&arch, 4, 1, f); /* version 3 = version 2 + lipid architecture code */
     fwrite(&s->step, 8, 1, f);
     fwrite(&s->time, 8, 1, f);
     fwrite(&s->L, 8, 1, f);
@@ -1684,10 +1953,12 @@ static void read_ckpt(Sys *s, const Params *P, const char *path) {
     if (ver == 1)
         die("%s is a version 1 checkpoint, written by the old engine that still had init = seeded and the flood-fill "
             "food supply; its history cannot be verified (SPEC section 0). Start from a new soup.", path);
-    if (ver != CKPT_VERSION) die("unsupported checkpoint version %d", ver);
+    if (ver != CKPT_VERSION && ver != 3) die("unsupported checkpoint version %d", ver);
     freadx(&N, 4, 1, f, "N");
     freadx(&ml, 4, 1, f, "mlen");
     freadx(&nH, 4, 1, f, "nH");
+    int32_t arch = ARCH_LINEAR;
+    if (ver == 3) freadx(&arch, 4, 1, f, "arch");
     freadx(&step, 8, 1, f, "step");
     freadx(&time, 8, 1, f, "time");
     freadx(&L, 8, 1, f, "L");
@@ -1703,7 +1974,7 @@ static void read_ckpt(Sys *s, const Params *P, const char *path) {
     freadx(&da, 8, 1, f, "dt_anchor");
     uint64_t soup_seed;
     freadx(&soup_seed, 8, 1, f, "soup_seed");
-    if (ml != P->lip_nH + P->lip_nT || nH != P->lip_nH) die("checkpoint lipid architecture differs from parameters");
+    if (ml != g_mol.mlen || nH != g_mol.nH || arch != g_mol.arch) die("checkpoint lipid architecture differs from parameters");
     if (fabs(L - P->L) > 1e-12) die("checkpoint L=%g differs from parameter L=%g", L, P->L);
     sys_alloc(s, N, L, ml, nH, P->threads, P->nsub);
     s->step = step;
@@ -1899,7 +2170,7 @@ int main(int argc, char **argv) {
 
     Sys S, *s = &S;
     const int restarting = P.restart[0] != 0;
-    const int mlen = P.lip_nH + P.lip_nT;
+    const int mlen = g_mol.mlen;
     double t_start = wtime();
     if (restarting) {
         read_ckpt(s, &P, P.restart);
@@ -1916,7 +2187,7 @@ int main(int argc, char **argv) {
     } else {
         const int N = (int)lround(P.rho * P.L * P.L);
         if (strcmp(P.init, "soup")) die("init = %s needs restart = <checkpoint>", P.init);
-        sys_alloc(s, N, P.L, mlen, P.lip_nH, P.threads, P.nsub);
+        sys_alloc(s, N, P.L, mlen, g_mol.nH, P.threads, P.nsub);
         s->seed = P.seed;
         s->soup_seed = P.seed;
         rng_seed(&s->rng, P.seed);

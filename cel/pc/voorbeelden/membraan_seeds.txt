@@ -1,0 +1,9 @@
+# Herhaling van het membraanresultaat van team A met 16 verschillende willekeurige soepen.
+# Doel: hoe robuust is "vesikels ontstaan vanzelf"? (chemie uit, zoals in de ini)
+#   python3 pc/sweep.py pc/voorbeelden/membraan_seeds.txt --achtergrond
+# 16 jobs x 2 threads; L = 100, 100.000 stappen (~1 u per job op één Threadripper-kern-paar).
+naam  = membraan_seeds
+basis = notes/membranen/teamA_membranes.ini
+seeds = 1-16
+steps = 100000
+snap_every = 2000

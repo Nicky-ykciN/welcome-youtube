@@ -9,6 +9,8 @@
 #   3. stats.csv, events.csv, the final checkpoint and every snapshot present in both runs must be
 #      bitwise identical to the reference; never two engines on the same directory.
 # usage: pc/tests/test_longrun_kill.sh [outdir]      (default pc/_test/kill; ~2-3 minutes)
+#   ENGINE=path/to/binary  test another engine with the same CLI (e.g. engine_gpu/oercel_emu or oercel_gpu)
+#   KILL_STEPS="a b c"     steps at which to kill (default "10000 25000 40000"); OV=...  engine overrides
 set -u
 cd "$(dirname "$0")/../.." || exit 1     # -> cel/
 OUT=${1:-pc/_test/kill}
@@ -16,7 +18,10 @@ RUNS=$OUT/runs
 NAME=k1
 RD=$RUNS/$NAME
 INI=engine/params/soup_small.ini
-OV="L=48 steps=60000 snap_every=1000 ckpt_every=3000 stats_every=100 log_every=5000"
+OV=${OV:-"L=48 steps=60000 snap_every=1000 ckpt_every=3000 stats_every=100 log_every=5000"}
+ENGINE=${ENGINE:-engine/oercel}
+read -r K1 K2 K3 <<< "${KILL_STEPS:-10000 25000 40000}"
+export OERCEL_NO_BUILD=1
 rm -rf "$OUT"; mkdir -p "$RUNS"
 fails=0
 pass() { echo "PASS  $*"; }
@@ -38,22 +43,22 @@ start_sup() {
 }
 
 echo "== reference run (engine directly, uninterrupted) =="
-engine/oercel $INI $OUT/ref $OV threads=1 >/dev/null || fail "reference run"
+$ENGINE $INI $OUT/ref $OV threads=1 >/dev/null || fail "reference run"
 
 echo "== supervised run =="
-start_sup --ini $INI --set $OV --engine cpu --threads 1 --chunk-min 0.15 --analyse-uur 0 --analyse-jobs 1 --width 800 --keep-recent 1000 --poll 1
-wait_step 10000 120 || fail "no progress"
+start_sup --ini $INI --set $OV --engine $ENGINE --threads 1 --chunk-min 0.15 --analyse-uur 0 --analyse-jobs 1 --width 800 --keep-recent 1000 --poll 1
+wait_step $K1 240 || fail "no progress"
 E=$(engines); echo "  a) kill -9 engine $E at step $(step)"
 kill -9 $E
 sleep 1
-wait_step 25000 180 || fail "no progress after engine kill"
+wait_step $K2 300 || fail "no progress after engine kill"
 S=$(sup_pid); E=$(engines); echo "  b) kill -9 supervisor $S at step $(step) (engine $E should stop by itself)"
 kill -9 $S
 t=0; while [ -n "$(engines)" ] && [ $t -lt 60 ]; do sleep 0.5; t=$((t + 1)); done
 [ -z "$(engines)" ] && pass "engine stopped after its supervisor was killed (PR_SET_PDEATHSIG)" || fail "engine $(engines) kept running without supervisor"
 grep -q "stopping at step .* (signal)" $RD/log.txt && pass "engine wrote a checkpoint on the way out: $(grep 'stopping at step' $RD/log.txt | tail -1)" || fail "no clean stop in log.txt"
 start_sup
-wait_step 40000 180 || fail "no progress after supervisor restart"
+wait_step $K3 300 || fail "no progress after supervisor restart"
 S=$(sup_pid); E=$(engines); echo "  c) kill -9 supervisor $S and engine $E together at step $(step) (power cut)"
 kill -9 $S $E
 sleep 1

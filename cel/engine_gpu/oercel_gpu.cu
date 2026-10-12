@@ -247,7 +247,7 @@ HD inline double pair_theta(uint64_t sseed, uint32_t gi, uint32_t gj) {
 HD inline float pair_theta_f(uint64_t sseed, uint32_t gi, uint32_t gj) {
     const uint64_t key = gi < gj ? (((uint64_t)gi << 32) | gj) : (((uint64_t)gj << 32) | gi);
     const uint64_t h = mix13((key * 0x9e3779b97f4a7c15ULL) ^ sseed);
-    return (float)(int64_t)h * (float)(SQRT12 / 18446744073709551616.0);
+    return (float)(int32_t)(uint32_t)(h >> 32) * (float)(SQRT12 / 4294967296.0); /* int32 -> float is native on GPUs */
 }
 /* counter-based uniform deviates for order-independent decisions (reference) */
 HD inline uint64_t hash_key(uint64_t seed, int64_t step, uint64_t salt) {
@@ -1121,6 +1121,7 @@ HD inline int cell_of(const Dev &D, double x, double y) {
  * by one thread per cell without atomics on positions.  If R > RMAX_GATHER, or at start
  * / restart, a stable counting sort on the host computes the same permutation. */
 static double g_t_sortfull = 0;
+static long g_nsortfull = 0, g_maxR = 0; /* diagnostics: host full sorts, largest gather radius */
 static void sort_cells(Sys *s, int full, int permf) {
     Dev D = s->d;
     const int N = D.N, nc = D.ncell;
@@ -1150,6 +1151,7 @@ static void sort_cells(Sys *s, int full, int permf) {
         Status h = get_status(s);
         if (h.err) check_err(s, "sort");
         R = h.maxdc < 1 ? 1 : h.maxdc;
+        if (R > g_maxR) g_maxR = R;
         if (R > RMAX_GATHER || 2 * R + 1 > D.ncx || 2 * R + 1 > D.ncy) full = 1;
     }
     int *csn = s->cstart2;
@@ -1203,6 +1205,7 @@ static void sort_cells(Sys *s, int full, int permf) {
         free(pos);
         pfor(N, KL(int d) { dest[src[d]] = d; });
         g_t_sortfull += wtime() - t0;
+        g_nsortfull++;
     }
     double *fx2 = NULL, *fy2 = NULL;
     if (permf) {
@@ -1550,6 +1553,45 @@ HD inline void relax_new_chain(const Dev &D, const ChemPar &C, const int *sl) {
     int nnb = 0;
     const double reach = 1.0 + cap * C.syn_relax;
     const double reach2 = reach * reach;
+    /* neighbours within reach of any chain bead, collected once.  Fast path: one pass over
+     * the bounding box of cells around the chain (each cell once, no duplicates); the same set
+     * as the reference's per-bead windows, in a different order.  Tiny boxes, where the
+     * bounding box would wrap onto itself, use the reference's per-bead loop. */
+    {
+        const double x0 = D.x[sl[0]], y0 = D.y[sl[0]];
+        double rxb[MAXMLEN], ryb[MAXMLEN], mnx = 0, mxx = 0, mny = 0, mxy = 0;
+        for (int b = 0; b < ml; b++) {
+            rxb[b] = minimg(D.x[sl[b]] - x0, L);
+            ryb[b] = minimg(D.y[sl[b]] - y0, L);
+            mnx = fmin(mnx, rxb[b]); mxx = fmax(mxx, rxb[b]);
+            mny = fmin(mny, ryb[b]); mxy = fmax(mxy, ryb[b]);
+        }
+        const double R = reach + CHEM_MARGIN;
+        const int cx0 = (int)floor((x0 + mnx - R) * D.icsx), cx1 = (int)floor((x0 + mxx + R) * D.icsx);
+        const int cy0 = (int)floor((y0 + mny - R) * D.icsy), cy1 = (int)floor((y0 + mxy + R) * D.icsy);
+        if (cx1 - cx0 + 1 <= D.ncx && cy1 - cy0 + 1 <= D.ncy) {
+            for (int cyy = cy0; cyy <= cy1; cyy++) {
+                const int yy = ((cyy % D.ncy) + D.ncy) % D.ncy;
+                for (int cxx = cx0; cxx <= cx1; cxx++) {
+                    const int cc = yy * D.ncx + ((cxx % D.ncx) + D.ncx) % D.ncx;
+                    for (int j = D.cstart[cc]; j < D.cstart[cc + 1]; j++) {
+                        int skip = 0;
+                        for (int q = 0; q < ml; q++) skip |= j == sl[q];
+                        if (skip) continue;
+                        const double dx = minimg(D.x[j] - x0, L), dy = minimg(D.y[j] - y0, L);
+                        int near = 0;
+                        for (int b = 0; b < ml && !near; b++) {
+                            /* minimum image again: in small boxes dx - rxb can exceed L/2 */
+                            const double ex = minimg(dx - rxb[b], L), ey = minimg(dy - ryb[b], L);
+                            near = ex * ex + ey * ey < reach2;
+                        }
+                        if (near && nnb < MAXNB) nbj[nnb++] = j;
+                    }
+                }
+            }
+            goto collected;
+        }
+    }
     for (int b = 0; b < ml && nnb < MAXNB; b++) {
         const double px = D.x[sl[b]], py = D.y[sl[b]];
         const int c = cell_of(D, px, py), cx = c % D.ncx, cy = c / D.ncx;
@@ -1568,6 +1610,7 @@ HD inline void relax_new_chain(const Dev &D, const ChemPar &C, const int *sl) {
             }
         }
     }
+collected:
     for (int it = 0; it < C.syn_relax; it++) {
         double fx[MAXMLEN], fy[MAXMLEN];
         for (int b = 0; b < ml; b++) fx[b] = fy[b] = 0.0;
@@ -1698,6 +1741,7 @@ static void ensure_ev(Sys *s, long extra) {
 
 static double g_t_react = 0, g_t_decay = 0, g_t_feed = 0;
 static long g_rounds = 0, g_nact_tot = 0;
+static int g_chem_serial = 0; /* OERCEL_CHEM_SERIAL=1: reactions strictly serial (test oracle, slow) */
 
 /* One chemistry check: reactions, decay, food supply (in this order, as the reference).
  *
@@ -1791,7 +1835,7 @@ static void chemistry(Sys *s, const Params *P, int64_t step) {
             d2h(hg.data(), s->actg, nact * sizeof(uint32_t));
             const uint64_t kp = hash_key(s->seed, step, 24);
             std::vector<std::pair<uint64_t, int> > pr(nact);
-            for (int q = 0; q < nact; q++) pr[q] = std::make_pair(hash_u64(kp, hg[q]) ^ 0, q);
+            for (int q = 0; q < nact; q++) pr[q] = std::make_pair(hash_u64(kp, hg[q]), q);
             std::sort(pr.begin(), pr.end(), [&](const std::pair<uint64_t, int> &a, const std::pair<uint64_t, int> &b) {
                 return a.first != b.first ? a.first < b.first : hg[a.second] < hg[b.second];
             });
@@ -1806,6 +1850,15 @@ static void chemistry(Sys *s, const Params *P, int64_t step) {
             int *actlist = s->actlist, *done = s->done, *claimed = s->claimed;
             const int RL = C.RL;
             int ndone = 0, rounds = 0;
+            if (g_chem_serial) {
+                /* test oracle (OERCEL_CHEM_SERIAL=1): the plain serial loop in priority order; the
+                 * lock rounds below must give bitwise the same result (selftest section 2) */
+                pfor_dyn(1, KL(int) {
+                    for (int r = 0; r < nact; r++) chem_react(D, C, actlist[r], r);
+                });
+                ndone = nact;
+                rounds = nact;
+            }
             while (ndone < nact) {
                 pfor(nact, KL(int r) {
                     if (done[r]) return;
@@ -2859,6 +2912,8 @@ int main(int argc, char **argv) {
     int64_t lastlog_step = s->step;
     int stopped_early = 0;
     const int prof = getenv("OERCEL_PROFILE") && atoi(getenv("OERCEL_PROFILE")) > 0;
+    g_chem_serial = getenv("OERCEL_CHEM_SERIAL") && atoi(getenv("OERCEL_CHEM_SERIAL")) > 0;
+    if (g_chem_serial) logmsg("OERCEL_CHEM_SERIAL=1: reactions run strictly serially (test mode)\n");
     double tm_integ = 0, tm_chem = 0, tm_sort = 0, tm_force = 0, tm_io = 0;
     logmsg("setup %.3f s\n", t_loop0 - t_start);
 
@@ -2965,6 +3020,8 @@ int main(int argc, char **argv) {
                1e3 * tm_io / nst, prof ? "" : " [phases overlap on the GPU unless OERCEL_PROFILE=1]");
         logmsg("chemistry per step: reactions %.4f, decay %.4f, feed %.4f ms; %ld active catalysts in %ld rounds\n",
                1e3 * g_t_react / nst, 1e3 * g_t_decay / nst, 1e3 * g_t_feed / nst, g_nact_tot, g_rounds);
+        logmsg("cell sort: largest per-step cell displacement %ld; %ld host full sorts (%.3f s; start/restart included)\n", g_maxR,
+               g_nsortfull, g_t_sortfull);
     }
     logmsg("done at step %lld%s\n", (long long)s->step, stopped_early ? " (stopped early; restart to continue)" : "");
     if (g_log) fclose(g_log);

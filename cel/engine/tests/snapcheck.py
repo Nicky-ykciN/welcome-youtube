@@ -28,16 +28,19 @@ def read_snap(path):
     return dict(ver=ver, N=N, nb=nb, step=step, time=time, L=L, x=x, y=y, t=t, bonds=bonds)
 
 def read_ckpt(path):
-    """engine checkpoint (format version 2, see engine/README.md); arrays in gid order,
-    with the full velocity v = vh + dt/2 f."""
+    """engine checkpoint (format version 2, or 3 = 2 + lipid architecture code, see
+    engine/README.md); arrays in gid order, with the full velocity v = vh + dt/2 f."""
     with open(path, 'rb') as f:
         b = f.read()
     if b[:4] != b'OCKP':
         raise SystemExit('bad checkpoint magic')
     ver, N, ml, nH = struct.unpack_from('<iiii', b, 4)
-    if ver != 2:
+    if ver not in (2, 3):
         raise SystemExit(f'checkpoint version {ver} not supported')
     o = 20
+    arch = 0                                  # 0 linear, 1 pi, 2 y, 3 bola
+    if ver == 3:
+        arch, = struct.unpack_from('<i', b, o); o += 4
     step, time, L, seed = struct.unpack_from('<qddQ', b, o); o += 32
     o += 32                                   # rng state
     maxbond, warm_end, t_anchor, step_anchor, dt, soup_seed = struct.unpack_from('<dqdqdQ', b, o); o += 48
@@ -50,7 +53,7 @@ def read_ckpt(path):
     assert b[o:o + 4] == b'END!' and o + 4 == len(b)
     order = np.argsort(gid)
     v = lambda a: a[order]
-    return dict(N=N, step=step, time=time, L=L, dt=dt, seed=seed, soup_seed=soup_seed, t=v(typ),
+    return dict(N=N, ver=ver, mlen=ml, nH=nH, arch=arch, step=step, time=time, L=L, dt=dt, seed=seed, soup_seed=soup_seed, t=v(typ),
                 x=v(x), y=v(y), vx=v(vx + 0.5 * dt * fx), vy=v(vy + 0.5 * dt * fy))
 
 def mi(d, L):

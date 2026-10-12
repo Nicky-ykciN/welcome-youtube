@@ -41,8 +41,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pclib as P  # noqa: E402
 
 STATE = "pc_sweep.json"
+STOP_REQ = "pc_stop_verzoek"      # written by --stop: a deliberate stop (status.py --hervat leaves it alone)
 VERSION = 1
 MAX_FAILURES = 4
+GPU_PARALLEL_DEFAULT = 4          # jobs at a time when every job runs on the (single) GPU
+CKPT_ERR_RE = re.compile(r"checkpoint|ckpt", re.I)
 
 SPECIAL = {"naam": "name", "name": "name", "basis": "base", "base": "base", "seeds": "seeds", "zet": "set",
            "set": "set", "engine": "engine", "threads": "threads", "jobs": "jobs", "parallel": "jobs"}
@@ -242,9 +245,9 @@ class Sweep:
                 s["status"] = "wacht"
             if s["status"] in ("analyse", "analyse_fout"):
                 s["status"] = "klaar"
-            if s["status"] == "fout":       # a new start gives failed jobs a new chance
+            if s["status"] == "fout":       # a new start gives failed jobs (and their checkpoints) a new chance
                 self.log(f"{j['name']}: eerder mislukt ({s.get('last_error')}); nieuwe poging")
-                s.update(status="wacht", fails=0, not_before=0)
+                s.update(status="wacht", fails=0, not_before=0, bad_ckpts=[])
             if s["status"] == "wacht" and os.path.isdir(d) and P.is_finished(d, self.target(j)):
                 s["status"] = "klaar"
         self.save()
@@ -279,7 +282,9 @@ class Sweep:
         s["status"] = "loopt"
         s["chunks"] += 1
         s.setdefault("started", P.stamp())
-        self.slots.append(dict(kind="engine", job=j, proc=p, t0=time.time(), step0=P.current_step(d), restart=restart))
+        s0 = P.ckpt_step(restart) if restart else 0
+        self.slots.append(dict(kind="engine", job=j, proc=p, t0=time.time(), restart=restart,
+                               step0=s0 if s0 is not None else P.current_step(d)))
 
     def start_analysis(self, j):
         d = self.jdir(j)
@@ -298,6 +303,9 @@ class Sweep:
         d = self.jdir(j)
         rc = sl["proc"].returncode
         if sl["kind"] == "analyse":
+            if self.stop_req and rc != 0:     # interrupted by --stop / shutdown: analyse again next time
+                s["status"] = "klaar"
+                return
             if rc == 0 and os.path.exists(os.path.join(d, "checklist.json")):
                 s["status"] = "geanalyseerd"
                 s["analysed_step"] = P.current_step(d)
@@ -308,11 +316,11 @@ class Sweep:
                 self.log(f"{j['name']}: analyse mislukt: {s['last_error']}")
                 self.summary_dirty = True
             return
-        if self.stop_req:
+        if self.stop_req or sl.get("paused"):   # stopped by us (stop request, or disk almost full): no failure
             s["status"] = "wacht"
             return
-        step = P.current_step(d)
-        if rc == 0:
+        step = P.durable_step(d)
+        if rc == 0 and (step > sl["step0"] or P.is_finished(d, self.target(j))):
             s["fails"] = 0
             if P.is_finished(d, self.target(j)):
                 s["status"] = "klaar"
@@ -323,11 +331,14 @@ class Sweep:
             return
         s["crashes"] += 1
         s["fails"] = s["fails"] + 1 if step <= sl["step0"] else 1
+        rc = rc if rc != 0 else -1000   # clean exit without progress counts as a failure
         tail = P.tail_text(os.path.join(d, "pc_engine.out"), 400).strip().splitlines()
         s["last_error"] = (tail[-1] if tail and not tail[-1].startswith("[") else None) or \
-            (f"engine gedood door signaal {-rc}" if rc < 0 else f"code {rc}")
+            ("engine stopte zonder voortgang" if rc == -1000 else f"engine gedood door signaal {-rc}" if rc < 0 else f"code {rc}")
         self.log(f"{j['name']}: engine gestopt met code {rc} bij stap {P.fmt_int(step)} (poging {s['fails']}): {s['last_error']}")
-        if sl.get("restart") and step <= sl["step0"] and time.time() - sl["t0"] < 60 and s["fails"] >= 2:
+        # only a failure that points at the checkpoint itself marks it bad (not a kill, full disk, missing GPU, ...)
+        ckpt_fault = bool(CKPT_ERR_RE.search(str(s["last_error"]))) or rc in (-signal.SIGSEGV, -signal.SIGBUS, -signal.SIGABRT)
+        if sl.get("restart") and step <= sl["step0"] and time.time() - sl["t0"] < 60 and s["fails"] >= 2 and ckpt_fault:
             s.setdefault("bad_ckpts", []).append(f"{os.path.basename(sl['restart'])}:{P.ckpt_step(sl['restart'])}")
         if s["fails"] >= MAX_FAILURES:
             s["status"] = "fout"
@@ -339,6 +350,11 @@ class Sweep:
     def run(self, poll=2.0):
         st = self.st
         st["supervisor_state"] = "loopt"
+        st.pop("stopped_by", None)
+        try:
+            os.unlink(os.path.join(self.sdir, STOP_REQ))
+        except OSError:
+            pass
         self.prepare()
         nslots = int(st["parallel"])
         self.log(f"sweep {st['name']}: {len(st['jobs'])} jobs, {nslots} tegelijk x {st['threads']} threads, "
@@ -364,8 +380,22 @@ class Sweep:
                 if j["name"] not in busy and self.js(j)["status"] == "klaar":
                     self.start_analysis(j)
                     free -= 1
+            low = (P.disk_free(self.sdir) or 1 << 62) < float(st.get("min_free_gb", 10)) * 1024 ** 3
+            if low and not getattr(self, "_low_logged", False):
+                self.log(f"SCHIJF BIJNA VOL (< {st.get('min_free_gb', 10)} GB vrij op de {P.disk_free_detail(self.sdir)[1]}): "
+                         f"lopende jobs stoppen netjes "
+                         f"(checkpoint), geen nieuwe chunks tot er weer ruimte is")
+            if low:
+                for sl in self.slots:
+                    if sl["kind"] == "engine" and not sl.get("paused") and sl["proc"].poll() is None:
+                        sl["paused"] = True
+                        try:
+                            sl["proc"].send_signal(signal.SIGTERM)
+                        except OSError:
+                            pass
+            self._low_logged = low
             for j in active:
-                if free <= 0:
+                if free <= 0 or low:
                     break
                 s = self.js(j)
                 if j["name"] not in busy and s["status"] == "wacht" and time.time() >= s.get("not_before", 0):
@@ -386,6 +416,8 @@ class Sweep:
         states = [self.js(j)["status"] for j in st["jobs"] if j["name"] in st["active"]]
         st["supervisor_state"] = "gestopt" if self.stop_req else "klaar"
         st["supervisor_end"] = P.stamp()
+        if self.stop_req:   # --stop leaves a marker; without it the SIGTERM came from a shutdown -> --hervat resumes
+            st["stopped_by"] = "gebruiker" if os.path.exists(os.path.join(self.sdir, STOP_REQ)) else "signaal"
         self.write_reports(force=True)
         self.save()
         if self.stop_req:
@@ -484,7 +516,8 @@ def summary(sdir, st):
     if rest:
         L += ["", "## Nog niet geanalyseerd", ""]
         for j, s in rest:
-            L.append(f"- {j['name']}: {s.get('status', 'wacht')}" + (f" — {s['last_error']}" if s.get("last_error") else ""))
+            L.append(f"- {j['name']}: {P.JOB_LABEL.get(s.get('status', 'wacht'), s.get('status'))}"
+                     + (f" — {s['last_error']}" if s.get("last_error") else ""))
     if done_sorted:
         j, a = done_sorted[0]
         L += ["", f"## Beste job: {j['name']}", ""]
@@ -530,14 +563,17 @@ def sweep_status_md(sdir, st):
             running.append(f"{j['name']} {P.fmt_float(100.0 * cur / max(1, tgt), 0)} %")
     holder = P.lock_holder(sdir)
     L = [f"# Sweep {st['name']}", "", f"_bijgewerkt {P.stamp()}_", "",
-         f"- supervisor: " + (f"{st['supervisor_state']} ({st.get('supervisor_end', '')})"
-                              if st.get("supervisor_state") in ("klaar", "gestopt")
+         f"- supervisor: " + ("onderbroken door een stopsignaal (afsluiten van WSL/Windows?); hervatten: zie onder"
+                              if st.get("supervisor_state") == "gestopt" and st.get("stopped_by") == "signaal" and not holder
+                              else f"{st['supervisor_state']} ({st.get('supervisor_end', '')})"
+                              if st.get("supervisor_state") in ("klaar", "gestopt") and not holder
                               else (f"loopt (pid {holder})" if holder else "draait niet (hervatten: zie onder)")),
-         f"- jobs: {len(jobs)} — " + ", ".join(f"{v} {k}" for k, v in sorted(cnt.items())),
+         f"- jobs: {len(jobs)} — " + ", ".join(f"{v} {P.JOB_LABEL.get(k, k)}" for k, v in sorted(cnt.items())),
          f"- voortgang (stappen): {P.fmt_float(100.0 * tot_c / max(1, tot_t), 1)} %",
          f"- {st['parallel']} tegelijk × {st['threads']} threads, {st['engine']}-engine",
          f"- bezig: {', '.join(running[:20]) + (' ...' if len(running) > 20 else '') if running else '—'}",
-         "", "Ranglijst: `SAMENVATTING.md`. Hervatten: `python3 pc/sweep.py --hervat " + st["name"] + " --achtergrond`", ""]
+         "", "Ranglijst: `SAMENVATTING.md`. Hervatten (vanuit de hoofdmap van de repo): `"
+         + P.shown_cmd("sweep.py", f"--hervat {st['name']} --achtergrond{P.runs_arg(sdir)}", for_file=True) + "`", ""]
     fouten = [(j["name"], st["state"][j["name"]].get("last_error")) for j in jobs
               if st["state"].get(j["name"], {}).get("status") in ("fout", "analyse_fout")]
     if fouten:
@@ -575,6 +611,11 @@ def main():
         if not pid or pid == "?":
             print(f"{a.stop}: geen draaiende sweep")
             return 0
+        try:
+            with open(os.path.join(sdir, STOP_REQ), "w") as f:
+                f.write(f"{P.stamp()} pid {os.getpid()}\n")
+        except OSError:
+            pass
         os.kill(int(pid), signal.SIGTERM)
         print(f"{a.stop}: stopsignaal naar pid {pid}; jobs schrijven een checkpoint ...")
         t0 = time.time()
@@ -593,6 +634,7 @@ def main():
         print(md)
         return 0
 
+    n_added = 0
     if a.hervat:
         name = a.hervat
         sdir = os.path.join(runs, name)
@@ -629,6 +671,9 @@ def main():
                                  f"Gebruik --engine PAD met een engine die ze wel kent.")
             thr = a.threads or (int(d["threads"]) if d["threads"] else 2)
             par = a.jobs or (int(d["jobs"]) if d["jobs"] else max(1, (P.cpu_count() - a.reserve) // thr))
+            if label == "gpu" and not (a.jobs or d["jobs"]) and par > GPU_PARALLEL_DEFAULT:
+                par = GPU_PARALLEL_DEFAULT
+                print(f"GPU-engine: standaard {par} jobs tegelijk (ze delen één GPU); anders --jobs N")
             st = dict(kind="sweep", version=VERSION, name=name, created=P.stamp(), jobfile_source=os.path.abspath(a.jobbestand),
                       base_source=os.path.relpath(base, P.CEL), base_steps=base_kv.get("steps"), engine=label,
                       engine_path=binary, engine_sha1=P.file_sha1(binary), threads=thr, parallel=par,
@@ -654,6 +699,7 @@ def main():
             if conflicts:
                 raise SystemExit(f"jobs met dezelfde naam maar andere parameters: {', '.join(conflicts)}; kies een nieuwe sweepnaam")
             added = [j for j in jobs if j["name"] not in old]
+            n_added = len(added)
             st["jobs"] += added
             st["active"] = [j["name"] for j in jobs]
             if added:
@@ -683,8 +729,22 @@ def main():
 
     holder = P.lock_holder(sdir)
     if holder:
-        print(f"{name}: sweep draait al (pid {holder}); status: runs/{name}/STATUS.md")
+        print(f"{name}: sweep draait al (pid {holder}); status: {P.shown_path(os.path.join(sdir, 'STATUS.md'))}")
+        changed = [o for o, v in (("--jobs", a.jobs), ("--threads", a.threads), ("--chunk-min", a.chunk_min))
+                   if v] + (["--heranalyse"] if a.heranalyse else []) + ([f"{n_added} nieuwe jobs"] if n_added else [])
+        if changed:
+            print(f"  NIET TOEGEPAST: {', '.join(changed)}. Een draaiende sweep neemt geen wijzigingen aan; "
+                  f"eerst: {P.shown_cmd('sweep.py', '--stop ' + name + P.runs_arg(sdir))}   en dan dit commando opnieuw.")
+            return 1
         return 0
+    if P.on_windows_drive(sdir):
+        print("LET OP: de repo staat op de Windows-schijf (/mnt/...): alles is daar veel trager. "
+              "Beter: de repo in je Linux-thuismap (~) clonen; zie pc/setup_wsl.sh.")
+    n_other, t_other = P.engine_threads_in_use(exclude_dirs=[sdir])
+    if n_other and t_other + int(st["parallel"]) * int(st["threads"]) > P.cpu_count():
+        print(f"LET OP: er draaien al {n_other} engine-processen met samen {t_other} threads; deze sweep wil "
+              f"{st['parallel']} x {st['threads']} threads op {P.cpu_count()} CPU's: overboekt, alles wordt trager. "
+              f"Overweeg --jobs {max(1, (P.cpu_count() - t_other - 2) // max(1, int(st['threads'])))}.")
     P.write_json_atomic(os.path.join(sdir, STATE), st)
     if a.achtergrond:
         argv = ["--hervat", name] + (["--runs-dir", a.runs_dir] if a.runs_dir else []) + ["--poll", str(a.poll)]
@@ -692,7 +752,7 @@ def main():
         time.sleep(1.5)
         print(f"{name}: sweep gestart op de achtergrond (pid {pid}); {len(st['active'])} jobs, "
               f"{st['parallel']} tegelijk x {st['threads']} threads")
-        print(f"  voortgang: python3 pc/status.py   ·   ranglijst: {os.path.join(sdir, 'SAMENVATTING.md')}")
+        print(f"  voortgang: {P.shown_cmd('status.py')}   ·   ranglijst: {os.path.join(sdir, 'SAMENVATTING.md')}")
         return 0
     try:
         lock = P.DirLock(sdir).acquire()

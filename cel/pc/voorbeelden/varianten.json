@@ -1,0 +1,13 @@
+{
+  "naam": "voorbeeld_json",
+  "basis": "notes/membranen/teamA_membranes.ini",
+  "seeds": [1, 2, 3],
+  "zet": {"steps": 100000, "snap_every": 2000},
+  "varianten": {
+    "referentie": {},
+    "stijver":    {"k_angle": 25},
+    "roeren":     {"stir_A": 1e-4},
+    "dag_nacht":  {"kT_amp": 0.05, "kT_period": 3000}
+  },
+  "raster": {"a_N_T": [60, 65]}
+}

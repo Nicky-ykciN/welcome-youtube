@@ -2,6 +2,7 @@ oercel_gpu
 oercel_emu
 build/
 testruns/
+.cuda/
 *.o
 __pycache__/
 nvcc.log

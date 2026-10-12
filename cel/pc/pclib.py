@@ -25,9 +25,38 @@ CEL = os.path.dirname(PC)
 ENGINE_DIR = os.path.join(CEL, "engine")
 ENGINE_CPU = os.path.join(ENGINE_DIR, "oercel")
 ENGINE_GPU_DIR = os.path.join(CEL, "engine_gpu")
-ENGINE_GPU = os.path.join(ENGINE_GPU_DIR, "oercel_gpu")
+ENGINE_GPU = os.environ.get("OERCEL_ENGINE_GPU") or os.path.join(ENGINE_GPU_DIR, "oercel_gpu")  # env: tests only
 TOOLS = os.path.join(CEL, "tools")
 VENV_PY = os.path.join(PC, ".venv", "bin", "python")
+
+
+REPO = os.path.dirname(CEL)
+
+
+def shown_cmd(script, args="", for_file=False):
+    """A pc/ command line to show to a person or to Claude.  In files (STATUS.md, logs) relative to the
+    repository root, where the README's commands are typed (python3 cel/pc/...); on the terminal relative
+    to the current directory when that is inside the repository, else absolute."""
+    p = os.path.join(PC, script)
+    if for_file:
+        rel = os.path.relpath(p, REPO)
+    else:
+        rel = os.path.relpath(p, os.getcwd())
+        if rel.startswith(".."):
+            rel = p
+    return f"python3 {rel}" + (f" {args}" if args else "")
+
+
+def shown_path(p):
+    """p relative to the current directory when that is inside the repository, else absolute."""
+    rel = os.path.relpath(p, os.getcwd())
+    return p if rel.startswith("..") else rel
+
+
+def runs_arg(d):
+    """' --runs-dir /abs/path' when directory d is not directly in the default runs/ directory."""
+    parent = os.path.dirname(os.path.abspath(d))
+    return "" if parent == runs_dir() else f" --runs-dir {parent}"
 
 
 def runs_dir(arg=None):
@@ -200,6 +229,10 @@ def parse_kv_list(items):
     return out
 
 
+# Dutch labels for the job states of a sweep (pc_sweep.json keeps the short keys)
+JOB_LABEL = {"wacht": "wachtend", "loopt": "lopend", "klaar": "klaar (analyse volgt)", "analyse": "in analyse",
+             "geanalyseerd": "geanalyseerd", "fout": "MISLUKT", "analyse_fout": "analyse MISLUKT"}
+
 # keys the supervisors set themselves; they must not come from job files or overrides
 RESERVED_KEYS = {"restart", "walltime", "threads", "ckpt_keep"}
 
@@ -300,8 +333,9 @@ def ensure_built(kind, logf=None):
         return True
     log(f"engine bouwen: make -C {os.path.relpath(d, CEL)} {' '.join(target)}", logf)
     env = dict(os.environ)
-    if os.path.isdir("/usr/local/cuda/bin") and "/usr/local/cuda/bin" not in env.get("PATH", ""):
-        env["PATH"] = "/usr/local/cuda/bin:" + env.get("PATH", "")
+    for cb in (os.path.join(ENGINE_GPU_DIR, ".cuda", "bin"), "/usr/local/cuda/bin"):  # local (no-root) nvcc, system toolkit
+        if os.path.isdir(cb) and cb not in env.get("PATH", "").split(":"):
+            env["PATH"] = cb + ":" + env.get("PATH", "")
     r = subprocess.run(["make", "-C", d] + target, capture_output=True, text=True, env=env)
     if r.returncode != 0:
         log(f"FOUT bij bouwen van {d}:\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}", logf)
@@ -309,21 +343,82 @@ def ensure_built(kind, logf=None):
     return os.path.exists(b)
 
 
+BUILD_DIR = os.path.join(PC, "_build")                       # git-ignored
+# written by setup_wsl.sh / cache of gpu_smoke_test(); the env variables are for tests only
+GPU_SELFTEST_FILE = os.environ.get("OERCEL_GPU_SELFTEST_FILE") or os.path.join(BUILD_DIR, "gpu_selftest.json")
+GPU_SMOKE_FILE = os.environ.get("OERCEL_GPU_SMOKE_FILE") or os.path.join(BUILD_DIR, "gpu_smoke.json")
+
+
+def gpu_smoke_test(binary, timeout=180):
+    """(ok, message): does `binary` really run on this machine?  A 20-step soup (L=32) in a
+    temporary directory; the result is cached per binary checksum in pc/_build/gpu_smoke.json, so
+    a rebuilt binary is tested again.  Nothing here touches a real run."""
+    import tempfile
+    sha = file_sha1(binary)
+    cache = read_json(GPU_SMOKE_FILE, {}) or {}
+    c = cache.get(sha) if sha else None
+    if c is not None and c.get("ok"):
+        return True, c.get("msg", "")
+    tmp = tempfile.mkdtemp(prefix="oercel_gpu_smoke_")
+    try:
+        r = subprocess.run([binary, "/dev/null", os.path.join(tmp, "r"), "L=32", "steps=20", "snap_every=0",
+                            "log_every=0", "threads=1"], capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+        lg = tail_text(os.path.join(tmp, "r", "log.txt"), 4096)
+        ok = r.returncode == 0 and "done at step 20" in lg
+        err = [l for l in (r.stderr + r.stdout).splitlines() if l.strip()]
+        msg = "proefrun van 20 stappen gelukt" if ok else (f"proefrun mislukt (code {r.returncode}): "
+                                                           + (err[-1] if err else "geen melding"))[:300]
+    except subprocess.TimeoutExpired:
+        ok, msg = False, f"proefrun van 20 stappen duurde langer dan {timeout} s"
+    except OSError as e:
+        ok, msg = False, f"proefrun kon niet starten: {e}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if sha:
+        try:
+            os.makedirs(os.path.dirname(GPU_SMOKE_FILE), exist_ok=True)
+            cache[sha] = dict(ok=ok, msg=msg, time=stamp(), binary=binary)
+            write_json_atomic(GPU_SMOKE_FILE, cache)
+        except OSError:
+            pass
+    return ok, msg
+
+
+def gpu_engine_check(binary=None):
+    """(ok, reason) for using the GPU engine: the binary exists, nvidia-smi sees a GPU, the setup's
+    GPU self-test did not FAIL for exactly this binary, and a 20-step proefrun works."""
+    b = binary or ENGINE_GPU
+    if not (os.path.isfile(b) and os.access(b, os.X_OK)):
+        return False, f"{os.path.relpath(b, CEL)} ontbreekt of kon niet gebouwd worden"
+    if gpu_info() is None:
+        return False, "nvidia-smi ziet geen GPU"
+    st = read_json(GPU_SELFTEST_FILE)
+    if st and st.get("sha1") == file_sha1(b) and st.get("ok") is False:
+        return False, (f"de GPU-zelftest van setup_wsl.sh faalde voor deze build ({st.get('time', '?')}; "
+                       f"log: {st.get('log', 'runs/_setup/selftest_gpu.log')})")
+    ok, msg = gpu_smoke_test(b)
+    return (True, msg) if ok else (False, f"de GPU-engine draait niet: {msg}")
+
+
 def gpu_engine_usable():
-    return os.path.isfile(ENGINE_GPU) and os.access(ENGINE_GPU, os.X_OK) and gpu_info() is not None
+    return gpu_engine_check()[0]
 
 
 def resolve_engine(choice, purpose, logf=None):
     """choice: auto | cpu | gpu | <path to a binary with the same CLI>.
     Returns (label, absolute binary path).  auto = gpu for long runs when a GPU engine and a working
-    GPU exist, cpu otherwise; sweeps default to cpu (many small runs on the cores)."""
+    GPU exist (and the engine passes gpu_engine_check), cpu otherwise; sweeps default to cpu."""
     choice = (choice or "auto").strip()
     if choice == "auto":
         if purpose == "longrun":
-            if os.path.exists(os.path.join(ENGINE_GPU_DIR, "Makefile")) and gpu_info() is not None:
+            g = gpu_info()
+            if os.path.exists(os.path.join(ENGINE_GPU_DIR, "Makefile")) and g is not None:
                 ensure_built("gpu", logf)
-            if gpu_engine_usable():
+            ok, why = gpu_engine_check()
+            if ok:
                 return "gpu", ENGINE_GPU
+            log(f"LET OP: GPU-engine niet bruikbaar ({why}); deze run gebruikt de CPU-engine", logf)
         choice = "cpu"
     if choice == "cpu":
         ensure_built("cpu", logf)
@@ -334,8 +429,9 @@ def resolve_engine(choice, purpose, logf=None):
         ensure_built("gpu", logf)
         if not os.path.exists(ENGINE_GPU):
             raise SystemExit(f"GPU-engine ontbreekt: {ENGINE_GPU} (draai pc/setup_wsl.sh)")
-        if gpu_info() is None:
-            log("WAARSCHUWING: nvidia-smi werkt niet; de GPU-engine zal waarschijnlijk falen", logf)
+        ok, why = gpu_engine_check()
+        if not ok:
+            raise SystemExit(f"GPU-engine niet bruikbaar: {why.rstrip('.')}.\nGebruik --engine cpu (of auto: kiest dan zelf de CPU).")
         return "gpu", ENGINE_GPU
     p = os.path.abspath(choice)
     if not (os.path.isfile(p) and os.access(p, os.X_OK)):
@@ -375,6 +471,17 @@ def list_snaps(rundir):
     return out
 
 
+def snaps_bytes(snaps):
+    """Total size of a list of (step, path) snapshots; files removed meanwhile (thinning) count 0."""
+    tot = 0
+    for _, p in snaps:
+        try:
+            tot += os.path.getsize(p)
+        except OSError:
+            pass
+    return tot
+
+
 def snap_complete(path):
     try:
         with open(path, "rb") as f:
@@ -410,12 +517,19 @@ def list_ckpt_copies(rundir):
 
 
 def ckpt_step(path):
-    """Step stored in an engine checkpoint (format version 2 of engine/README.md), else None."""
+    """Step stored in an engine checkpoint, else None.  Version 2 = engine/README.md; version 3 =
+    the runs/memB_src engine (version 2 + an int32 lipid-architecture code before the step).
+    Unknown versions (e.g. a GPU engine with its own format) give None; callers then use
+    stats.csv, the snapshots and the 'done at step' lines of log.txt instead."""
     try:
         with open(path, "rb") as f:
-            b = f.read(28)
-        if len(b) == 28 and b[:4] == b"OCKP":
-            return struct.unpack_from("<q", b, 20)[0]
+            b = f.read(32)
+        if len(b) == 32 and b[:4] == b"OCKP":
+            ver = struct.unpack_from("<i", b, 4)[0]
+            off = {2: 20, 3: 24}.get(ver)
+            if off is not None:
+                st = struct.unpack_from("<q", b, off)[0]
+                return st if 0 <= st < 1 << 50 else None
     except OSError:
         pass
     return None
@@ -623,6 +737,26 @@ class AlreadyRunning(Exception):
         self.pid = pid
 
 
+_BUSY = (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK)
+
+
+def _flock(fd, op, path=""):
+    # test hook: a file system without flock (only the run directories; the /tmp fallback works)
+    if os.environ.get("OERCEL_TEST_NO_FLOCK") == "1" and not os.path.basename(os.path.dirname(path)).startswith("oercel-locks-"):
+        raise OSError(errno.ENOLCK, "flock niet ondersteund (testmodus)")
+    fcntl.flock(fd, op)
+
+
+def _alt_lock_path(path):
+    """Lock file on the Linux file system for a directory whose own file system has no working flock
+    (possible on the Windows drive /mnt/c in WSL).  Locks only live as long as the processes, so /tmp
+    (emptied at boot) is fine."""
+    import hashlib
+    d = os.path.join("/tmp", f"oercel-locks-{os.getuid()}")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, hashlib.sha1(os.path.abspath(path).encode()).hexdigest()[:20] + ".lock")
+
+
 class DirLock:
     """Exclusive lock on a run or sweep directory (released automatically when the process dies)."""
 
@@ -630,12 +764,12 @@ class DirLock:
         self.path = os.path.join(directory, name)
         self.fd = None
 
-    def acquire(self):
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+    def _try(self, path):
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, path)
         except OSError as e:
-            if e.errno in (errno.EAGAIN, errno.EACCES):
+            if e.errno in _BUSY:
                 try:
                     pid = os.read(fd, 64).decode().strip()
                 except OSError:
@@ -644,6 +778,22 @@ class DirLock:
                 raise AlreadyRunning(pid)
             os.close(fd)
             raise
+        return fd
+
+    def acquire(self):
+        try:
+            fd = self._try(self.path)
+        except AlreadyRunning:
+            raise
+        except OSError as e:   # no flock on this file system: lock a file in /tmp instead
+            log(f"LET OP: bestandsvergrendeling werkt niet in {os.path.dirname(self.path)} ({e.strerror}); "
+                f"vergrendeling via {_alt_lock_path(self.path)}")
+            fd = self._try(_alt_lock_path(self.path))
+            try:
+                with open(self.path, "w") as f:
+                    f.write(str(os.getpid()))
+            except OSError:
+                pass
         os.ftruncate(fd, 0)
         os.write(fd, str(os.getpid()).encode())
         os.fsync(fd)
@@ -660,26 +810,66 @@ class DirLock:
             self.fd = None
 
 
-def lock_holder(directory, name=".pc_lock"):
-    """PID holding the lock of a directory, or None if nobody holds it."""
-    p = os.path.join(directory, name)
+def _holder_of(p):
+    """(held, pid) for lock file p; raises OSError when flock does not work there."""
     if not os.path.exists(p):
-        return None
+        return False, None
     try:
         fd = os.open(p, os.O_RDONLY)
     except OSError:
-        return None
+        return False, None
     try:
-        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return None
-    except OSError:
         try:
-            return int(os.read(fd, 64).decode().strip() or 0) or "?"
+            _flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB, p)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False, None
+        except OSError as e:
+            if e.errno not in _BUSY:
+                raise
+        try:
+            return True, int(os.read(fd, 64).decode().strip() or 0) or "?"
         except (OSError, ValueError):
-            return "?"
+            return True, "?"
     finally:
         os.close(fd)
+
+
+def lock_holder(directory, name=".pc_lock"):
+    """PID holding the lock of a directory, or None if nobody holds it."""
+    p = os.path.join(directory, name)
+    try:
+        held, pid = _holder_of(p)
+    except OSError:
+        held, pid = False, None
+        try:
+            held, pid = _holder_of(_alt_lock_path(p))
+        except OSError:
+            pass
+    return pid if held else None
+
+
+def engine_threads_in_use(exclude_dirs=()):
+    """(processes, threads) of all running oercel* engines (threads from their threads= argument)."""
+    ex = {os.path.abspath(d) for d in exclude_dirs}
+    n = t = 0
+    for d in glob.glob("/proc/[0-9]*"):
+        cl = proc_cmdline(os.path.basename(d))
+        if len(cl) < 3 or not os.path.basename(cl[0]).startswith("oercel"):
+            continue
+        if any(os.path.abspath(cl[2]).startswith(x + os.sep) or os.path.abspath(cl[2]) == x for x in ex):
+            continue
+        th = [a.split("=", 1)[1] for a in cl[3:] if a.startswith("threads=")]
+        try:
+            t += int(th[-1]) if th else 1
+        except ValueError:
+            t += 1
+        n += 1
+    return n, t
+
+
+def on_windows_drive(path):
+    """True for paths on the Windows drives in WSL (/mnt/c/...): slow, and file locking may not work."""
+    return re.match(r"^/mnt/[a-zA-Z](/|$)", os.path.abspath(path)) is not None
 
 
 def detach(script, argv, logpath):
@@ -706,12 +896,66 @@ def loadavg():
         return (0.0, 0.0, 0.0)
 
 
-def disk_free(path):
+_IS_WSL = None
+
+
+def is_wsl():
+    global _IS_WSL
+    if _IS_WSL is None:
+        try:
+            with open("/proc/version") as f:
+                _IS_WSL = "microsoft" in f.read().lower()
+        except OSError:
+            _IS_WSL = False
+    return _IS_WSL
+
+
+def _fake_bytes(var):
+    fake = os.environ.get(var)
+    if fake:
+        try:
+            with open(fake) as f:
+                return int(float(f.read().strip()))
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def host_drive_free():
+    """WSL2 only: free bytes on the Windows drive C:, where WSL normally keeps the distro's virtual disk
+    (ext4.vhdx).  Inside WSL, statvfs shows the free space of that virtual disk (up to 1 TB), not of the
+    Windows drive it grows on: when C: fills up, the virtual disk can be damaged.  None outside WSL."""
+    v = _fake_bytes("OERCEL_TEST_HOST_FREE_FILE")   # test hook
+    if v is not None:
+        return v
+    if not is_wsl() or not os.path.isdir("/mnt/c"):
+        return None
     try:
-        st = os.statvfs(path)
+        st = os.statvfs("/mnt/c")
         return st.f_bavail * st.f_frsize
     except OSError:
         return None
+
+
+def disk_free_detail(path):
+    """(free bytes, which disk limits it): the Linux file system of path, or in WSL2 the Windows drive C:
+    when that has less free space (see host_drive_free)."""
+    v = _fake_bytes("OERCEL_TEST_DISK_FREE_FILE")   # test hook: free bytes read from a file
+    if v is None:
+        try:
+            st = os.statvfs(path)
+            v = st.f_bavail * st.f_frsize
+        except OSError:
+            return None, None
+    which = "schijf"
+    h = host_drive_free()
+    if h is not None and h < v and not on_windows_drive(path):
+        v, which = h, "Windows-schijf C: (daar groeit de virtuele WSL-schijf)"
+    return v, which
+
+
+def disk_free(path):
+    return disk_free_detail(path)[0]
 
 
 # ----------------------------------------------------------------------------- engine chunks
@@ -755,6 +999,13 @@ def current_step(rundir):
     if c:
         best = max(best, c)
     return best
+
+
+def durable_step(rundir):
+    """Step of the newest checkpoint (the progress that survives a crash); without a readable
+    checkpoint format the best other estimate."""
+    c, _ = ckpt_info(rundir)
+    return c if c is not None else current_step(rundir)
 
 
 def is_finished(rundir, target):

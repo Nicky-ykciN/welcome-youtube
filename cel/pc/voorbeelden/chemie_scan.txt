@@ -1,0 +1,12 @@
+# Eerste verkenning van de levensfase: chemie AAN bovenop de membraanfysica van team A.
+# Raster over de synthesesnelheid (p_syn_a) en de voedselinstroom (p_feed), 4 soepen per combinatie
+# = 4 x 3 x 4 = 48 jobs.  Waarden zijn een STARTPUNT (team A: met de SPEC-voorbeeldwaarden eet een
+# vesikel zijn lumen leeg in ~1500 stappen; zie notes/membranen/teamA_TUNING.md), niet afgestemd.
+#   python3 pc/sweep.py pc/voorbeelden/chemie_scan.txt --achtergrond
+naam  = chemie_scan
+basis = notes/membranen/teamA_membranes.ini
+seeds = 1-4
+zet   = steps=300000 snap_every=2000 chem=1 events=1 feed=uniform feed_cap=0.11
+zet   = p_syn_b=6e-4 p_rep_a=1e-5 p_rep_b=1e-5 p_ld=2e-6 p_kd=5e-6 p_nd=1e-6
+raster p_syn_a = 2e-5 5e-5 1e-4 2e-4
+raster p_feed  = 3e-5 1e-4 3e-4

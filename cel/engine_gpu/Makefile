@@ -24,6 +24,11 @@ CCBIN_FLAG := $(if $(CCBIN),-ccbin $(CCBIN),)
 GENCODE := $(foreach a,$(ARCH),-gencode arch=compute_$(a:sm_%=%),code=$(a)) \
            -gencode arch=compute_$(lastword $(ARCH:sm_%=%)),code=compute_$(lastword $(ARCH:sm_%=%))
 NVFLAGS ?= -O3 -std=c++17 --extended-lambda -lineinfo
+# include/lib dirs next to nvcc (needed for the relocatable toolkit that setup_wsl.sh downloads)
+CUDA_HOME ?= $(abspath $(dir $(shell command -v $(NVCC) 2>/dev/null))..)
+ifneq ($(CUDA_HOME),/usr)
+NVFLAGS += $(if $(wildcard $(CUDA_HOME)/include/cuda_runtime.h),-I$(CUDA_HOME)/include -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib,)
+endif
 # host code: no fp contraction (exact TwoSum accumulation); never -ffast-math
 CXXFLAGS ?= -O3 -march=native
 CXXFLAGS += -std=c++17 -ffp-contract=off -fopenmp -Wall -Wextra -Wno-unused-parameter

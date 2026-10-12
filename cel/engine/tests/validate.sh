@@ -11,7 +11,7 @@ fails=0
 pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*"; fails=$((fails + 1)); }
 rm -rf "$OUT"; mkdir -p "$OUT"
-make -s -C engine oercel tests/forcetest >/dev/null || { echo "build failed"; exit 1; }
+make -s -C engine oercel tests/forcetest tests/molforcetest >/dev/null || { echo "build failed"; exit 1; }
 
 echo "== 1. force kernel vs O(N^2) brute force, bonded forces vs finite differences =="
 for L in 9 12.5 23.7; do
@@ -159,6 +159,54 @@ c, *_ = np.linalg.lstsq(M, T, rcond=None)
 amp, lag = np.hypot(c[1], c[2]), np.arctan2(-c[2], c[1])
 ok = abs(amp - 0.2) < 0.01 and abs(c[0] - 1) < 0.03 and 0 <= lag < 0.2
 print(('PASS' if ok else 'FAIL') + f'  temperature cycle kT(t) = 1 + 0.2 sin(2 pi t/30): T_kin = {c[0]:.4f} + {amp:.4f} sin(2 pi t/30 - {lag:.3f})  (lag {lag/w:.2f} t.u.)')
+sys.exit(0 if ok else 1)
+PYEOF
+
+echo "== 8. membrane lipid (params/membranes.ini: tied H2T2 'pi' lipid, k_bond 300, two-phase nutrient) =="
+r=$(engine/tests/molforcetest)
+if echo "$r" | grep -q "MOLFORCETEST PASS"; then pass "molforcetest: bonded forces of $(echo "$r" | grep -c 'r0_head=.*PASS$') lipid templates (linear, pi, y, bola, ties, junction angles) vs finite differences"
+else fail "molforcetest"; echo "$r"; fi
+# restart identity with the template lipid (checkpoint version 3) and every reaction active
+OV="L=32 steps=600 snap_every=100 stats_every=10 ckpt_every=300 log_every=0 warmup=200 chem=1 events=1 p_syn_a=0.5 p_rep_a=0.2 mu=0.3 p_ld=0.01 p_kd=0.01 p_nd=0.01"
+OV="$OV feed=uniform p_feed=0.01 feed_cap=0.2 stir_A=0.05 stir_n=2 kT_amp=0.2 kT_period=5"
+$ENG engine/params/membranes.ini $OUT/mem_restart_A $OV threads=3 ckpt_keep=1 >/dev/null
+$ENG engine/params/membranes.ini $OUT/mem_restart_B $OV threads=1 restart=$OUT/mem_restart_A/ckpt_0000000300.bin >/dev/null
+ok=1
+for st in 0000000400 0000000500 0000000600; do $CHK cmp $OUT/mem_restart_A/snap_$st.bin $OUT/mem_restart_B/snap_$st.bin >/dev/null || ok=0; done
+cmp -s $OUT/mem_restart_A/ckpt.bin $OUT/mem_restart_B/ckpt.bin || ok=0
+diff -q <(tail -n +2 $OUT/mem_restart_A/stats.csv | awk -F, '$1+0>300') <(tail -n +2 $OUT/mem_restart_B/stats.csv | awk -F, '$1+0>300') >/dev/null || ok=0
+diff -q <(tail -n +2 $OUT/mem_restart_A/events.csv | awk -F, '$1+0>300') <(tail -n +2 $OUT/mem_restart_B/events.csv | awk -F, '$1+0>300') >/dev/null || ok=0
+ver=$(python3 -c "import struct;print(struct.unpack_from('<i',open('$OUT/mem_restart_A/ckpt.bin','rb').read(),4)[0])")
+nsyn=$(tail -n +2 $OUT/mem_restart_A/events.csv | awk -F, '$1+0>300 && $2=="syn"' | wc -l)
+[ $ok = 1 ] && [ "$ver" = 3 ] && pass "pi lipid: restart at 300 (3 threads -> 1 thread), checkpoint version $ver: snapshots, stats, events ($nsyn syntheses after 300), final checkpoint bitwise identical" || fail "pi lipid restart identity (ckpt version $ver)"
+# soup with fast synthesis: bond lengths, temperature, every molecule an intact template
+M=$OUT/mem_soup
+$ENG engine/params/membranes.ini $M L=48 steps=20000 snap_every=5000 stats_every=50 log_every=0 chem=1 events=1 p_syn_a=0.02 p_rep_a=2e-4 p_ld=2e-5 feed=uniform p_feed=1e-3 feed_cap=0.11 threads=2 >/dev/null
+python3 - $M <<'PYEOF' || fails=$((fails + 1))
+import sys, glob, numpy as np
+sys.path.insert(0, 'engine/tests')
+from snapcheck import read_snap
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+run = sys.argv[1]
+a = np.genfromtxt(run + '/stats.csv', delimiter=',', names=True)
+mb_all = a['max_bond'].max(); mb = a['max_bond'][a['step'] > 3000].max(); T = a['T_kin'][a['time'] >= 90].mean()
+nsyn = sum(1 for l in open(run + '/events.csv') if ',syn,' in l)
+bad = 0; nmol = 0
+for p in sorted(glob.glob(run + '/snap_*.bin')):
+    s = read_snap(p); t = s['t']; b = s['bonds'].astype(np.int64); n = len(t)
+    lip = np.nonzero((t == 1) | (t == 2))[0]
+    g = coo_matrix((np.ones(len(b)), (b[:, 0], b[:, 1])), shape=(n, n))
+    nc, lab = connected_components(g, directed=False)
+    nbond = np.bincount(lab[b[:, 0]], minlength=nc)
+    size = np.bincount(lab[lip], minlength=nc)
+    nhead = np.bincount(lab[lip[t[lip] == 1]], minlength=nc)
+    mols = np.unique(lab[lip])
+    bad += int(np.sum((size[mols] != 4) | (nhead[mols] != 2) | (nbond[mols] != 4)))
+    nmol = len(mols)
+ok = mb < 1.5 and abs(T - 1) < 0.03 and bad == 0 and nsyn > 100
+print(('PASS' if ok else 'FAIL') + f'  pi-lipid soup L=48 with {nsyn} syntheses: max bond after warm-up {mb:.3f} (whole run {mb_all:.3f}; < 1.5), <T>={T:.4f}, '
+      f'{nmol} molecules in the last snapshot, {bad} molecule-snapshots not an intact H2T2 template (4 beads, 2 H, 4 bonds)')
 sys.exit(0 if ok else 1)
 PYEOF
 

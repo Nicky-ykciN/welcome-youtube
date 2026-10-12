@@ -9,3 +9,4 @@ engine_gpu/*.o
 engine_gpu/build/
 pc/.venv/
 .venv/
+engine/tests/molforcetest

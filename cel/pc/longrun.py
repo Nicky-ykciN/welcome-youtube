@@ -23,8 +23,10 @@ What it does
 Nothing here changes the physics (SPEC section 0): it only starts, stops and restarts the engine.
 """
 import argparse
+import glob
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -38,12 +40,16 @@ import pclib as P  # noqa: E402
 STATE = "pc_longrun.json"
 SUPLOG = "pc_supervisor.log"
 ENGOUT = "pc_engine.out"
+STOP_REQ = "pc_stop_verzoek"      # written by --stop: a deliberate stop (status.py --hervat leaves it alone)
 VERSION = 1
+
+# engine messages that mean "this checkpoint file cannot be used" (engine/oercel.c read_ckpt, die())
+CKPT_ERR_RE = re.compile(r"checkpoint|ckpt", re.I)
 
 # settings that may be changed on every (re)start; physics (ini + overrides) may not
 SETTINGS_DEFAULTS = dict(threads=None, chunk_min=60, analyse_uur=2.0, analyse_jobs=8, keep_recent=200,
                          max_stride=64, max_snap_gb=100.0, keep_ckpt=3, div_window=10, images_keep=4,
-                         width=2000, render=True, poll_s=5.0, max_failures=6)
+                         width=2000, render=True, poll_s=5.0, max_failures=6, backoff_s=10.0, min_free_gb=10.0)
 
 
 # ----------------------------------------------------------------------------- thinning
@@ -145,11 +151,12 @@ class Supervisor:
             self.analyse_req = True
             return
         self.stop_req = True
-        if self.proc is not None and self.proc.poll() is None:
-            try:
-                self.proc.send_signal(signal.SIGTERM)
-            except OSError:
-                pass
+        for p in (self.proc, getattr(self, "tool_proc", None)):   # engine (writes a checkpoint) and analysis/render
+            if p is not None and p.poll() is None:
+                try:
+                    p.send_signal(signal.SIGTERM)
+                except OSError:
+                    pass
 
     # -- engine
     def engine_cmd(self, restart):
@@ -157,6 +164,8 @@ class Supervisor:
         ini = os.path.join(self.rundir, "pc_base.ini")
         ov = dict(st["overrides"])
         ov["steps"] = str(st["steps"])
+        if restart and restart == st.get("from_ckpt") and st.get("reseed_first"):
+            ov["restart_reseed"] = "1"      # branch only at the very first restart (from --van-ckpt)
         return P.engine_command(st["engine_path"], ini, self.rundir, ov, self.cfg["threads"],
                                 int(self.cfg["chunk_min"] * 60), restart=restart)
 
@@ -232,6 +241,15 @@ class Supervisor:
             if P.list_snaps(rd) or os.path.exists(os.path.join(rd, "stats.csv")):
                 n = P.wipe_engine_outputs(rd)
                 self.log(f"geen checkpoint: run begint opnieuw vanaf de soep ({n} oude bestanden verwijderd)")
+        if st.get("bad_ckpts") and self.pick_restart()[0] == "":
+            # a new start gives every checkpoint a new chance (the earlier failures may have had another cause)
+            self.log(f"nieuwe start: de {len(st['bad_ckpts'])} als onbruikbaar gemarkeerde checkpoints worden opnieuw geprobeerd")
+            st["bad_ckpts"] = []
+        try:
+            os.unlink(os.path.join(rd, STOP_REQ))
+        except OSError:
+            pass
+        st.pop("stopped_by", None)
         st["status"] = "loopt"
         st["supervisor_pid"] = os.getpid()
         st["supervisor_started"] = P.stamp()
@@ -242,6 +260,8 @@ class Supervisor:
         self.sample()
         while not self.stop_req:
             if P.is_finished(rd, self.target()):
+                break
+            if not self.wait_for_disk():
                 break
             restart, key = self.pick_restart()
             if restart == "":
@@ -254,7 +274,9 @@ class Supervisor:
                 n = P.wipe_engine_outputs(rd)
                 self.log(f"geen checkpoint na eerdere poging: opnieuw vanaf de soep ({n} bestanden opgeruimd)")
             cmd = self.engine_cmd(restart)
-            step0 = P.current_step(rd)
+            step0 = (P.ckpt_step(restart) if restart else 0)
+            if step0 is None:
+                step0 = P.current_step(rd)
             self.log(f"chunk {st.get('chunks', 0) + 1}: {'herstart van ' + os.path.basename(restart) if restart else 'start vanaf willekeurige soep'}"
                      f" (stap {P.fmt_int(P.ckpt_step(restart) if restart and P.ckpt_step(restart) is not None else step0)})")
             P.trim_file(os.path.join(rd, ENGOUT))
@@ -274,19 +296,35 @@ class Supervisor:
                     self.prune_ckpts()
                     self.write_status()
                     last_status = time.time()
+                    # snapshots above the disk budget: analyse + thin now instead of at the next interval
+                    budget = float(self.cfg["max_snap_gb"]) * 1024 ** 3
+                    if budget > 0 and time.time() - st.get("last_analysis_time", 0) > 600 and \
+                            P.snaps_bytes(P.list_snaps(rd)) > budget:
+                        self.analyse_req = True
+                if not getattr(self, "disk_pause", False) and self.disk_low():
+                    self.log(f"SCHIJF BIJNA VOL (< {self.cfg['min_free_gb']} GB vrij op de {P.disk_free_detail(rd)[1]}): "
+                             f"engine netjes pauzeren")
+                    self.disk_pause = True
+                    self.proc.send_signal(signal.SIGTERM)
                 self.maybe_pipeline()
             rc = self.proc.returncode
             self.proc = None
             st["engine_pid"] = None
-            step1 = self.sample()
+            self.sample()
+            step1 = P.durable_step(rd)
             dur = time.time() - t_start
             if self.stop_req:
                 break
-            if rc == 0:
+            if getattr(self, "disk_pause", False):
+                self.disk_pause = False
+                continue
+            if rc == 0 and (step1 > step0 or P.is_finished(rd, self.target())):
                 fails = 0
                 if not P.is_finished(rd, self.target()):
                     self.log(f"chunk klaar na {P.fmt_dur(dur)}: stap {P.fmt_int(step1)}")
                 continue
+            if rc == 0:   # clean exit without any progress and not finished: count as a failure (no endless loop)
+                self.log("engine stopte zonder voortgang en zonder het doel te halen")
             # crash
             fails = fails + 1 if (last_fail_step is None or step1 <= last_fail_step) else 1
             last_fail_step = step1
@@ -297,19 +335,31 @@ class Supervisor:
             st["last_crash"] = dict(time=P.stamp(), rc=rc, step=step1, error=str(err)[:300])
             self.log(f"ENGINE GESTOPT met code {rc} na {P.fmt_dur(dur)} bij stap {P.fmt_int(step1)} "
                      f"(poging {fails}): {str(err)[:200]}")
-            if restart and key and dur < 60 and step1 <= step0 and fails >= 2:
+            # only a failure that points at the checkpoint itself (read error, or a crash while loading it)
+            # marks it bad; 'no CUDA device', a full disk or a kill -9 say nothing about the file
+            ckpt_fault = bool(CKPT_ERR_RE.search(str(err))) or rc in (-signal.SIGSEGV, -signal.SIGBUS, -signal.SIGABRT)
+            if restart and key and dur < 60 and step1 <= step0 and fails >= 2 and ckpt_fault:
                 st.setdefault("bad_ckpts", []).append(key)
                 self.log(f"checkpoint {os.path.basename(restart)} lijkt onbruikbaar: volgende keer een oudere kopie")
+            if st.get("engine") == "gpu" and re.search(r"CUDA|GPU|device", str(err)) and not getattr(self, "_gpu_hint", False):
+                self._gpu_hint = True
+                self.log("de GPU-engine start niet: controleer `nvidia-smi` (Windows-driver; in PowerShell `wsl --shutdown`). "
+                         "Desnoods verder op de CPU: " + P.shown_cmd("longrun.py", f"{os.path.basename(rd)} --engine cpu "
+                                                                     f"--forceer-engine --achtergrond{P.runs_arg(rd)}", for_file=True))
             self.save()
             if fails >= self.cfg["max_failures"]:
                 st["status"] = "fout"
                 self.log("te vaak achter elkaar mislukt zonder voortgang: supervisor stopt. Zie pc_engine.out en log.txt.")
                 break
-            self._sleep(min(300, 10 * 2 ** (fails - 1)))
+            self._sleep(min(300, float(self.cfg.get("backoff_s", 10)) * 2 ** (fails - 1)))
         # finish
         if self.stop_req:
             st["status"] = "gestopt"
-            self.log("gestopt op verzoek (checkpoint geschreven); hervat met hetzelfde commando")
+            # --stop leaves a marker: a deliberate stop.  Without it the SIGTERM came from elsewhere (closed
+            # terminal, WSL/Windows shutting down): then status.py --hervat must bring the run back.
+            st["stopped_by"] = "gebruiker" if os.path.exists(os.path.join(rd, STOP_REQ)) else "signaal"
+            self.log("gestopt " + ("op verzoek" if st["stopped_by"] == "gebruiker" else "door een signaal (afsluiten?)")
+                     + " (checkpoint geschreven); hervat met hetzelfde commando")
         elif st.get("status") != "fout":
             st["status"] = "klaar"
             st["finished"] = P.stamp()
@@ -320,9 +370,38 @@ class Supervisor:
                 self.pipeline(final=True)
         self.wait_pipeline()
         self.prune_ckpts()
+        try:
+            self.sync_images()     # also after a render that was killed in an earlier supervisor
+        except OSError as e:
+            self.log(f"beelden bijwerken mislukt: {e!r}")
         self.save()
         self.write_status()
         return 0 if st["status"] in ("klaar", "gestopt") else 2
+
+    def disk_low(self):
+        free = P.disk_free(self.rundir)
+        return free is not None and free < float(self.cfg.get("min_free_gb", 10)) * 1024 ** 3
+
+    def wait_for_disk(self):
+        """Never let the disk run full (a checkpoint written on a full disk is lost): pause until
+        there is 1.5x min_free_gb free again.  Returns False if a stop was requested meanwhile."""
+        if not self.disk_low():
+            return True
+        st = self.st
+        st["status"] = "wacht_op_schijf"
+        self.save()
+        self.write_status()
+        need = 1.5 * float(self.cfg.get("min_free_gb", 10)) * 1024 ** 3
+        self.log(f"wacht tot er {P.fmt_bytes(need)} vrij is op de {P.disk_free_detail(self.rundir)[1]} "
+                 f"(nu {P.fmt_bytes(P.disk_free(self.rundir) or 0)}); "
+                 f"eerst analyse + uitdunnen van oude snapshots; anders: ruim iets op, de run gaat dan vanzelf verder")
+        self.analyse_req = True       # thinning (after an analysis) may free enough space by itself
+        while not self.stop_req and (P.disk_free(self.rundir) or 0) < need:
+            self.maybe_pipeline()
+            self._sleep(min(60.0, float(self.cfg.get("poll_s", 5)) * 4))
+        st["status"] = "loopt"
+        self.save()
+        return not self.stop_req
 
     def _sleep(self, sec):
         t1 = time.time() + sec
@@ -358,14 +437,19 @@ class Supervisor:
         with open(logp, "ab") as f:
             f.write(f"\n[{P.stamp()}] {' '.join(cmd)}\n".encode())
             f.flush()
+            if self.stop_req:
+                return False
             p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=P.CEL,
                                  preexec_fn=P._set_pdeathsig)
+            self.tool_proc = p
             try:
                 rc = p.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 p.kill()
                 rc = -999
-        if rc != 0:
+            finally:
+                self.tool_proc = None
+        if rc != 0 and not self.stop_req:
             self.log(f"{what} mislukt (code {rc}); zie {os.path.relpath(logp, P.CEL)}")
         return rc == 0
 
@@ -410,36 +494,72 @@ class Supervisor:
             f.write(f"{P.stamp()},{self.st.get('last_analysis_step')},{s.get('cells_last', '')},{s.get('cat_cells_last', '')},"
                     f"{s['divisions']},{s['divisions_confirmed']},{s['n_ja']},{s['n_deels']}\n")
 
+    def render_one(self, args, out, what):
+        """tools/render.py into a temporary name, renamed when complete: a kill during rendering never
+        leaves a half PNG in beelden/ (render.py itself writes straight to --out)."""
+        tmp = out[:-4] + ".tmp.png"
+        ok = self.run_tool(args + ["--out", tmp], what, timeout=3600) and os.path.exists(tmp)
+        if ok:
+            os.replace(tmp, out)
+        else:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return ok
+
     def render(self, summ):
         st = self.st
         name = os.path.basename(self.rundir)
         out_dir = os.path.join(st["beelden_dir"], name)
         os.makedirs(out_dir, exist_ok=True)
+        self.sync_images()
         step = st["last_analysis_step"]
         imgs = st.setdefault("images", {})
         w = str(self.cfg["width"])
         tag = f"{int(step):010d}"
         r = os.path.join(P.TOOLS, "render.py")
         f = os.path.join(out_dir, f"micro_{tag}.png")
-        if self.run_tool([r, self.rundir, "--kind", "micro", "--step", str(step), "--out", f, "--width", w],
-                         "micro-beeld", timeout=3600):
+        if self.render_one([r, self.rundir, "--kind", "micro", "--step", str(step), "--width", w], f, "micro-beeld"):
             imgs.setdefault("micro", []).append(f)
         it = P.interesting_track(self.rundir)
         if it is not None:
             tid, tstep = it
             f = os.path.join(out_dir, f"goodsell_{int(tstep):010d}_spoor{tid}.png")
-            if self.run_tool([r, self.rundir, "--kind", "goodsell", "--cell", str(tid), "--step", str(tstep), "--out", f,
-                              "--width", w], "goodsell-beeld", timeout=3600):
+            if self.render_one([r, self.rundir, "--kind", "goodsell", "--cell", str(tid), "--step", str(tstep),
+                                "--width", w], f, "goodsell-beeld"):
                 imgs.setdefault("goodsell", []).append(f)
         if summ.get("divisions", 0) > 0:
             sig = f"{summ['divisions']}:{summ['divisions_confirmed']}:{summ.get('division_steps')}"
             if sig != st.get("timelapse_sig"):
                 f = os.path.join(out_dir, f"timelapse_{tag}.png")
-                if self.run_tool([r, self.rundir, "--kind", "timelapse", "--out", f, "--width", str(max(2400, int(w)))],
-                                 "time-lapse", timeout=3600):
+                if self.render_one([r, self.rundir, "--kind", "timelapse", "--width", str(max(2400, int(w)))], f, "time-lapse"):
                     imgs.setdefault("timelapse", []).append(f)
                     st["timelapse_sig"] = sig
+        self.sync_images()
+        self.save()
+
+    def sync_images(self):
+        """beelden/NAAM: remove half images (*.tmp.png) of a killed render, adopt finished images the state
+        does not list yet (kill between rendering and saving), keep the newest images_keep per kind."""
+        st = self.st
+        out_dir = os.path.join(st["beelden_dir"], os.path.basename(self.rundir))
+        if not os.path.isdir(out_dir):
+            return
+        for p in glob.glob(os.path.join(out_dir, "*.tmp.png")):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        imgs = st.setdefault("images", {})
         keep = max(1, int(self.cfg["images_keep"]))
+        for kind in ("micro", "goodsell", "timelapse"):
+            # what is on disk counts (a kill between rendering and saving the state must not leave orphans);
+            # names carry the zero-padded step, so name order is time order
+            on_disk = [p for p in glob.glob(os.path.join(out_dir, f"{kind}_*.png")) if not p.endswith(".tmp.png")]
+            if on_disk or kind in imgs:
+                imgs[kind] = sorted(set(on_disk) | {x for x in imgs.get(kind, []) if os.path.exists(x)},
+                                    key=os.path.basename)
         for kind, lst in imgs.items():
             lst[:] = [x for x in dict.fromkeys(lst) if os.path.exists(x)]
             while len(lst) > keep:
@@ -466,18 +586,20 @@ class Supervisor:
             plan = thinning_plan(snaps, se, st.get("last_analysis_step"), ck, st.get("protected", []),
                                  int(self.cfg["keep_recent"]), stride)
             for s, p in plan:
-                try:
-                    os.unlink(p)
-                    removed += 1
-                except OSError:
-                    pass
+                # cache first: a kill in between then leaves a snapshot without cache (recomputed), never
+                # a cache entry without snapshot
                 for c in (f"cells_{s:010d}.json", f"grid_{s:010d}.npz"):
                     try:
                         os.unlink(os.path.join(rd, "analysis_cache", c))
                     except OSError:
                         pass
+                try:
+                    os.unlink(p)
+                    removed += 1
+                except OSError:
+                    pass
             snaps = P.list_snaps(rd)
-            used = sum(os.path.getsize(p) for _, p in snaps if os.path.exists(p))
+            used = P.snaps_bytes(snaps)
             if budget <= 0 or used <= budget or stride >= 1 << 20:
                 break
             stride *= 2
@@ -506,8 +628,14 @@ def status_markdown(rundir, st, speed=None):
         status = "FOUT: supervisor gestopt na herhaalde crashes (zie pc_supervisor.log, pc_engine.out, log.txt)"
     elif status == "klaar":
         status = f"klaar ({st.get('finished', '')})"
+    elif status == "gestopt" and st.get("stopped_by") == "signaal":
+        status = ("onderbroken door een stopsignaal (afsluiten van WSL/Windows?); hervat met hetzelfde commando of "
+                  + P.shown_cmd("status.py", "--hervat", for_file=True))
     elif status == "gestopt":
         status = "gestopt op verzoek (hervat met hetzelfde commando)"
+    elif status == "wacht_op_schijf" and holder:
+        status = (f"GEPAUZEERD: {P.disk_free_detail(rundir)[1]} bijna vol (minder dan {st['settings'].get('min_free_gb', 10)} GB vrij); "
+                  f"gaat vanzelf verder als er ruimte is")
     elif holder:
         status = f"loopt (supervisor pid {holder})"
     else:
@@ -537,7 +665,7 @@ def status_markdown(rundir, st, speed=None):
     lines.append(f"| herstarts | {st.get('chunks', 0)} chunks, {st.get('crashes', 0)} crashes"
                  + (f" (laatste {lc['time']}, code {lc['rc']}, stap {P.fmt_int(lc['step'])})" if lc else "") + " |")
     snaps = P.list_snaps(rundir)
-    ssz = sum(os.path.getsize(p) for _, p in snaps if os.path.exists(p))
+    ssz = P.snaps_bytes(snaps)
     lines.append(f"| schijf | {len(snaps)} snapshots ({P.fmt_bytes(ssz)}), {len(P.list_ckpt_copies(rundir))} checkpoint-kopieën, "
                  f"{st.get('thinned_total', 0)} snapshots uitgedund; vrij {P.fmt_bytes(P.disk_free(rundir) or 0)} |")
     a = st.get("analysis")
@@ -561,12 +689,26 @@ def status_markdown(rundir, st, speed=None):
         for kind in ("micro", "goodsell", "timelapse"):
             if imgs.get(kind):
                 lines.append(f"- {kind}: `{os.path.relpath(imgs[kind][-1], P.CEL)}`")
-    lines += ["", "Hervatten (na crash/reboot): `python3 pc/longrun.py " + name + " --achtergrond`  ·  "
-              "stoppen: `python3 pc/longrun.py " + name + " --stop`", ""]
+    ra = P.runs_arg(rundir)
+    lines += ["", f"Hervatten (na crash/reboot): `{P.shown_cmd('longrun.py', name + ' --achtergrond' + ra, for_file=True)}`  ·  "
+              f"stoppen: `{P.shown_cmd('longrun.py', name + ' --stop' + ra, for_file=True)}`  (vanuit de hoofdmap van de repo)", ""]
     return "\n".join(lines)
 
 
 # ----------------------------------------------------------------------------- CLI
+def warn_machine(rundir, st):
+    """Printed before a start: repo on the Windows drive, or more engine threads than CPUs."""
+    if P.on_windows_drive(rundir):
+        print("LET OP: de repo staat op de Windows-schijf (/mnt/...): alles is daar veel trager. "
+              "Beter: de repo in je Linux-thuismap (~) clonen; zie pc/setup_wsl.sh.")
+    n, t = P.engine_threads_in_use(exclude_dirs=[rundir])
+    mine = int(st["settings"].get("threads") or 1)
+    if n and t + mine > P.cpu_count():
+        print(f"LET OP: er draaien al {n} engine-processen met samen {t} threads; met deze run erbij "
+              f"{t + mine} threads op {P.cpu_count()} CPU's. Alles wordt dan trager (overboekt); "
+              f"overweeg --threads of een sweep met minder --jobs.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("naam", help="naam van de run (map runs/NAAM)")
@@ -590,12 +732,14 @@ def main():
     ap.add_argument("--images-keep", type=int, default=None, help="beelden per soort bewaren in beelden/NAAM (4)")
     ap.add_argument("--width", type=int, default=None, help="beeldbreedte in pixels (2000)")
     ap.add_argument("--geen-beelden", action="store_true", help="geen beelden maken (alleen analyse)")
+    ap.add_argument("--min-vrij-gb", type=float, default=None, help="engine pauzeren als er minder vrij is (10 GB)")
     ap.add_argument("--runs-dir", default=None)
     ap.add_argument("--beelden-dir", default=None)
     ap.add_argument("--achtergrond", action="store_true", help="los van de terminal draaien (nohup/setsid)")
     ap.add_argument("--stop", action="store_true", help="draaiende supervisor netjes stoppen")
     ap.add_argument("--analyseer-nu", action="store_true", help="draaiende supervisor meteen laten analyseren")
     ap.add_argument("--poll", type=float, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--backoff", type=float, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--_bg", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a._bg:
@@ -615,6 +759,12 @@ def main():
                     print(f"losse engine-processen {strays} netjes stoppen")
                     P.stop_pids(strays)
             return 0
+        if a.stop:   # mark the stop as deliberate (status.py --hervat then leaves this run alone)
+            try:
+                with open(os.path.join(rundir, STOP_REQ), "w") as f:
+                    f.write(f"{P.stamp()} pid {os.getpid()}\n")
+            except OSError:
+                pass
         os.kill(int(pid), signal.SIGUSR1 if a.analyseer_nu else signal.SIGTERM)
         if a.analyseer_nu:
             print(f"{name}: analyse aangevraagd bij pid {pid}")
@@ -674,14 +824,25 @@ def main():
             raise SystemExit(f"{rundir} bestaat al met snapshots maar is geen longrun-map; kies een andere naam")
         shutil.copyfile(ini, os.path.join(rundir, "pc_base.ini"))
         frm = None
+        reseed_first = False
+        if str(ov.get("restart_reseed", "0")).strip() not in ("0", ""):
+            if not a.van_ckpt:
+                raise SystemExit("restart_reseed=1 heeft alleen zin met --van-ckpt")
+            ov.pop("restart_reseed")
+            reseed_first = True       # only for the first chunk; later chunks continue exactly
+        frm_src = None
         if a.van_ckpt:
-            frm = os.path.abspath(a.van_ckpt)
-            if not os.path.exists(frm):
+            frm_src = os.path.abspath(a.van_ckpt)
+            if not os.path.exists(frm_src):
                 raise SystemExit(f"checkpoint niet gevonden: {a.van_ckpt}")
+            # freeze the branch point: the source (often another run's ckpt.bin) changes while that run goes on
+            frm = os.path.join(rundir, "pc_van_ckpt.bin")
+            shutil.copyfile(frm_src, frm + ".tmp")
+            os.replace(frm + ".tmp", frm)
         st = dict(kind="longrun", version=VERSION, name=name, created=P.stamp(), ini_source=os.path.relpath(ini, P.CEL),
                   overrides=ov, steps=steps, engine=label, engine_path=binary, engine_sha1=P.file_sha1(binary),
-                  from_ckpt=frm, beelden_dir=P.beelden_dir(a.beelden_dir), settings=dict(SETTINGS_DEFAULTS),
-                  status="nieuw", chunks=0, crashes=0)
+                  from_ckpt=frm, from_ckpt_source=frm_src, reseed_first=reseed_first, beelden_dir=P.beelden_dir(a.beelden_dir),
+                  settings=dict(SETTINGS_DEFAULTS), status="nieuw", chunks=0, crashes=0)
         st["settings"]["threads"] = 2 if label == "gpu" else min(32, max(1, P.cpu_count() - 2))
     else:
         if a.ini or a.set or a.van_ckpt:
@@ -713,7 +874,8 @@ def main():
     for k, v in (("threads", a.threads), ("chunk_min", a.chunk_min), ("analyse_uur", a.analyse_uur),
                  ("analyse_jobs", a.analyse_jobs), ("keep_recent", a.keep_recent), ("max_stride", a.max_stride),
                  ("max_snap_gb", a.max_snap_gb), ("keep_ckpt", a.keep_ckpt), ("div_window", a.div_window),
-                 ("images_keep", a.images_keep), ("width", a.width), ("poll_s", a.poll)):
+                 ("images_keep", a.images_keep), ("width", a.width), ("poll_s", a.poll),
+                 ("backoff_s", a.backoff), ("min_free_gb", a.min_vrij_gb)):
         if v is not None:
             s[k] = v
     if a.geen_beelden:
@@ -725,9 +887,22 @@ def main():
 
     holder = P.lock_holder(rundir) if os.path.isdir(rundir) else None
     if holder:
-        print(f"{name}: supervisor draait al (pid {holder}); status: runs/{name}/STATUS.md")
+        print(f"{name}: supervisor draait al (pid {holder}); status: {P.shown_path(os.path.join(rundir, 'STATUS.md'))}")
+        changed = [o for o, v in (("--steps", a.steps), ("--engine", a.engine), ("--threads", a.threads),
+                                  ("--chunk-min", a.chunk_min), ("--analyse-uur", a.analyse_uur),
+                                  ("--analyse-jobs", a.analyse_jobs), ("--keep-recent", a.keep_recent),
+                                  ("--max-stride", a.max_stride), ("--max-snap-gb", a.max_snap_gb),
+                                  ("--keep-ckpt", a.keep_ckpt), ("--div-window", a.div_window),
+                                  ("--images-keep", a.images_keep), ("--width", a.width),
+                                  ("--min-vrij-gb", a.min_vrij_gb), ("--beelden-dir", a.beelden_dir))
+                   if v is not None] + (["--geen-beelden"] if a.geen_beelden else [])
+        if changed:
+            print(f"  NIET TOEGEPAST: {' '.join(changed)}. Een draaiende run neemt geen nieuwe instellingen aan; "
+                  f"eerst: {P.shown_cmd('longrun.py', name + ' --stop' + P.runs_arg(rundir))}   en dan dit commando opnieuw.")
+            return 1
         return 0
     os.makedirs(rundir, exist_ok=True)
+    warn_machine(rundir, st)
     P.write_json_atomic(stp, st)
 
     if a.achtergrond:
@@ -737,7 +912,7 @@ def main():
         pid = P.detach(os.path.abspath(__file__), argv, os.path.join(rundir, "pc_supervisor.out"))
         time.sleep(1.5)
         print(f"{name}: supervisor gestart op de achtergrond (pid {pid}); log: {os.path.join(rundir, SUPLOG)}")
-        print(f"  status: python3 pc/status.py   of   cat {os.path.join(rundir, 'STATUS.md')}")
+        print(f"  status: {P.shown_cmd('status.py')}   of   cat {os.path.join(rundir, 'STATUS.md')}")
         return 0
 
     try:
