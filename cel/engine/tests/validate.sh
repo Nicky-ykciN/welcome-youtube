@@ -2,6 +2,14 @@
 # Oercel engine validation suite (SPEC section 2 checks + restart identity).
 # usage: engine/tests/validate.sh [outdir]     (default runs/validate; takes ~2-3 min with 2 threads)
 # Every check prints PASS/FAIL; the script exits non-zero if any check fails.
+# Build: tests/forcetest and tests/molforcetest are ALWAYS rebuilt from source here (make -B), so a
+# stale binary or one built on another machine (e.g. with AVX-512) is never what gets tested.
+# engine/oercel is rebuilt when oercel.c is newer, and also when it does not run on this machine
+# (e.g. an AVX-512 build copied to a CPU without AVX-512). To validate other compiler flags, pass
+# them in the ENVIRONMENT (not as make arguments: those would drop -fopenmp) and rebuild the engine
+# with them first, e.g. (from cel/):
+#   export CFLAGS="-O3 -march=x86-64-v3 -fno-math-errno -fno-trapping-math"
+#   make -B -C engine oercel && engine/tests/validate.sh
 set -u
 cd "$(dirname "$0")/../.."           # -> cel/
 ENG=engine/oercel
@@ -11,7 +19,23 @@ fails=0
 pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*"; fails=$((fails + 1)); }
 rm -rf "$OUT"; mkdir -p "$OUT"
-make -s -C engine oercel tests/forcetest tests/molforcetest >/dev/null || { echo "build failed"; exit 1; }
+make -s -C engine oercel >/dev/null || { echo "build failed (engine/oercel)"; exit 1; }
+smoke() { $ENG engine/params/water.ini "$OUT/_smoke" L=8 steps=20 snap_every=0 stats_every=0 ckpt_every=0 log_every=0 threads=1 >/dev/null 2>&1; }
+if ! smoke; then
+  echo "engine/oercel does not run on this machine (stale or foreign build?): rebuilding it from source"
+  { make -s -B -C engine oercel >/dev/null && smoke; } || { echo "build failed: engine/oercel still does not run after a rebuild"; exit 1; }
+fi
+rm -rf "$OUT/_smoke"
+make -s -B -C engine tests/forcetest tests/molforcetest >/dev/null || { echo "build failed (test binaries)"; exit 1; }
+# which force kernel the test binaries were just compiled with (engine/oercel: the same, unless it was built with other flags)
+cflags=$(make -s -C engine --no-print-directory --eval '_print_cflags: ; @echo $(CC) $(CFLAGS)' _print_cflags 2>/dev/null)
+n512=$(echo | ${cflags:-gcc} -dM -E -x c - 2>/dev/null | grep -cE '^#define __AVX512(F|DQ|BW|VL)__ 1')
+case "$n512 $cflags" in
+  *OERCEL_SCALAR*) kern="scalar force kernel (-DOERCEL_SCALAR)" ;;
+  4\ *) kern="AVX-512 force kernel" ;;
+  *) kern="scalar force kernel (this build has no AVX-512 F/DQ/BW/VL)" ;;
+esac
+echo "build: $cflags -> $kern"
 
 echo "== 1. force kernel vs O(N^2) brute force, bonded forces vs finite differences =="
 for L in 9 12.5 23.7; do

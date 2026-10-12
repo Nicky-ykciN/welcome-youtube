@@ -366,3 +366,14 @@ Bevindingen en wat eraan gedaan is:
   push), de échte apt-installatie uit cli.github.com (hier 403; alleen droog, plus de controle "ziet apt
   cli.github.com" alleen beredeneerd), de echte curl-proef naar api.github.com (alleen nep-curl), explorer.exe/
   wslview in WSL2, gh 2.4.0 in het echt, setup_wsl.sh zonder ffmpeg in het echt (alleen nep-selftest + hook).
+
+## PROEFRIT-BEVINDINGEN (verse-kloon-test) — 2026-10-12, workflow-agent
+Opdracht (7 punten): 1 herstart-bestendig (Windows-taak bij aanmelden -> verborgen wsl.exe -> start.sh --automatisch,
+houdt de distro wakker); 2 race in test_sweep_kill.sh; 3 test_thinning.sh zelfstandig + SKIP apart in alle_tests.sh;
+4 voorbeelden/ (memB-kop, gebruiksregels `python3 cel/pc/sweep.py cel/pc/voorbeelden/<f> --achtergrond`);
+5 longrun.py GPU->CPU-checkpoint omzetten (engine_gpu/ckpt_to_cpu.py) of weigeren + test; 6 tests uitvoerbaar /
+`bash ...`, opruimen in /tmp (mkdtemp, tmux-sockets, locks, selftest_gpu.sh-kopie via EXIT-trap); 7 README.md (root).
+Regels: geen git (alleen lezen), lichte tests (1-2 threads), runs/life*_src NIET aanraken, alleen cel/pc/**, README.md,
+STARTEN.md (herstartsectie), selftest_gpu.sh (alleen de zelfkopie-opruiming). Hier: 4 kernen, geen GPU, geen WSL.
+- [stap 0] gelezen: CLAUDE.md, STARTEN.md, start.sh, stop.sh, claude_rc.sh, longrun.py (main/run), pclib (engine,
+  locks), ckpt_to_cpu.py, selftest_gpu.sh, tests/alle_tests.sh, test_sweep_kill.sh, test_thinning.sh, voorbeelden/.
