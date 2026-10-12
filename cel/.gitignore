@@ -3,3 +3,9 @@ runs/
 __pycache__/
 engine/oercel
 engine/tests/forcetest
+engine_gpu/oercel_gpu
+engine_gpu/oercel_emu
+engine_gpu/*.o
+engine_gpu/build/
+pc/.venv/
+.venv/
